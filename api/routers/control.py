@@ -19,8 +19,8 @@ async def bot_status():
         "open_positions": portfolio.open_position_count(),
         "equity_eur": portfolio.get_equity_eur(),
         "drawdown_pct": portfolio.current_drawdown_pct(),
-        "candles_ready": bot_main._candles_ready,
-        "candles_progress": bot_main._candles_progress,
+        "candles_ready": bot_main.get_candle_cache().is_ready,
+        "candles_progress": bot_main.get_candle_cache().progress,
         "rate_limit": get_rate_status(),
     }
 

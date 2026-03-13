@@ -21,6 +21,7 @@ import uvicorn
 
 from bot.config import get_settings
 from bot.data.database import close_db, init_db
+from bot.data_loader import CandleCache
 from bot.events.bus import (
     TOPIC_BOT_STARTED,
     TOPIC_SIGNAL,
@@ -54,27 +55,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── Candle cache ──────────────────────────────────────────────────────────────
-# symbol → interval → list of dicts (chronological)
-_candle_cache: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-MAX_CANDLES = 500
+
+_candle_cache_obj = CandleCache()
 
 
-def _cache_candle(symbol: str, interval: str, candle: Dict[str, Any]) -> None:
-    _candle_cache.setdefault(symbol, {}).setdefault(interval, [])
-    cache = _candle_cache[symbol][interval]
-    cache.append(candle)
-    if len(cache) > MAX_CANDLES:
-        cache.pop(0)
-
-
-def _get_df(symbol: str, interval: str) -> pd.DataFrame:
-    rows = _candle_cache.get(symbol, {}).get(interval, [])
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows)
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    df = df.set_index("timestamp").sort_index()
-    return df
+def get_candle_cache() -> CandleCache:
+    return _candle_cache_obj
 
 
 # ── Bot state ─────────────────────────────────────────────────────────────────
@@ -82,8 +68,6 @@ def _get_df(symbol: str, interval: str) -> pd.DataFrame:
 _running = False
 _active_symbols: List[str] = []
 _tradeable_symbols: List[str] = []  # subset with enough volume for trading
-_candles_ready = False
-_candles_progress: Dict[str, Any] = {"loaded": 0, "total": 0, "done": False}
 
 
 async def _init_symbols() -> None:
@@ -219,7 +203,7 @@ def _get_param_optimizer() -> ParamOptimizer:
 
 
 async def _on_candle(data: Dict[str, Any]) -> None:
-    _cache_candle(data["symbol"], data["interval"], data)
+    _candle_cache_obj.cache_candle(data["symbol"], data["interval"], data)
     _get_portfolio().update_price(data["symbol"], data["close"])
 
     # Check stop-loss / take-profit on every candle
@@ -248,7 +232,7 @@ async def _check_stops(symbol: str, current_price: float) -> None:
         return
 
     # Update trailing stop
-    df_5m = _get_df(symbol, "5m")
+    df_5m = _candle_cache_obj.get_df(symbol, "5m")
     if len(df_5m) >= 14:
         atr_val = compute_atr(df_5m["high"], df_5m["low"], df_5m["close"]).iloc[-1]
         new_stop = trail_stop(
@@ -361,29 +345,6 @@ async def _get_trade_stats(strategy_name: str) -> tuple:
 # ── Main strategy cycle ───────────────────────────────────────────────────────
 
 
-async def _lazy_load_candles(symbol: str) -> None:
-    """Fetch candles from REST API if not yet cached."""
-    cached_5m = _candle_cache.get(symbol, {}).get("5m", [])
-    if len(cached_5m) >= 30:
-        return  # already have enough
-    client = _get_client()
-    loop = asyncio.get_event_loop()
-    for interval in ["5m", "1h"]:
-        try:
-            candles = await loop.run_in_executor(
-                None, lambda iv=interval: client.get_candles(symbol, iv, limit=200)
-            )
-            for c in candles:
-                _cache_candle(symbol, interval, {
-                    "symbol": c.symbol, "interval": c.interval,
-                    "timestamp": c.timestamp, "open": c.open,
-                    "high": c.high, "low": c.low,
-                    "close": c.close, "volume": c.volume,
-                })
-        except Exception as e:
-            logger.error("Lazy load candles %s %s: %s", symbol, interval, e)
-
-
 async def _strategy_cycle() -> None:
     settings = get_settings()
     portfolio = _get_portfolio()
@@ -401,8 +362,8 @@ async def _strategy_cycle() -> None:
 
     for symbol in list(_tradeable_symbols):
         try:
-            df_5m = _get_df(symbol, "5m")
-            df_1h = _get_df(symbol, "1h")
+            df_5m = _candle_cache_obj.get_df(symbol, "5m")
+            df_1h = _candle_cache_obj.get_df(symbol, "1h")
 
             if len(df_5m) < 30:
                 continue
@@ -558,55 +519,6 @@ async def _strategy_cycle() -> None:
 # ── Scheduled jobs ────────────────────────────────────────────────────────────
 
 
-async def _load_candles_for_symbol(client, symbol: str, loop) -> None:
-    """Load candles for a single symbol."""
-    for interval in ["5m", "1h"]:
-        try:
-            candles = await loop.run_in_executor(
-                None, lambda s=symbol, iv=interval: client.get_candles(s, iv, limit=200)
-            )
-            for c in candles:
-                _cache_candle(symbol, interval, {
-                    "symbol": c.symbol, "interval": c.interval,
-                    "timestamp": c.timestamp, "open": c.open,
-                    "high": c.high, "low": c.low,
-                    "close": c.close, "volume": c.volume,
-                })
-        except Exception as e:
-            logger.error("Failed to load candles for %s %s: %s", symbol, interval, e)
-
-
-async def _load_all_candles() -> None:
-    """Load candles for ALL active symbols in concurrent batches."""
-    global _candles_ready
-    loop = asyncio.get_event_loop()
-    client = _get_client()
-    total = len(_active_symbols)
-    _candles_progress["total"] = total
-    _candles_progress["loaded"] = 0
-    _candles_progress["done"] = False
-
-    BATCH_SIZE = get_settings().candle_batch_size
-    for batch_start in range(0, total, BATCH_SIZE):
-        batch = _active_symbols[batch_start:batch_start + BATCH_SIZE]
-        tasks = []
-        for symbol in batch:
-            cached_5m = _candle_cache.get(symbol, {}).get("5m", [])
-            if len(cached_5m) >= 30:
-                continue
-            tasks.append(_load_candles_for_symbol(client, symbol, loop))
-        if tasks:
-            await asyncio.gather(*tasks)
-        _candles_progress["loaded"] = min(batch_start + BATCH_SIZE, total)
-        if _candles_progress["loaded"] % 50 == 0 or _candles_progress["loaded"] == total:
-            logger.info("Candle loading progress: %d/%d", _candles_progress["loaded"], total)
-        await asyncio.sleep(1)  # rate limit: 1s pause between batches
-
-    _candles_progress["done"] = True
-    _candles_ready = True
-    logger.info("All candles loaded (%d pairs)", total)
-
-
 async def _sentiment_loop(interval_secs: int) -> None:
     sentiment = _get_sentiment()
     while True:
@@ -697,7 +609,10 @@ async def _main() -> None:
     logger.info("Dashboard: http://%s:%d", settings.api_host, settings.api_port)
 
     await asyncio.gather(
-        _load_all_candles(),
+        _candle_cache_obj.load_all(
+            _active_symbols, _get_client(),
+            batch_size=settings.candle_batch_size,
+        ),
         ws.run(),
         _sentiment_loop(settings.sentiment_poll_interval_secs),
         _strategy_loop(settings.strategy_cycle_secs),
