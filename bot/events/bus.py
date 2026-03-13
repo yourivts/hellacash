@@ -20,6 +20,9 @@ TOPIC_TRADE_CLOSED = "trade.closed"
 TOPIC_SENTIMENT_UPDATED = "sentiment.updated"
 TOPIC_RISK_HALT = "risk.halt"
 TOPIC_PORTFOLIO_UPDATE = "portfolio.update"
+TOPIC_RISK_DECISION = "risk.decision"
+TOPIC_BOT_STARTED = "bot.started"
+TOPIC_SENTIMENT_DEGRADED = "sentiment.degraded"
 
 
 # ── Event envelope ────────────────────────────────────────────────────────────

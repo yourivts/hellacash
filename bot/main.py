@@ -22,6 +22,7 @@ import uvicorn
 from bot.config import get_settings
 from bot.data.database import close_db, init_db
 from bot.events.bus import (
+    TOPIC_BOT_STARTED,
     TOPIC_SIGNAL,
     TOPIC_TICKER,
     TOPIC_TRADE_CLOSED,
@@ -111,7 +112,7 @@ async def start_bot() -> None:
     logger.info("Bot ACTIVATED — trading enabled")
 
     bus = get_bus()
-    await bus.publish("bot.started", {"symbols": _active_symbols})
+    await bus.publish(TOPIC_BOT_STARTED, {"symbols": _active_symbols})
 
 
 async def stop_bot() -> None:
