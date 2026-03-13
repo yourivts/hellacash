@@ -44,6 +44,11 @@ class BitvavoWebSocket:
         self._running = False
         self._ws = None
 
+    @property
+    def is_connected(self) -> bool:
+        """Whether the WebSocket connection is active."""
+        return self._running and self._ws is not None
+
     def set_markets(self, markets: List[str]) -> None:
         self._subscribed_markets = set(markets)
 
