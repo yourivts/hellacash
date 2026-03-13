@@ -30,6 +30,7 @@ def create_app() -> FastAPI:
     app.include_router(control.router)
     app.include_router(backtest.router)
     app.include_router(risk.router)
+    app.include_router(health.router)
 
     # WebSocket live feed
     hub = get_hub()
