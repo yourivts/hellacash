@@ -13,7 +13,6 @@ if __name__ == "__main__" and "bot.main" not in _sys.modules:
 import asyncio
 import logging
 import signal
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import uvicorn
@@ -35,6 +34,7 @@ from bot.learning.trade_analyzer import TradeAnalyzer
 from bot.portfolio.tracker import PortfolioTracker
 from bot.risk.drawdown_guard import DrawdownGuard
 from bot.risk.engine import RiskEngine
+from bot.scheduler import BotScheduler
 from bot.sentiment.aggregator import SentimentAggregator
 from bot.strategy.router import StrategyRouter
 from bot.trading_loop import TradingLoop
@@ -59,6 +59,7 @@ def get_candle_cache() -> CandleCache:
 _running = False
 _active_symbols: List[str] = []
 _tradeable_symbols: List[str] = []  # subset with enough volume for trading
+_ws_instance: Optional[BitvavoWebSocket] = None
 
 
 async def _init_symbols() -> None:
@@ -104,6 +105,10 @@ def get_active_symbols() -> List[str]:
     return list(_active_symbols)
 
 
+def get_ws() -> Optional[BitvavoWebSocket]:
+    return _ws_instance
+
+
 # ── Global singletons (lazy init) ─────────────────────────────────────────────
 
 _client: Optional[BitvavoClient] = None
@@ -117,6 +122,7 @@ _trade_analyzer: Optional[TradeAnalyzer] = None
 _signal_eval: Optional[SignalEvaluator] = None
 _param_optimizer: Optional[ParamOptimizer] = None
 _trading_loop: Optional[TradingLoop] = None
+_scheduler: Optional[BotScheduler] = None
 
 
 def _get_client() -> BitvavoClient:
@@ -209,54 +215,11 @@ def _get_trading_loop() -> TradingLoop:
     return _trading_loop
 
 
-# ── Scheduled jobs ────────────────────────────────────────────────────────────
-
-
-async def _sentiment_loop(interval_secs: int) -> None:
-    sentiment = _get_sentiment()
-    while True:
-        if _active_symbols:  # always collect sentiment, even before trading activated
-            try:
-                await sentiment.run_cycle(_active_symbols)
-            except Exception as e:
-                logger.error("Sentiment loop error: %s", e)
-        await asyncio.sleep(interval_secs)
-
-
-async def _strategy_loop(interval_secs: int) -> None:
-    trading_loop = _get_trading_loop()
-    while True:
-        if _running:
-            await trading_loop.run_cycle(_tradeable_symbols, _running)
-        await asyncio.sleep(interval_secs)
-
-
-async def _portfolio_snapshot_loop(interval_secs: int = 300) -> None:
-    while True:
-        if _running:
-            try:
-                await _get_portfolio().snapshot()
-            except Exception as e:
-                logger.error("Snapshot error: %s", e)
-        await asyncio.sleep(interval_secs)
-
-
-async def _optimizer_loop(interval_hours: int = 24) -> None:
-    while True:
-        await asyncio.sleep(interval_hours * 3600)
-        if _running:
-            try:
-                await _get_param_optimizer().optimize_hybrid(
-                    min_trades=get_settings().optimizer_min_trades
-                )
-            except Exception as e:
-                logger.error("Optimizer error: %s", e)
-
-
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 
 async def _main() -> None:
+    global _ws_instance, _scheduler
     settings = get_settings()
 
     logger.info(
@@ -288,6 +251,24 @@ async def _main() -> None:
         on_fill=trading_loop.on_fill,
     )
     ws.set_markets(_active_symbols)
+    _ws_instance = ws
+
+    # Create BotScheduler
+    sentiment = _get_sentiment()
+    param_optimizer = _get_param_optimizer()
+
+    scheduler = BotScheduler(
+        run_cycle=lambda: trading_loop.run_cycle(_tradeable_symbols, _running),
+        sentiment_cycle=sentiment.run_cycle,
+        portfolio_snapshot=portfolio.snapshot,
+        optimizer_run=lambda: param_optimizer.optimize_hybrid(
+            min_trades=settings.optimizer_min_trades
+        ),
+        is_running=is_running,
+        active_symbols=get_active_symbols,
+        settings=settings,
+    )
+    _scheduler = scheduler
 
     # Import the FastAPI app
     from api.app import create_app
@@ -302,6 +283,21 @@ async def _main() -> None:
     )
     server = uvicorn.Server(uvicorn_config)
 
+    # Graceful shutdown signal handler
+    def _handle_shutdown(sig: int, frame: Any) -> None:
+        logger.info("Received signal %s — shutting down gracefully", sig)
+        if _scheduler:
+            _scheduler.shutdown()
+        if _ws_instance:
+            asyncio.ensure_future(_ws_instance.stop())
+
+    try:
+        signal.signal(signal.SIGTERM, _handle_shutdown)
+        signal.signal(signal.SIGINT, _handle_shutdown)
+    except (OSError, ValueError):
+        # Windows may not support SIGTERM in all contexts; ignore gracefully
+        pass
+
     # Run everything concurrently
     logger.info("Dashboard: http://%s:%d", settings.api_host, settings.api_port)
 
@@ -311,10 +307,7 @@ async def _main() -> None:
             batch_size=settings.candle_batch_size,
         ),
         ws.run(),
-        _sentiment_loop(settings.sentiment_poll_interval_secs),
-        _strategy_loop(settings.strategy_cycle_secs),
-        _portfolio_snapshot_loop(300),
-        _optimizer_loop(24),
+        scheduler.run_all(),
         server.serve(),
     )
 
