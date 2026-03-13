@@ -421,6 +421,7 @@ async def run_backtest(
     interval: str = "5m",
     days: int = 30,
     initial_capital: float = 10_000.0,
+    max_open_positions: int = 3,
 ) -> BacktestResult:
     """
     Fetch historical candles from Bitvavo public API and run the backtest.
@@ -508,5 +509,5 @@ async def run_backtest(
         unique[-1].timestamp.isoformat() if unique else "?",
     )
 
-    engine = BacktestEngine(unique, initial_capital=initial_capital)
+    engine = BacktestEngine(unique, initial_capital=initial_capital, max_open_positions=max_open_positions)
     return engine.run()
