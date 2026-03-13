@@ -6,13 +6,13 @@ import json
 import logging
 import urllib.request
 import time
-from datetime import datetime
-from typing import Dict, List, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Set, Tuple
 
 from bot.config import Settings
 from bot.data.database import get_session
 from bot.data.repositories import save_sentiment
-from bot.events.bus import TOPIC_SENTIMENT_UPDATED, get_bus
+from bot.events.bus import TOPIC_SENTIMENT_UPDATED, TOPIC_SENTIMENT_DEGRADED, get_bus
 from bot.sentiment.nlp import FinBERTScorer, VADERScorer
 from bot.sentiment.scraper_news import NewsScraper
 from bot.sentiment.scraper_reddit import RedditScraper
@@ -71,6 +71,63 @@ class SentimentAggregator:
         self._finbert = FinBERTScorer()
         self._cache: Dict[str, float] = {}  # base asset → latest aggregate score
         self._bus = get_bus()
+        self._source_failures: Dict[str, int] = {}
+        self._source_disabled_until: Dict[str, datetime] = {}
+        self._max_failures = 3
+        self._cooldown_secs = 600
+
+    def _record_failure(self, source: str) -> None:
+        self._source_failures[source] = self._source_failures.get(source, 0) + 1
+        if self._source_failures[source] >= self._max_failures:
+            until = datetime.now(timezone.utc) + timedelta(seconds=self._cooldown_secs)
+            self._source_disabled_until[source] = until
+            logger.warning("Sentiment source '%s' disabled until %s", source, until.isoformat())
+            try:
+                active = [s for s in SOURCE_WEIGHTS if not self._is_source_disabled(s)]
+                asyncio.get_running_loop().create_task(
+                    self._bus.publish(TOPIC_SENTIMENT_DEGRADED, {
+                        "source": source, "status": "disabled",
+                        "active_sources": active,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                )
+            except RuntimeError:
+                pass
+
+    def _record_success(self, source: str) -> None:
+        was_disabled = source in self._source_disabled_until
+        self._source_failures[source] = 0
+        self._source_disabled_until.pop(source, None)
+        if was_disabled:
+            try:
+                active = [s for s in SOURCE_WEIGHTS if not self._is_source_disabled(s)]
+                asyncio.get_running_loop().create_task(
+                    self._bus.publish(TOPIC_SENTIMENT_DEGRADED, {
+                        "source": source, "status": "recovered",
+                        "active_sources": active,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                )
+            except RuntimeError:
+                pass
+
+    def _is_source_disabled(self, source: str) -> bool:
+        until = self._source_disabled_until.get(source)
+        if until is None:
+            return False
+        if datetime.now(timezone.utc) >= until:
+            self._source_disabled_until.pop(source, None)
+            self._source_failures[source] = 0
+            logger.info("Sentiment source '%s' recovered (cooldown expired)", source)
+            return False
+        return True
+
+    def _get_active_weights(self, disabled: set) -> Dict[str, float]:
+        active = {k: v for k, v in SOURCE_WEIGHTS.items() if k not in disabled}
+        if not active:
+            return {}
+        total = sum(active.values())
+        return {k: v / total for k, v in active.items()}
 
     def get_score(self, symbol: str) -> float:
         """Return cached aggregate sentiment score for a symbol (base asset)."""
@@ -86,12 +143,45 @@ class SentimentAggregator:
         if not all_symbols:
             all_symbols = assets  # fallback to active symbols
 
-        # Step 1: Pre-fetch ALL shared data sources ONCE
-        fear_greed_score, _, _ = await asyncio.gather(
-            loop.run_in_executor(None, self._fear_greed.get_score),
-            loop.run_in_executor(None, self._reddit.prefetch_subs),
-            loop.run_in_executor(None, self._news.prefetch_feeds),
-        )
+        # Step 1: Pre-fetch ALL shared data sources ONCE, guarded by circuit breakers
+        fear_greed_score = 0.0
+        disabled_sources: Set[str] = set()
+
+        if not self._is_source_disabled("fear_greed"):
+            try:
+                fear_greed_score = await loop.run_in_executor(None, self._fear_greed.get_score)
+                self._record_success("fear_greed")
+            except Exception as e:
+                logger.error("Fear & Greed fetch failed: %s", e)
+                self._record_failure("fear_greed")
+                disabled_sources.add("fear_greed")
+        else:
+            disabled_sources.add("fear_greed")
+            logger.warning("Sentiment source 'fear_greed' is disabled (circuit breaker open)")
+
+        if not self._is_source_disabled("reddit"):
+            try:
+                await loop.run_in_executor(None, self._reddit.prefetch_subs)
+                self._record_success("reddit")
+            except Exception as e:
+                logger.error("Reddit prefetch failed: %s", e)
+                self._record_failure("reddit")
+                disabled_sources.add("reddit")
+        else:
+            disabled_sources.add("reddit")
+            logger.warning("Sentiment source 'reddit' is disabled (circuit breaker open)")
+
+        if not self._is_source_disabled("news"):
+            try:
+                await loop.run_in_executor(None, self._news.prefetch_feeds)
+                self._record_success("news")
+            except Exception as e:
+                logger.error("News prefetch failed: %s", e)
+                self._record_failure("news")
+                disabled_sources.add("news")
+        else:
+            disabled_sources.add("news")
+            logger.warning("Sentiment source 'news' is disabled (circuit breaker open)")
 
         # Step 2: Pre-filter — find which assets actually have mentions
         # This avoids running NLP on 400+ assets with zero mentions
@@ -100,8 +190,8 @@ class SentimentAggregator:
 
         for symbol in all_symbols:
             base = symbol.split("-")[0].upper()
-            news_texts = self._news.fetch_articles(base, 30)
-            reddit_texts = self._reddit.fetch_posts(base, 50)
+            news_texts = [] if "news" in disabled_sources else self._news.fetch_articles(base, 30)
+            reddit_texts = [] if "reddit" in disabled_sources else self._reddit.fetch_posts(base, 50)
             if news_texts or reddit_texts:
                 assets_with_mentions.append((base, news_texts, reddit_texts))
             else:
@@ -115,33 +205,69 @@ class SentimentAggregator:
         # Step 3: Score assets WITH mentions (run NLP)
         for base, news_texts, reddit_texts in assets_with_mentions:
             try:
-                news_score = await loop.run_in_executor(None, self._finbert.score_batch, news_texts)
-                reddit_score = await loop.run_in_executor(None, self._vader.score_batch, reddit_texts)
+                source_scores: Dict[str, float] = {}
 
-                agg = (
-                    news_score * SOURCE_WEIGHTS["news"]
-                    + reddit_score * SOURCE_WEIGHTS["reddit"]
-                    + fear_greed_score * SOURCE_WEIGHTS["fear_greed"]
+                if "news" not in disabled_sources and news_texts:
+                    try:
+                        news_score = await loop.run_in_executor(
+                            None, self._finbert.score_batch, news_texts
+                        )
+                        source_scores["news"] = news_score
+                    except Exception as e:
+                        logger.error("News NLP scoring failed for %s: %s", base, e)
+                        self._record_failure("news")
+                        disabled_sources.add("news")
+
+                if "reddit" not in disabled_sources and reddit_texts:
+                    try:
+                        reddit_score = await loop.run_in_executor(
+                            None, self._vader.score_batch, reddit_texts
+                        )
+                        source_scores["reddit"] = reddit_score
+                    except Exception as e:
+                        logger.error("Reddit NLP scoring failed for %s: %s", base, e)
+                        self._record_failure("reddit")
+                        disabled_sources.add("reddit")
+
+                if "fear_greed" not in disabled_sources:
+                    source_scores["fear_greed"] = fear_greed_score
+
+                active_weights = self._get_active_weights(disabled=disabled_sources)
+                if not active_weights:
+                    logger.warning("All sentiment sources disabled for %s, skipping", base)
+                    continue
+
+                agg = sum(
+                    source_scores.get(src, 0.0) * w
+                    for src, w in active_weights.items()
                 )
                 self._cache[base] = agg
 
+                news_score_log = source_scores.get("news", float("nan"))
+                reddit_score_log = source_scores.get("reddit", float("nan"))
                 logger.info(
                     "Sentiment %s: news=%.3f(%d) reddit=%.3f(%d) fg=%.3f → agg=%.3f",
-                    base, news_score, len(news_texts), reddit_score, len(reddit_texts),
+                    base, news_score_log, len(news_texts), reddit_score_log, len(reddit_texts),
                     fear_greed_score, agg,
                 )
 
                 await self._persist_and_publish(
-                    base, news_score, reddit_score, fear_greed_score, agg,
-                    news_texts, reddit_texts,
+                    base,
+                    source_scores.get("news", 0.0),
+                    source_scores.get("reddit", 0.0),
+                    fear_greed_score,
+                    agg,
+                    news_texts,
+                    reddit_texts,
                 )
             except Exception as e:
                 logger.error("Sentiment scoring failed for %s: %s", base, e)
 
         # Step 4: Assets WITHOUT mentions just get Fear & Greed score
         now = datetime.utcnow()
+        fg_weight = self._get_active_weights(disabled=disabled_sources).get("fear_greed", 0.0)
         for base in assets_without_mentions:
-            self._cache[base] = fear_greed_score * SOURCE_WEIGHTS["fear_greed"]
+            self._cache[base] = fear_greed_score * fg_weight
 
         logger.info("Sentiment cycle complete — %d total assets scored", len(self._cache))
 
