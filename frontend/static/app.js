@@ -516,6 +516,44 @@ async function refreshStrategies() {
   } catch (e) { console.error('refreshStrategies', e); }
 }
 
+// ── Risk Gate Log ─────────────────────────────────────────────────────────
+
+async function refreshRiskGate() {
+  try {
+    const res = await fetch(`${API}/api/risk/decisions?limit=10`);
+    const decisions = await res.json();
+    const el = document.getElementById('risk-gate-log');
+    if (!el) return;
+    if (!decisions.length) {
+      el.innerHTML = '<div class="text-gray-600 italic">No decisions yet</div>';
+      return;
+    }
+    el.innerHTML = decisions.map(d => {
+      const badge = d.approved
+        ? '<span class="px-1.5 py-0.5 rounded text-xs font-medium" style="background:#10b98122;color:#10b981">APPROVED</span>'
+        : '<span class="px-1.5 py-0.5 rounded text-xs font-medium" style="background:#ef444422;color:#ef4444">REJECTED</span>';
+      const ts = d.timestamp ? d.timestamp.slice(11, 19) : '';
+      const failedGates = d.gate_details
+        ? Object.entries(d.gate_details).filter(([, g]) => !g.passed).map(([name]) => name.replace('_', ' ')).join(', ')
+        : '';
+      const gateInfo = !d.approved && failedGates
+        ? `<div class="text-gray-500 mt-0.5">Failed: <span class="text-red-400">${failedGates}</span></div>`
+        : '';
+      return `<div class="py-1.5 border-b border-gray-800">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-2">
+            <span class="text-gray-500">${ts}</span>
+            <span class="text-white font-medium">${d.symbol || '?'}</span>
+            <span class="text-gray-400">${d.side || ''}</span>
+          </div>
+          ${badge}
+        </div>
+        ${gateInfo}
+      </div>`;
+    }).join('');
+  } catch (e) { console.error('refreshRiskGate', e); }
+}
+
 // ── Paper Reset ───────────────────────────────────────────────────────────
 
 let isPaperMode = false;
@@ -557,7 +595,7 @@ async function init() {
   await Promise.all([
     loadMarkets(), refreshStatus(), refreshPortfolio(), refreshAnalytics(),
     loadCandles(), loadEquityHistory(), refreshTrades(), refreshSentiment(),
-    refreshStrategies(),
+    refreshStrategies(), refreshRiskGate(),
   ]);
 
   // Poll status every 2s until candles are ready, then slow to 30s
@@ -574,7 +612,7 @@ async function init() {
   setInterval(async () => {
     await Promise.all([
       refreshPortfolio(), refreshAnalytics(), loadEquityHistory(),
-      refreshStrategies(),
+      refreshStrategies(), refreshRiskGate(),
     ]);
   }, 30000);
 
