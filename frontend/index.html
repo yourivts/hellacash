@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>HellaCash — Trading Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+  <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+  <style>
+    body { background: #0f1117; color: #e2e8f0; font-family: 'Inter', system-ui, sans-serif; }
+    .card { background: #1a1d27; border: 1px solid #2d3148; border-radius: 12px; }
+    .badge-paper { background: #f59e0b22; color: #f59e0b; }
+    .badge-live  { background: #10b98122; color: #10b981; }
+    .badge-halt  { background: #ef444422; color: #ef4444; }
+    .pnl-pos { color: #10b981; }
+    .pnl-neg { color: #ef4444; }
+    .sentiment-bar { height: 6px; border-radius: 3px; transition: width 0.5s; }
+    table { border-collapse: collapse; width: 100%; }
+    th { color: #64748b; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; padding: 10px 12px; text-align: left; }
+    td { padding: 10px 12px; border-top: 1px solid #1e2235; font-size: 13px; }
+    tr:hover td { background: #1e2235; }
+    .signal-long  { color: #10b981; }
+    .signal-short { color: #ef4444; }
+    .signal-neutral { color: #64748b; }
+    #price-chart { height: 320px; }
+    .ob-row { display: flex; justify-content: space-between; padding: 1px 4px; position: relative; }
+    .ob-row .ob-bg { position: absolute; top: 0; bottom: 0; opacity: 0.15; }
+    .ob-bid .ob-bg { right: 0; background: #10b981; }
+    .ob-ask .ob-bg { left: 0; background: #ef4444; }
+    ::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-track { background: #1a1d27; } ::-webkit-scrollbar-thumb { background: #2d3148; border-radius: 2px; }
+  </style>
+</head>
+<body class="min-h-screen">
+
+<!-- Header -->
+<header class="px-3 md:px-6 py-4 flex flex-wrap items-center justify-between border-b border-gray-800 gap-3">
+  <div class="flex items-center gap-3">
+    <span class="text-xl font-bold text-white">⚡ HellaCash</span>
+    <span id="mode-badge" class="text-xs px-2 py-1 rounded font-medium badge-paper">PAPER</span>
+    <span id="halt-badge" class="text-xs px-2 py-1 rounded font-medium badge-halt hidden">HALTED</span>
+    <span id="candle-status" class="text-xs px-2 py-1 rounded font-medium" style="background:#3b82f622;color:#3b82f6">
+      <span id="candle-status-text">Loading candles…</span>
+    </span>
+    <span id="rate-limit-badge" class="text-xs px-2 py-1 rounded font-medium" style="background:#10b98122;color:#10b981">
+      API: <span id="rate-limit-text">1000/1000</span>
+    </span>
+  </div>
+  <div class="flex items-center gap-4">
+    <div class="text-right">
+      <div class="text-xs text-gray-500">Portfolio</div>
+      <div id="hdr-equity" class="text-lg font-bold text-white">€—</div>
+    </div>
+    <div class="text-right">
+      <div class="text-xs text-gray-500">Daily P&L</div>
+      <div id="hdr-daily-pnl" class="text-lg font-bold">—</div>
+    </div>
+    <div class="text-right">
+      <div class="text-xs text-gray-500">Win Rate</div>
+      <div id="hdr-winrate" class="text-lg font-bold text-white">—</div>
+    </div>
+    <div class="flex gap-2">
+      <button id="btn-toggle" onclick="botToggle()" class="px-4 py-2 bg-green-600 hover:bg-green-500 text-white rounded-lg text-sm font-medium transition">Start</button>
+      <button id="btn-paper-reset" onclick="paperReset()" class="px-3 py-2 border border-gray-600 hover:border-gray-400 text-gray-400 hover:text-white rounded-lg text-sm font-medium transition hidden">Reset Paper</button>
+    </div>
+  </div>
+</header>
+
+<!-- Main Grid -->
+<main class="p-3 md:p-6 grid grid-cols-1 md:grid-cols-12 gap-4">
+
+  <!-- Left column: stats + positions -->
+  <aside class="col-span-1 md:col-span-3 flex flex-col gap-4">
+
+    <div class="card p-4">
+      <div class="text-xs text-gray-500 mb-1">Total Equity</div>
+      <div id="equity" class="text-2xl font-bold text-white">€—</div>
+      <div class="text-xs text-gray-500 mt-2">Drawdown</div>
+      <div id="drawdown" class="text-sm">—</div>
+    </div>
+
+    <div class="card p-4">
+      <div class="flex items-center justify-between mb-2">
+        <div class="text-xs text-gray-500">Sentiment (<span id="sentiment-count">0</span>)</div>
+      </div>
+      <input id="sentiment-search" type="text" placeholder="Search coin…" oninput="filterSentiment(this.value)"
+        class="w-full bg-gray-800 text-white rounded px-2 py-1 text-xs border border-gray-700 mb-2"/>
+      <div id="sentiment-list" class="flex flex-col gap-1 overflow-y-auto" style="max-height:280px">
+        <div class="text-xs text-gray-600 italic">Loading…</div>
+      </div>
+    </div>
+
+    <div class="card p-4 flex-1">
+      <div class="text-xs text-gray-500 mb-3 flex justify-between">
+        <span>Open Positions</span>
+        <span id="pos-count" class="text-white">0</span>
+      </div>
+      <div id="positions-list" class="flex flex-col gap-2 text-sm">
+        <div class="text-xs text-gray-600 italic">No positions</div>
+      </div>
+    </div>
+
+  </aside>
+
+  <!-- Center: price chart + signal feed -->
+  <section class="col-span-1 md:col-span-6 flex flex-col gap-4">
+
+    <div class="card p-4">
+      <div class="flex items-center justify-between mb-3">
+        <div class="flex items-center gap-3">
+          <div class="relative">
+            <input id="pair-search" type="text" placeholder="Search market…"
+              class="bg-gray-800 text-white rounded px-3 py-1.5 text-sm border border-gray-700 w-44 hidden"
+              oninput="filterMarkets(this.value)" onblur="setTimeout(()=>this.classList.add('hidden'),200)"/>
+            <select id="pair-select" onchange="switchPair(this.value)" onfocus="document.getElementById('pair-search').classList.remove('hidden');document.getElementById('pair-search').focus()"
+              class="bg-gray-800 text-white rounded px-3 py-1.5 text-sm border border-gray-700 w-44">
+              <option value="BTC-EUR">BTC-EUR</option>
+            </select>
+          </div>
+          <span id="live-price" class="text-lg font-bold text-white">—</span>
+          <span id="live-price-delta" class="text-xs font-medium"></span>
+        </div>
+        <div class="flex gap-1">
+          <button onclick="switchInterval('1m')" class="tf-btn px-3 py-1 text-xs rounded bg-gray-800 text-gray-400 hover:text-white">1m</button>
+          <button onclick="switchInterval('5m')" class="tf-btn px-3 py-1 text-xs rounded bg-blue-700 text-white">5m</button>
+          <button onclick="switchInterval('1h')" class="tf-btn px-3 py-1 text-xs rounded bg-gray-800 text-gray-400 hover:text-white">1h</button>
+        </div>
+      </div>
+      <div id="price-chart"></div>
+    </div>
+
+    <div class="card p-4">
+      <div class="text-xs text-gray-500 mb-2">Live Signal Feed</div>
+      <div id="signal-feed" class="flex flex-col gap-1 max-h-36 overflow-y-auto text-xs">
+        <div class="text-gray-600 italic">Waiting for signals…</div>
+      </div>
+    </div>
+
+  </section>
+
+  <!-- Right column: analytics -->
+  <aside class="col-span-1 md:col-span-3 flex flex-col gap-4">
+
+    <div class="card p-4">
+      <div class="text-xs text-gray-500 mb-3">Analytics (30d)</div>
+      <div class="grid grid-cols-2 gap-3 text-sm">
+        <div><div class="text-xs text-gray-500">Total P&L</div><div id="a-pnl" class="font-bold">—</div></div>
+        <div><div class="text-xs text-gray-500">Win Rate</div><div id="a-wr" class="font-bold">—</div></div>
+        <div><div class="text-xs text-gray-500">Sharpe</div><div id="a-sharpe" class="font-bold">—</div></div>
+        <div><div class="text-xs text-gray-500">Trades</div><div id="a-trades" class="font-bold">—</div></div>
+      </div>
+    </div>
+
+    <div class="card p-4">
+      <div class="text-xs text-gray-500 mb-2">Order Book</div>
+      <div class="grid grid-cols-2 gap-2 text-xs mb-1">
+        <div class="text-gray-500 text-center">Bids</div>
+        <div class="text-gray-500 text-center">Asks</div>
+      </div>
+      <div id="orderbook" class="grid grid-cols-2 gap-2 text-xs" style="max-height:200px; overflow-y:auto">
+        <div class="text-gray-600 italic col-span-2 text-center">Loading…</div>
+      </div>
+      <div class="mt-2 text-center">
+        <span id="ob-spread" class="text-xs text-gray-500"></span>
+      </div>
+    </div>
+
+    <div class="card p-4">
+      <div class="text-xs text-gray-500 mb-2">Equity Curve</div>
+      <div style="position:relative; height:150px">
+        <canvas id="equity-chart"></canvas>
+      </div>
+    </div>
+
+    <div class="card p-4">
+      <div class="text-xs text-gray-500 mb-3">Strategy Performance</div>
+      <div class="overflow-x-auto">
+        <table>
+          <thead>
+            <tr>
+              <th>Strategy</th><th>Trades</th><th>Win%</th><th>P&L</th>
+            </tr>
+          </thead>
+          <tbody id="strategy-body">
+            <tr><td colspan="4" class="text-gray-600 text-center py-4">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+  </aside>
+
+</main>
+
+<!-- Trade History -->
+<section class="px-3 md:px-6 pb-6">
+  <div class="card p-4">
+    <div class="text-xs text-gray-500 mb-3">Trade History</div>
+    <div class="overflow-x-auto">
+      <table>
+        <thead>
+          <tr>
+            <th>Pair</th><th>Strategy</th><th>Entry</th><th>Exit</th>
+            <th>Qty</th><th>P&L</th><th>ROI %</th><th>Hold</th><th>Reason</th><th>Type</th>
+          </tr>
+        </thead>
+        <tbody id="trades-body">
+          <tr><td colspan="10" class="text-gray-600 text-center py-6">No trades yet</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

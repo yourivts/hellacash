@@ -1,0 +1,17 @@
+.env
+.env.*
+__pycache__/
+*.pyc
+*.pyo
+*.log
+models/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+postgres_data/
+*.db
+.idea/
+.vscode/
+node_modules/
+alembic/versions/*.pyc
