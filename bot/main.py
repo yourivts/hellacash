@@ -37,6 +37,7 @@ from bot.risk.engine import RiskEngine
 from bot.scheduler import BotScheduler
 from bot.sentiment.aggregator import SentimentAggregator
 from bot.strategy.router import StrategyRouter
+from bot.notifications.discord import DiscordNotifier
 from bot.trading_loop import TradingLoop
 
 logging.basicConfig(
@@ -253,6 +254,9 @@ async def _main() -> None:
     ws.set_markets(_active_symbols)
     _ws_instance = ws
 
+    # Create Discord notifier
+    discord = DiscordNotifier(settings)
+
     # Create BotScheduler
     sentiment = _get_sentiment()
     param_optimizer = _get_param_optimizer()
@@ -267,6 +271,7 @@ async def _main() -> None:
         is_running=is_running,
         active_symbols=get_active_symbols,
         settings=settings,
+        discord_run=discord.run,
     )
     _scheduler = scheduler
 
@@ -310,6 +315,9 @@ async def _main() -> None:
         scheduler.run_all(),
         server.serve(),
     )
+
+    await discord.shutdown()
+    await close_db()
 
 
 def main() -> None:

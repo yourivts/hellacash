@@ -46,6 +46,8 @@ class BotScheduler:
             self._portfolio_snapshot_loop(300),
             self._optimizer_loop(24),
         ]
+        if self._discord_run is not None:
+            coros.append(self._discord_run())
         self._tasks = [asyncio.create_task(c) for c in coros]
         await asyncio.gather(*self._tasks)
 
