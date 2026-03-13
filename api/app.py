@@ -7,7 +7,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from api.routers import analytics, backtest, charts, control, portfolio, sentiment, trades
+from api.routers import analytics, backtest, charts, control, health, portfolio, risk, sentiment, trades
 from api.ws_hub import get_hub
 
 
@@ -29,6 +29,7 @@ def create_app() -> FastAPI:
     app.include_router(charts.router)
     app.include_router(control.router)
     app.include_router(backtest.router)
+    app.include_router(risk.router)
 
     # WebSocket live feed
     hub = get_hub()
