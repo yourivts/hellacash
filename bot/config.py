@@ -4,7 +4,7 @@ import os
 from functools import lru_cache
 from typing import List
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     # ── API server ────────────────────────────────────────────────────────────
     api_host: str = "0.0.0.0"
     api_port: int = 8000
+
+    # ── Discord notifications ──────────────────────────────────────────────────
+    discord_webhook_url: str = Field(default="", repr=False)
+    discord_notify_trades: bool = False
 
     # ── Learning ──────────────────────────────────────────────────────────────
     optimizer_min_trades: int = 50         # minimum trades before optimizer runs
