@@ -88,6 +88,7 @@ class BacktestEngine:
         initial_capital: float = 10_000.0,
         max_open_positions: int = 3,
         slippage_pct: float = 0.001,
+        strategy_params: Optional[Dict[str, Any]] = None,
     ) -> None:
         self._raw_candles = candles
         self.initial_capital = initial_capital
@@ -100,6 +101,12 @@ class BacktestEngine:
         self.closed_trades: List[TradeRecord] = []
 
         self._router = StrategyRouter()
+        if strategy_params:
+            self._router.update_hybrid_params(
+                sentiment_weight=strategy_params.get("sentiment_weight", 0.25),
+                entry_threshold=strategy_params.get("entry_threshold", 0.40),
+                indicator_weights=strategy_params.get("indicator_weights"),
+            )
 
     # ------------------------------------------------------------------
     # Public API
