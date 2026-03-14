@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from api.middleware.auth import require_api_key, ws_auth
+from api.metrics import router as metrics_router, start_metrics_relay
 from api.routers import analytics, backtest, charts, control, health, portfolio, positions, risk, sentiment, trades
 from api.ws_hub import get_hub
 
@@ -36,12 +37,16 @@ def create_app() -> FastAPI:
     # No auth for health check
     app.include_router(health.router)
 
+    # No auth for Prometheus metrics
+    app.include_router(metrics_router)
+
     # WebSocket live feed
     hub = get_hub()
 
     @app.on_event("startup")
     async def on_startup():
         await hub.start_relay()
+        await start_metrics_relay()
 
     @app.websocket("/ws/feed")
     async def ws_feed(ws: WebSocket, api_key: str | None = Query(None)):
