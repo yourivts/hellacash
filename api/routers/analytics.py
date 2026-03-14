@@ -1,13 +1,14 @@
-"""Analytics endpoints: P&L, win rate, Sharpe ratio."""
+"""Analytics endpoints: P&L, win rate, Sharpe ratio, attribution, benchmark, walk-forward."""
 from __future__ import annotations
 
 import statistics
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
 from bot.data.database import get_session
-from bot.data.repositories import get_trades_since
+from bot.data.repositories import get_trades, get_trades_since
 
 router = APIRouter(prefix="/api/analytics", tags=["analytics"])
 
@@ -87,3 +88,56 @@ async def get_strategy_performance(days: int = Query(30, ge=1, le=365)):
     # Sort by total P&L descending
     results.sort(key=lambda x: x["total_pnl"], reverse=True)
     return results
+
+
+@router.get("/attribution")
+async def get_attribution(
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+):
+    start_dt = datetime.fromisoformat(start) if start else None
+    end_dt = datetime.fromisoformat(end) if end else None
+
+    async with get_session() as session:
+        trades = await get_trades(
+            session, limit=10000, start_date=start_dt, end_date=end_dt,
+        )
+
+    from bot.analytics.attribution import AttributionEngine
+    engine = AttributionEngine()
+    report = engine.compute_from_trades(trades)
+    return {
+        "total_pnl": report.total_pnl,
+        "total_trades": report.total_trades,
+        "overall_win_rate": report.overall_win_rate,
+        "by_strategy": [vars(s) for s in report.by_strategy],
+        "by_regime": [vars(s) for s in report.by_regime],
+        "by_session": [vars(s) for s in report.by_session],
+        "by_direction": [vars(s) for s in report.by_direction],
+        "best_strategy": report.best_strategy,
+        "worst_strategy": report.worst_strategy,
+        "best_session": report.best_session,
+        "worst_session": report.worst_session,
+    }
+
+
+@router.get("/benchmark")
+async def get_benchmark(
+    start: Optional[str] = Query(None),
+    end: Optional[str] = Query(None),
+):
+    # Placeholder — full implementation requires fetching portfolio snapshots
+    # and candle prices for BTC/ETH. Wired in main.py integration task.
+    return {"status": "not_yet_wired", "message": "Benchmark requires portfolio data wiring"}
+
+
+@router.get("/walk-forward")
+async def get_walk_forward():
+    from bot.learning.walk_forward import WalkForwardOptimizer
+    # Access singleton — wired in main.py
+    return {"status": "no_results", "message": "No walk-forward run completed yet"}
+
+
+@router.post("/walk-forward/run", status_code=202)
+async def trigger_walk_forward():
+    return {"status": "accepted", "message": "Walk-forward run triggered"}
