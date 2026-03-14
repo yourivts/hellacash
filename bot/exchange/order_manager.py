@@ -31,11 +31,12 @@ class OrderManager:
         strategy_name: str,
         signal_id: Optional[int] = None,
         price: Optional[float] = None,
+        extra_data: Optional[Dict] = None,
     ) -> Optional[int]:
         """Submit a buy order. Returns internal order DB id."""
         try:
             resp = self.client.place_order(symbol, "buy", "market", amount_base, price)
-            return await self._record_order(resp, strategy_name, signal_id)
+            return await self._record_order(resp, strategy_name, signal_id, extra_data=extra_data)
         except Exception as e:
             logger.error("submit_buy(%s) failed: %s", symbol, e)
             return None
@@ -47,17 +48,19 @@ class OrderManager:
         strategy_name: str,
         signal_id: Optional[int] = None,
         price: Optional[float] = None,
+        extra_data: Optional[Dict] = None,
     ) -> Optional[int]:
         """Submit a sell order. Returns internal order DB id."""
         try:
             resp = self.client.place_order(symbol, "sell", "market", amount_base, price)
-            return await self._record_order(resp, strategy_name, signal_id)
+            return await self._record_order(resp, strategy_name, signal_id, extra_data=extra_data)
         except Exception as e:
             logger.error("submit_sell(%s) failed: %s", symbol, e)
             return None
 
     async def _record_order(
-        self, resp: Dict[str, Any], strategy_name: str, signal_id: Optional[int]
+        self, resp: Dict[str, Any], strategy_name: str, signal_id: Optional[int],
+        extra_data: Optional[Dict] = None,
     ) -> int:
         fill_price = float(resp.get("price", 0) or resp.get("filledAmountQuote", 0))
         filled = float(resp.get("filledAmount", resp.get("amount", 0)) or 0)
@@ -84,7 +87,7 @@ class OrderManager:
             )
             order_id = order.id
 
-        await self._bus.publish(TOPIC_TRADE_OPENED, {
+        payload = {
             "order_id": order_id,
             "bitvavo_order_id": resp.get("orderId"),
             "symbol": resp.get("market"),
@@ -94,7 +97,10 @@ class OrderManager:
             "fee": fee,
             "strategy_name": strategy_name,
             "paper_trade": paper or self.client.paper_trading,
-        })
+        }
+        if extra_data:
+            payload.update(extra_data)
+        await self._bus.publish(TOPIC_TRADE_OPENED, payload)
         return order_id
 
     async def on_fill_notification(self, fill: Dict[str, Any]) -> None:

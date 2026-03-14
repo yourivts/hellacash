@@ -4,6 +4,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Dict, List
 
+import pandas as pd
+
 from bot.config import get_settings
 from bot.data_loader import CandleCache
 from bot.events.bus import (
@@ -37,6 +39,8 @@ class TradingLoop:
         trade_analyzer: Any,
         signal_eval: Any,
         settings: Any,
+        onchain: Any = None,
+        orderbook: Any = None,
     ) -> None:
         self.candle_cache = candle_cache
         self.portfolio = portfolio
@@ -48,6 +52,8 @@ class TradingLoop:
         self.trade_analyzer = trade_analyzer
         self.signal_eval = signal_eval
         self.settings = settings
+        self.onchain = onchain
+        self.orderbook = orderbook
 
         self._pending_orders: set[str] = set()
 
@@ -59,6 +65,15 @@ class TradingLoop:
     def is_symbol_pending(self, symbol: str) -> bool:
         """Check if a symbol has a pending order (used by manual close endpoint too)."""
         return symbol in self._pending_orders
+
+    @staticmethod
+    def _resample(df_5m: pd.DataFrame, freq: str) -> pd.DataFrame:
+        if df_5m.empty:
+            return df_5m
+        return df_5m.resample(freq).agg({
+            "open": "first", "high": "max", "low": "min",
+            "close": "last", "volume": "sum",
+        }).dropna()
 
     # ── WebSocket event handlers ──────────────────────────────────────────────
 
@@ -266,14 +281,29 @@ class TradingLoop:
                 sentiment_score = sentiment.get_score(symbol)
 
                 # Build market context
+                # Resample for MTF
+                df_15m = self._resample(df_5m, "15min") if len(df_5m) >= 10 else df_5m
+                df_4h = self._resample(df_5m, "4h") if len(df_5m) >= 200 else df_1h
+                df_1d = self._resample(df_5m, "1D") if len(df_5m) >= 500 else df_1h
+
+                # Get provider scores
+                onchain_score = self.onchain.score(symbol) if self.onchain and self.onchain.is_available() else 0.0
+                orderbook_imb = self.orderbook.score(symbol) if self.orderbook and self.orderbook.is_available() else 0.0
+
                 ctx = MarketContext(
                     symbol=symbol,
                     candles_5m=df_5m,
                     candles_1h=df_1h,
+                    candles_15m=df_15m,
+                    candles_4h=df_4h,
+                    candles_1d=df_1d,
                     current_price=df_5m["close"].iloc[-1],
                     sentiment_score=sentiment_score,
                     portfolio_equity_eur=equity,
                     open_position_count=portfolio.open_position_count(),
+                    onchain_score=onchain_score,
+                    orderbook_imbalance=orderbook_imb,
+                    market_regime=regime,
                 )
 
                 # Run strategies and pick strongest signal
@@ -382,14 +412,21 @@ class TradingLoop:
 
                 self._pending_orders.add(symbol)
                 try:
+                    journal_data = {
+                        "signal": best_signal,
+                        "market_regime": regime,
+                        "candle_data": df_5m.tail(100).to_dict("records") if len(df_5m) > 0 else [],
+                    }
                     # LONG: buy to open. SHORT: sell to open.
                     if direction == "SHORT":
                         order_id = await order_mgr.submit_sell(
-                            symbol, amount_base, best_signal.strategy_name, signal_id
+                            symbol, amount_base, best_signal.strategy_name, signal_id,
+                            extra_data=journal_data,
                         )
                     else:
                         order_id = await order_mgr.submit_buy(
-                            symbol, amount_base, best_signal.strategy_name, signal_id
+                            symbol, amount_base, best_signal.strategy_name, signal_id,
+                            extra_data=journal_data,
                         )
 
                     if order_id:
