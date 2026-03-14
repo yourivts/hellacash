@@ -22,16 +22,11 @@ async def export_trades(
     end_date: Optional[str] = Query(None),
     limit: int = Query(10000, le=100000),
 ):
-    async with get_session() as session:
-        trades = await get_trades(session, limit=limit)
+    start = date.fromisoformat(start_date) if start_date else None
+    end = date.fromisoformat(end_date) if end_date else None
 
-    # Filter by date if provided
-    if start_date:
-        start = date.fromisoformat(start_date)
-        trades = [t for t in trades if t.created_at and t.created_at.date() >= start]
-    if end_date:
-        end = date.fromisoformat(end_date)
-        trades = [t for t in trades if t.created_at and t.created_at.date() <= end]
+    async with get_session() as session:
+        trades = await get_trades(session, limit=limit, start_date=start, end_date=end)
 
     output = io.StringIO()
     writer = csv.writer(output)

@@ -31,6 +31,13 @@ function initPriceChart() {
   window.addEventListener('resize', () => chart.applyOptions({ width: el.clientWidth }));
 }
 
+function pricePrecision(price) {
+  if (!price || price <= 0) return { precision: 2, minMove: 0.01 };
+  if (price < 0.01) return { precision: 6, minMove: 0.000001 };
+  if (price < 1) return { precision: 4, minMove: 0.0001 };
+  return { precision: 2, minMove: 0.01 };
+}
+
 async function loadCandles() {
   try {
     const res = await fetch(`${API}/api/candles/${currentPair}?interval=${currentInterval}&limit=200`);
@@ -39,6 +46,19 @@ async function loadCandles() {
       time: Math.floor(new Date(c.timestamp).getTime() / 1000),
       open: c.open, high: c.high, low: c.low, close: c.close,
     })).sort((a, b) => a.time - b.time);
+
+    // Determine price precision from the last candle's close price
+    const lastClose = candles.length ? candles[candles.length - 1].close : 0;
+    const pf = pricePrecision(lastClose);
+
+    // Remove old series and create fresh one to avoid stale data conflicts
+    chart.removeSeries(candleSeries);
+    candleSeries = chart.addCandlestickSeries({
+      upColor: '#10b981', downColor: '#ef4444',
+      borderUpColor: '#10b981', borderDownColor: '#ef4444',
+      wickUpColor: '#10b981', wickDownColor: '#ef4444',
+      priceFormat: { type: 'price', precision: pf.precision, minMove: pf.minMove },
+    });
     candleSeries.setData(candles);
   } catch (e) { console.error('loadCandles', e); }
 }
@@ -71,7 +91,8 @@ async function pollPrice() {
       const diff = price - prevPrice;
       if (diff !== 0) {
         const sign = diff > 0 ? '+' : '';
-        deltaEl.textContent = `${sign}${diff.toFixed(2)}`;
+        const pf = pricePrecision(price);
+        deltaEl.textContent = `${sign}${diff.toFixed(pf.precision)}`;
         deltaEl.className = `text-xs font-medium ${diff > 0 ? 'pnl-pos' : 'pnl-neg'}`;
       }
     }
@@ -215,7 +236,8 @@ async function refreshAnalytics() {
     setText('hdr-winrate', d.win_rate != null ? `${(d.win_rate * 100).toFixed(1)}%` : '—');
     setText('a-sharpe', d.sharpe_ratio != null ? d.sharpe_ratio.toFixed(2) : '—');
     setText('a-trades', d.total_trades || 0);
-    setValueColored('hdr-daily-pnl', d.total_pnl, `€${fmt(d.total_pnl)}`);
+    const dailyPnl = d.daily_pnl || 0;
+    setValueColored('hdr-daily-pnl', dailyPnl, `€${fmt(dailyPnl)}`);
   } catch (e) {}
 }
 
@@ -343,16 +365,50 @@ async function refreshStatus() {
 
 // ── Render helpers ────────────────────────────────────────────────────────────
 
+let openPositions = [];
+
 function renderPositions(positions) {
+  openPositions = positions;
+  _drawPositions();
+}
+
+function _drawPositions() {
   const el = document.getElementById('positions-list');
-  if (!positions.length) { el.innerHTML = '<div class="text-xs text-gray-600 italic">No positions</div>'; return; }
-  el.innerHTML = positions.map(p => {
+  if (!openPositions.length) { el.innerHTML = '<div class="text-xs text-gray-600 italic">No positions</div>'; return; }
+  el.innerHTML = openPositions.map(p => {
     const pnl = p.unrealized_pnl || 0;
+    const price = p.current_price || 0;
+    const value = price * (p.quantity || 0);
+    const entry = p.entry_price || 0;
+    const roiPct = entry > 0 ? ((price - entry) / entry * 100) : 0;
     return `<div class="flex justify-between items-center py-1 border-b border-gray-800">
-      <div><div class="text-white font-medium">${p.symbol}</div><div class="text-xs text-gray-500">${p.strategy_name}</div></div>
-      <div class="text-right"><div class="${pnl>=0?'pnl-pos':'pnl-neg'} font-medium">€${fmt(pnl)}</div><div class="text-xs text-gray-500">${p.quantity?.toFixed(4)||'—'}</div></div>
+      <div>
+        <div class="text-white font-medium">${p.symbol}</div>
+        <div class="text-xs text-gray-500">${p.strategy_name}</div>
+        <div class="text-xs text-gray-600">Entry €${fmt(entry)}</div>
+      </div>
+      <div class="text-right">
+        <div class="${pnl>=0?'pnl-pos':'pnl-neg'} font-medium">€${fmt(pnl)} <span class="text-xs">(${roiPct>=0?'+':''}${roiPct.toFixed(2)}%)</span></div>
+        <div class="text-xs text-gray-400">€${fmt(value)}</div>
+        <div class="text-xs text-gray-500">${p.quantity?.toFixed(4)||'—'} @ €${fmt(price)}</div>
+      </div>
     </div>`;
   }).join('');
+}
+
+function updatePositionPrices(symbol, price) {
+  let changed = false;
+  for (const p of openPositions) {
+    if (p.symbol === symbol) {
+      p.current_price = price;
+      const entry = p.entry_price || 0;
+      const qty = p.quantity || 0;
+      const dir = p.direction || 'LONG';
+      p.unrealized_pnl = dir === 'SHORT' ? (entry - price) * qty : (price - entry) * qty;
+      changed = true;
+    }
+  }
+  if (changed) _drawPositions();
 }
 
 function renderTrades(trades) {
@@ -401,11 +457,11 @@ function connectWS() {
       const type = msg.type;
       const d = msg.data || {};
 
-      if (type === 'market.ticker') updateLastCandle(d);
+      if (type === 'market.ticker') { updateLastCandle(d); if (d.symbol && d.price) updatePositionPrices(d.symbol, d.price); }
       if (type === 'strategy.signal') addSignalFeedItem(d);
       if (type === 'trade.opened') { addSignalFeedItem({...d, direction:'LONG', symbol:d.symbol}); refreshTrades(); }
       if (type === 'trade.closed') { refreshTrades(); refreshPortfolio(); }
-      if (type === 'portfolio.update') refreshPortfolio();
+      if (type === 'portfolio.update') { refreshPortfolio(); refreshAnalytics(); }
       if (type === 'sentiment.updated') { refreshSentiment(); refreshAnalytics(); }
       if (type === 'risk.halt') {
         document.getElementById('halt-badge').classList.remove('hidden');
@@ -476,7 +532,11 @@ async function switchInterval(iv) {
 
 function fmt(n) {
   if (n == null) return '—';
-  return Number(n).toLocaleString('nl-NL', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const v = Math.abs(Number(n));
+  let decimals = 2;
+  if (v > 0 && v < 0.01) decimals = 6;
+  else if (v >= 0.01 && v < 1) decimals = 4;
+  return Number(n).toLocaleString('nl-NL', { minimumFractionDigits: 2, maximumFractionDigits: decimals });
 }
 function fmtDuration(secs) {
   if (!secs) return '—';

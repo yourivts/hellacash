@@ -135,13 +135,13 @@ class SentimentAggregator:
         return self._cache.get(base, 0.0)
 
     async def run_cycle(self, assets: List[str]) -> None:
-        """Scrape and score ALL Bitvavo EUR markets, not just active trading symbols."""
+        """Scrape and score only tradeable symbols."""
         loop = asyncio.get_event_loop()
 
-        # Get all Bitvavo EUR markets
-        all_symbols = await loop.run_in_executor(None, _fetch_all_eur_symbols)
-        if not all_symbols:
-            all_symbols = assets  # fallback to active symbols
+        all_symbols = assets
+
+        # Update Reddit scraper's sub list to match tradeable symbols
+        self._reddit.set_tradeable_symbols(all_symbols)
 
         # Step 1: Pre-fetch ALL shared data sources ONCE, guarded by circuit breakers
         fear_greed_score = 0.0

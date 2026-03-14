@@ -214,8 +214,9 @@ async def count_trades_since(session: AsyncSession, since: datetime) -> int:
 
 async def clear_all_trade_data(session: AsyncSession) -> None:
     """Delete all trading data (for paper reset). Order respects FK constraints:
-    LearningEvent → Trade → Order ← Position, Order → Signal
+    TradeJournal → Trade/Order, LearningEvent → Trade, Trade → Order, Position → Order, Order → Signal
     """
+    await session.execute(delete(TradeJournal))
     await session.execute(delete(LearningEvent))
     await session.execute(delete(Trade))
     await session.execute(delete(Position))
@@ -238,6 +239,17 @@ async def get_snapshots(
     session: AsyncSession, days: int = 7
 ) -> List[PortfolioSnapshot]:
     since = datetime.utcnow() - timedelta(days=days)
+    result = await session.execute(
+        select(PortfolioSnapshot)
+        .where(PortfolioSnapshot.snapshot_at >= since)
+        .order_by(PortfolioSnapshot.snapshot_at)
+    )
+    return list(result.scalars().all())
+
+
+async def get_snapshots_since(
+    session: AsyncSession, since: datetime
+) -> List[PortfolioSnapshot]:
     result = await session.execute(
         select(PortfolioSnapshot)
         .where(PortfolioSnapshot.snapshot_at >= since)

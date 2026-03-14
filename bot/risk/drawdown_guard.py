@@ -7,6 +7,11 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# After circuit breaker triggers, wait this long before allowing recovery
+COOLDOWN_MINUTES = 30
+# Drawdown must recover below this % before trading resumes after cooldown
+RECOVERY_THRESHOLD_PCT = 6.0
+
 
 class DrawdownGuard:
     """
@@ -14,7 +19,7 @@ class DrawdownGuard:
 
     Levels:
         SOFT  (>3%):  reduce new position sizes by 50%
-        HARD  (>8%):  halt all new trades
+        HARD  (>8%):  halt all new trades (with cooldown recovery)
         DAILY (loss > limit): halt trading until next day
     """
 
@@ -32,6 +37,7 @@ class DrawdownGuard:
         self._daily_loss: float = 0.0
         self._daily_loss_date: date = date.today()
         self._hard_halt: bool = False
+        self._halt_triggered_at: Optional[datetime] = None
 
     def update(self, current_equity: float) -> None:
         """Call on every portfolio snapshot."""
@@ -65,12 +71,31 @@ class DrawdownGuard:
         dd = self.current_drawdown_pct(current_equity)
 
         if self._hard_halt:
-            return False, "Emergency halt active"
+            # Check for automatic recovery after cooldown
+            if self._halt_triggered_at is not None:
+                elapsed = (datetime.now(timezone.utc) - self._halt_triggered_at).total_seconds()
+                if elapsed >= COOLDOWN_MINUTES * 60 and dd < RECOVERY_THRESHOLD_PCT:
+                    logger.info(
+                        "Cooldown expired (%.0f min) and drawdown recovered to %.1f%% "
+                        "(< %.1f%%) — resuming trading",
+                        elapsed / 60, dd, RECOVERY_THRESHOLD_PCT,
+                    )
+                    self._hard_halt = False
+                    self._halt_triggered_at = None
+                else:
+                    remaining = max(0, COOLDOWN_MINUTES * 60 - elapsed) / 60
+                    return False, (
+                        f"Emergency halt active (cooldown {remaining:.0f} min remaining, "
+                        f"drawdown {dd:.1f}%, need < {RECOVERY_THRESHOLD_PCT}%)"
+                    )
+            else:
+                return False, "Emergency halt active"
 
-        if dd >= self.max_drawdown_pct:
+        if not self._hard_halt and dd >= self.max_drawdown_pct:
             self._hard_halt = True
+            self._halt_triggered_at = datetime.now(timezone.utc)
             reason = f"Drawdown {dd:.1f}% exceeds hard limit {self.max_drawdown_pct}%"
-            logger.warning("CIRCUIT BREAKER: %s", reason)
+            logger.warning("CIRCUIT BREAKER: %s — cooldown %d min", reason, COOLDOWN_MINUTES)
             return False, reason
 
         if self._daily_loss >= self.daily_loss_limit_eur:
@@ -90,4 +115,5 @@ class DrawdownGuard:
     def reset_hard_halt(self) -> None:
         """Manual override to resume trading after investigation."""
         self._hard_halt = False
+        self._halt_triggered_at = None
         logger.info("Hard halt reset manually")

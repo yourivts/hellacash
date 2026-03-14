@@ -16,6 +16,7 @@ def initial_stops(
     df: pd.DataFrame,
     atr_multiplier: float = 2.0,
     rr_ratio: float = 3.0,
+    direction: str = "LONG",
 ) -> tuple[float, float]:
     """
     Compute initial stop-loss and take-profit prices.
@@ -25,15 +26,27 @@ def initial_stops(
     """
     if len(df) < 15:
         # Fallback: 2% stop, 3% take-profit
-        stop = entry_price * 0.98
-        tp = entry_price * 1.03
+        if direction == "SHORT":
+            stop = entry_price * 1.02
+            tp = entry_price * 0.97
+        else:
+            stop = entry_price * 0.98
+            tp = entry_price * 1.03
         return stop, tp
 
     a = compute_atr(df["high"], df["low"], df["close"]).iloc[-1]
-    stop = entry_price - atr_multiplier * a
-    risk = entry_price - stop
-    tp = entry_price + rr_ratio * risk
-    logger.debug("StopLoss: entry=%.4f ATR=%.4f stop=%.4f tp=%.4f", entry_price, a, stop, tp)
+
+    if direction == "SHORT":
+        stop = entry_price + atr_multiplier * a
+        risk = stop - entry_price
+        tp = entry_price - rr_ratio * risk
+    else:
+        stop = entry_price - atr_multiplier * a
+        risk = entry_price - stop
+        tp = entry_price + rr_ratio * risk
+
+    logger.debug("StopLoss: %s entry=%.4f ATR=%.4f stop=%.4f tp=%.4f",
+                 direction, entry_price, a, stop, tp)
     return stop, tp
 
 
@@ -42,17 +55,22 @@ def trail_stop(
     highest_price: float,
     current_stop: float,
     atr_value: float,
+    direction: str = "LONG",
     activation_multiplier: float = 1.0,
 ) -> float:
     """
-    Update trailing stop: only moves up, never down.
-    Activates when price is > entry + 1×ATR above the stop.
+    Update trailing stop: for LONG only moves up, for SHORT only moves down.
 
     Returns new stop-loss price (may be same as current_stop).
     """
-    new_stop = highest_price - atr_value
-    if new_stop > current_stop:
-        return new_stop
+    if direction == "SHORT":
+        new_stop = highest_price + atr_value  # highest_price = lowest for shorts
+        if new_stop < current_stop:
+            return new_stop
+    else:
+        new_stop = highest_price - atr_value
+        if new_stop > current_stop:
+            return new_stop
     return current_stop
 
 
@@ -60,12 +78,19 @@ def check_stop_triggered(
     current_price: float,
     stop_loss: float,
     take_profit: float,
+    direction: str = "LONG",
 ) -> Optional[str]:
     """
     Returns 'stop_loss', 'take_profit', or None.
     """
-    if current_price <= stop_loss:
-        return "stop_loss"
-    if current_price >= take_profit:
-        return "take_profit"
+    if direction == "SHORT":
+        if current_price >= stop_loss:
+            return "stop_loss"
+        if current_price <= take_profit:
+            return "take_profit"
+    else:
+        if current_price <= stop_loss:
+            return "stop_loss"
+        if current_price >= take_profit:
+            return "take_profit"
     return None

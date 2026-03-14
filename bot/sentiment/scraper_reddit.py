@@ -11,82 +11,87 @@ from bot.sentiment.keywords import get_keywords
 
 logger = logging.getLogger(__name__)
 
-SUBREDDITS = [
-    # Major crypto subs
+# General crypto subs — always scraped (cover all assets)
+GENERAL_SUBS = [
     "CryptoCurrency",
-    "Bitcoin",
-    "ethereum",
-    "altcoin",
     "CryptoMarkets",
-    "defi",
     "SatoshiStreetBets",
     "CryptoMoonShots",
-    # Trading & analysis
-    "CryptoTechnology",
     "BitcoinMarkets",
     "ethtrader",
     "ethfinance",
-    "CryptoCurrencyTrading",
+    "defi",
+    "altcoin",
     "Daytrading",
     "wallstreetbetscrypto",
-    # Major L1/L2 coins
-    "solana",
-    "cardano",
-    "Ripple",
-    "dogecoin",
-    "polkadot",
-    "Chainlink",
-    "cosmosnetwork",
-    "algorand",
-    "Tezos",
-    "Stellar",
-    "Hedera",
-    "avax",
-    "FantomFoundation",
-    "Tronix",
-    "NEO",
-    "VeChain",
-    "harmony_one",
-    "nearprotocol",
-    "Elrond",
-    "IOStoken",
-    "Ravencoin",
-    # DeFi & L2
-    "UniSwap",
-    "Aave",
-    "PancakeSwapOfficial",
-    "SushiSwapOfficial",
-    "MakerDAO",
-    "LidoFinance",
-    "Arbitrum",
-    "optimismCollective",
-    "polygonnetwork",
-    "0xPolygon",
-    "starknet",
-    # NFT & Gaming
-    "NFT",
-    "AxieInfinity",
-    "TheSandboxGaming",
-    "decentraland",
-    "ImmutableX",
-    # Memecoins
-    "SHIBArmy",
-    "Floki",
-    "pepecoin",
-    "dogelon",
-    "BONK",
-    # Privacy & misc
-    "Monero",
-    "litecoin",
-    "EOS",
-    "Iota",
 ]
 
-HEADERS = {"User-Agent": "hellacash/1.0 (sentiment bot; +https://github.com/hellacash)"}
+# Coin-specific subs — only scraped if the base asset is tradeable
+_COIN_SUBS: Dict[str, List[str]] = {
+    "BTC": ["Bitcoin"],
+    "ETH": ["ethereum"],
+    "SOL": ["solana"],
+    "ADA": ["cardano"],
+    "XRP": ["Ripple"],
+    "DOGE": ["dogecoin"],
+    "DOT": ["polkadot"],
+    "LINK": ["Chainlink"],
+    "ATOM": ["cosmosnetwork"],
+    "AVAX": ["avax"],
+    "MATIC": ["0xPolygon"],
+    "ARB": ["Arbitrum"],
+    "OP": ["optimismCollective"],
+    "UNI": ["UniSwap"],
+    "AAVE": ["Aave"],
+    "MKR": ["MakerDAO"],
+    "LDO": ["LidoFinance"],
+    "NEAR": ["nearprotocol"],
+    "SHIB": ["SHIBArmy"],
+    "LTC": ["litecoin"],
+    "XMR": ["Monero"],
+    "IOTA": ["Iota"],
+    "HBAR": ["Hedera"],
+    "VET": ["VeChain"],
+    "ALGO": ["algorand"],
+    "XTZ": ["Tezos"],
+    "XLM": ["Stellar"],
+    "FLOKI": ["Floki"],
+    "BONK": ["BONK"],
+    "TRX": ["Tronix"],
+    "CAKE": ["pancakeswap"],
+    "IMX": ["ImmutableX"],
+    "STRK": ["starknet"],
+}
 
-# Cache subreddit data for 30 minutes to avoid 429s
-CACHE_TTL = 1800
+# Built dynamically based on tradeable symbols
+_active_subs: List[str] = []
+
+
+def _build_sub_list(tradeable_symbols: List[str]) -> List[str]:
+    """Build subreddit list from general subs + coin subs for tradeable assets."""
+    subs = list(GENERAL_SUBS)
+    for sym in tradeable_symbols:
+        base = sym.split("-")[0].upper()
+        for sub in _COIN_SUBS.get(base, []):
+            if sub not in subs:
+                subs.append(sub)
+    return subs
+
+# Cache subreddit data for 5 minutes
+CACHE_TTL = 300
 _sub_cache: Dict[str, Tuple[float, list]] = {}  # sub_name → (timestamp, posts)
+
+# Resolved at first use from settings
+_user_agent: str = ""
+
+
+def _get_user_agent() -> str:
+    global _user_agent
+    if not _user_agent:
+        from bot.config import get_settings
+        _user_agent = get_settings().reddit_user_agent
+        logger.info("Reddit User-Agent: %s", _user_agent)
+    return _user_agent
 
 
 def _fetch_sub(sub_name: str) -> list:
@@ -96,9 +101,13 @@ def _fetch_sub(sub_name: str) -> list:
     if cached and (now - cached[0]) < CACHE_TTL:
         return cached[1]
 
-    # Use old.reddit.com — different rate limits than www.reddit.com
-    url = f"https://old.reddit.com/r/{sub_name}/hot.json?limit=100"
-    req = urllib.request.Request(url, headers=HEADERS)
+    url = f"https://www.reddit.com/r/{sub_name}/hot.json?limit=100&raw_json=1"
+    headers = {
+        "User-Agent": _get_user_agent(),
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=10) as resp:
         data = json.loads(resp.read().decode())
 
@@ -107,17 +116,33 @@ def _fetch_sub(sub_name: str) -> list:
     return posts
 
 
+BACKOFF_CYCLES = 3  # skip this many cycles after a 403/429
+
+
 class RedditScraper:
     def __init__(self, client_id: str = "", client_secret: str = "", user_agent: str = "") -> None:
-        pass  # credentials no longer needed
+        self._subs: List[str] = list(GENERAL_SUBS)
+        self._backoff_until: float = 0.0  # timestamp when backoff expires
+
+    def set_tradeable_symbols(self, symbols: List[str]) -> None:
+        """Rebuild the subreddit list based on current tradeable symbols."""
+        self._subs = _build_sub_list(symbols)
+        logger.info("Reddit scraper active subs: %d (%d general + %d coin-specific)",
+                     len(self._subs), len(GENERAL_SUBS), len(self._subs) - len(GENERAL_SUBS))
 
     def prefetch_subs(self) -> None:
-        """Fetch all subreddits once, populating the cache. Call before scoring assets."""
+        """Fetch all active subreddits once, populating the cache."""
+        now = time.time()
+        if now < self._backoff_until:
+            remaining = int(self._backoff_until - now)
+            logger.info("Reddit backoff active — skipping prefetch (%d s remaining)", remaining)
+            return
+
         fetched = 0
         skipped = 0
-        total = len(SUBREDDITS)
-        for i, sub_name in enumerate(SUBREDDITS):
-            # Skip if still cached
+        blocked = False
+        total = len(self._subs)
+        for sub_name in self._subs:
             cached = _sub_cache.get(sub_name)
             if cached and (time.time() - cached[0]) < CACHE_TTL:
                 skipped += 1
@@ -128,22 +153,28 @@ class RedditScraper:
                 if fetched % 10 == 0:
                     logger.info("Reddit prefetch progress: %d/%d fetched, %d cached", fetched, total - skipped, skipped)
             except urllib.error.HTTPError as e:
-                if e.code == 429:
-                    logger.warning("Reddit 429 for r/%s after %d fetched — will continue next cycle", sub_name, fetched)
+                if e.code in (429, 403):
+                    self._backoff_until = time.time() + BACKOFF_CYCLES * CACHE_TTL
+                    logger.warning(
+                        "Reddit %d for r/%s after %d fetched — backing off for %d s",
+                        e.code, sub_name, fetched, BACKOFF_CYCLES * CACHE_TTL,
+                    )
+                    blocked = True
                     break
                 logger.error("Reddit prefetch error r/%s: %s", sub_name, e)
             except Exception as e:
                 logger.error("Reddit prefetch error r/%s: %s", sub_name, e)
-            # 1s delay — old.reddit.com is more lenient
             time.sleep(1)
-        logger.info("Reddit prefetch done — %d subs cached (%d new, %d already cached)", len(_sub_cache), fetched, skipped)
+
+        if not blocked:
+            logger.info("Reddit prefetch done — %d subs cached (%d new, %d already cached)", len(_sub_cache), fetched, skipped)
 
     def fetch_posts(self, asset: str, limit: int = 50) -> List[str]:
         """Filter cached subreddit posts by asset keywords. No HTTP requests."""
         keywords = get_keywords(asset)
         texts: List[str] = []
 
-        for sub_name in SUBREDDITS:
+        for sub_name in self._subs:
             cached = _sub_cache.get(sub_name)
             if not cached:
                 continue

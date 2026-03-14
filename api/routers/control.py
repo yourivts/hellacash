@@ -45,7 +45,21 @@ async def reset_halt():
 
 @router.post("/paper/reset")
 async def reset_paper():
-    """Reset paper trading balance and drawdown guard."""
+    """Reset paper trading balance, drawdown guard, and all trade history."""
+    import logging
+    logger = logging.getLogger(__name__)
+
+    # Clear DB trade data
+    try:
+        from bot.data.database import get_session
+        from bot.data.repositories import clear_all_trade_data
+        async with get_session() as session:
+            await clear_all_trade_data(session)
+        logger.info("Paper reset: cleared all trade data from DB")
+    except Exception as e:
+        logger.error("Paper reset: failed to clear DB: %s", e, exc_info=True)
+
+    # Reset in-memory state (always runs even if DB clear fails)
     client = bot_main._get_client()
     client._paper_balance = {"EUR": 10000.0}
     client._save_paper_state()
@@ -55,4 +69,7 @@ async def reset_paper():
     drawdown._daily_loss = 0.0
     portfolio = bot_main._get_portfolio()
     portfolio._positions = {}
+    portfolio._peak_equity = 0.0
+    portfolio._daily_realized_loss = 0.0
+    logger.info("Paper reset: balance restored to €10,000")
     return {"status": "paper_reset", "balance": 10000.0}

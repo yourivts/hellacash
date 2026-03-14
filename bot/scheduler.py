@@ -26,6 +26,7 @@ class BotScheduler:
         active_symbols: Callable[[], List[str]],
         settings: Any,
         discord_run: Optional[Callable] = None,
+        walk_forward_run: Optional[Callable] = None,
     ) -> None:
         self._run_cycle = run_cycle
         self._sentiment_cycle = sentiment_cycle
@@ -35,6 +36,7 @@ class BotScheduler:
         self._active_symbols = active_symbols
         self._settings = settings
         self._discord_run = discord_run
+        self._walk_forward_run = walk_forward_run
         self._tasks: List[asyncio.Task] = []
 
     async def run_all(self) -> None:
@@ -48,6 +50,8 @@ class BotScheduler:
         ]
         if self._discord_run is not None:
             coros.append(self._discord_run())
+        if self._walk_forward_run is not None:
+            coros.append(self._walk_forward_loop(168))  # weekly
         self._tasks = [asyncio.create_task(c) for c in coros]
         await asyncio.gather(*self._tasks)
 
@@ -92,3 +96,14 @@ class BotScheduler:
                     await self._optimizer_run()
                 except Exception as e:
                     logger.error("Optimizer error: %s", e)
+
+    async def _walk_forward_loop(self, interval_hours: int) -> None:
+        # Run once on startup (after 60s warmup for candles to load), then weekly
+        await asyncio.sleep(60)
+        while True:
+            try:
+                logger.info("Walk-forward optimization starting...")
+                await self._walk_forward_run()
+            except Exception as e:
+                logger.error("Walk-forward error: %s", e)
+            await asyncio.sleep(interval_hours * 3600)

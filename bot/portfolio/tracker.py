@@ -15,8 +15,20 @@ from bot.data.repositories import (
     update_position,
 )
 from bot.exchange.bitvavo_client import BitvavoClient
+from bot.risk.fees import compute_trade_fees, get_borrow_rate_hourly
 
 logger = logging.getLogger(__name__)
+
+
+def _unrealized_pnl(pos: Dict[str, Any]) -> float:
+    """Compute unrealized P&L for a position, direction-aware."""
+    direction = pos.get("direction", "LONG")
+    entry = pos["entry_price"]
+    current = pos["current_price"]
+    qty = pos["quantity"]
+    if direction == "SHORT":
+        return (entry - current) * qty
+    return (current - entry) * qty
 
 
 class PortfolioTracker:
@@ -41,9 +53,11 @@ class PortfolioTracker:
         for p in positions:
             ticker = self.client.get_ticker(p.symbol)
             current_price = ticker.price if ticker else p.current_price
-            self._positions[p.symbol] = {
+            direction = getattr(p, "direction", "LONG") or "LONG"
+            pos_dict = {
                 "id": p.id,
                 "symbol": p.symbol,
+                "direction": direction,
                 "strategy_name": p.strategy_name,
                 "entry_price": p.entry_price,
                 "current_price": current_price,
@@ -55,22 +69,35 @@ class PortfolioTracker:
                 "entry_order_id": p.entry_order_id,
                 "paper_trade": p.paper_trade,
                 "opened_at": p.opened_at,
-                "unrealized_pnl": (current_price - p.entry_price) * p.quantity,
             }
+            pos_dict["unrealized_pnl"] = _unrealized_pnl(pos_dict)
+            self._positions[p.symbol] = pos_dict
 
     def get_equity_eur(self) -> float:
         """Total portfolio value in EUR (cash + positions)."""
         cash = self.client.get_balance_eur()
         positions_value = sum(
             p["current_price"] * p["quantity"] for p in self._positions.values()
+            if p.get("direction", "LONG") == "LONG"
         )
+        # For SHORT positions, the value is the collateral (entry_price * qty)
+        # plus/minus the unrealized P&L
+        for p in self._positions.values():
+            if p.get("direction") == "SHORT":
+                positions_value += p["entry_price"] * p["quantity"] + _unrealized_pnl(p)
         return cash + positions_value
 
     def get_cash_eur(self) -> float:
         return self.client.get_balance_eur()
 
     def get_positions_value_eur(self) -> float:
-        return sum(p["current_price"] * p["quantity"] for p in self._positions.values())
+        total = 0.0
+        for p in self._positions.values():
+            if p.get("direction", "LONG") == "LONG":
+                total += p["current_price"] * p["quantity"]
+            else:
+                total += p["entry_price"] * p["quantity"] + _unrealized_pnl(p)
+        return total
 
     def open_position_count(self) -> int:
         return len(self._positions)
@@ -88,8 +115,12 @@ class PortfolioTracker:
         if symbol in self._positions:
             pos = self._positions[symbol]
             pos["current_price"] = price
-            pos["unrealized_pnl"] = (price - pos["entry_price"]) * pos["quantity"]
-            if price > pos["highest_price"]:
+            pos["unrealized_pnl"] = _unrealized_pnl(pos)
+            direction = pos.get("direction", "LONG")
+            if direction == "LONG" and price > pos["highest_price"]:
+                pos["highest_price"] = price
+            elif direction == "SHORT" and price < pos["highest_price"]:
+                # For shorts, track the lowest price (best for trailing stop)
                 pos["highest_price"] = price
 
     def current_drawdown_pct(self) -> float:
@@ -115,12 +146,18 @@ class PortfolioTracker:
         take_profit: float,
         entry_order_id: Optional[int],
         paper_trade: bool = True,
+        direction: str = "LONG",
     ) -> None:
+        if symbol in self._positions:
+            logger.warning("Skipping duplicate position for %s — already open", symbol)
+            return
+
         from bot.data.repositories import save_position
         async with get_session() as session:
             pos = await save_position(
                 session,
                 symbol=symbol,
+                direction=direction,
                 strategy_name=strategy_name,
                 entry_price=entry_price,
                 current_price=entry_price,
@@ -135,6 +172,7 @@ class PortfolioTracker:
         self._positions[symbol] = {
             "id": pos.id,
             "symbol": symbol,
+            "direction": direction,
             "strategy_name": strategy_name,
             "entry_price": entry_price,
             "current_price": entry_price,
@@ -148,7 +186,7 @@ class PortfolioTracker:
             "opened_at": datetime.now(timezone.utc),
             "unrealized_pnl": 0.0,
         }
-        logger.info("Position opened: %s x%.4f @ €%.4f", symbol, quantity, entry_price)
+        logger.info("Position opened: %s %s x%.4f @ €%.4f", direction, symbol, quantity, entry_price)
 
     async def close_position(
         self,
@@ -164,18 +202,41 @@ class PortfolioTracker:
 
         entry_price = pos["entry_price"]
         quantity = pos["quantity"]
-        gross_pnl = (exit_price - entry_price) * quantity
-        fee_pct = 0.0025
-        fee = (entry_price + exit_price) * quantity * fee_pct
-        net_pnl = gross_pnl - fee
-        roi_pct = net_pnl / (entry_price * quantity) * 100.0
+        direction = pos.get("direction", "LONG")
 
-        if net_pnl < 0:
-            self._daily_realized_loss += abs(net_pnl)
+        # Direction-aware P&L
+        if direction == "SHORT":
+            gross_pnl = (entry_price - exit_price) * quantity
+        else:
+            gross_pnl = (exit_price - entry_price) * quantity
 
         hold_secs = int(
             (datetime.now(timezone.utc) - pos["opened_at"]).total_seconds()
         )
+        hold_hours = hold_secs / 3600.0
+
+        # Compute fees using actual Bitvavo fee schedule
+        fee = compute_trade_fees(
+            symbol=symbol,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            quantity=quantity,
+            direction=direction,
+            hold_hours=hold_hours,
+        )
+
+        # Separate borrow fee for record-keeping
+        borrow_fee = 0.0
+        if direction == "SHORT" and hold_hours > 0:
+            hourly_rate = get_borrow_rate_hourly(symbol)
+            borrow_fee = entry_price * quantity * hourly_rate * hold_hours
+
+        net_pnl = gross_pnl - fee
+        cost_basis = entry_price * quantity
+        roi_pct = net_pnl / cost_basis * 100.0 if cost_basis > 0 else 0.0
+
+        if net_pnl < 0:
+            self._daily_realized_loss += abs(net_pnl)
 
         async with get_session() as session:
             # Remove from positions table
@@ -185,6 +246,7 @@ class PortfolioTracker:
             trade = await save_trade(
                 session,
                 symbol=symbol,
+                direction=direction,
                 strategy_name=pos["strategy_name"],
                 entry_order_id=pos["entry_order_id"],
                 exit_order_id=exit_order_id,
@@ -198,16 +260,18 @@ class PortfolioTracker:
                 hold_seconds=hold_secs,
                 exit_reason=exit_reason,
                 paper_trade=pos["paper_trade"],
+                borrow_fee=borrow_fee,
             )
 
         logger.info(
-            "Position closed: %s @ €%.4f | P&L: €%.2f (%.2f%%) | Reason: %s",
-            symbol, exit_price, net_pnl, roi_pct, exit_reason,
+            "Position closed: %s %s @ €%.4f | P&L: €%.2f (%.2f%%) | Fee: €%.2f | Reason: %s",
+            direction, symbol, exit_price, net_pnl, roi_pct, fee, exit_reason,
         )
 
         return {
             "trade_id": trade.id,
             "symbol": symbol,
+            "direction": direction,
             "net_pnl": net_pnl,
             "roi_pct": roi_pct,
             "exit_reason": exit_reason,
@@ -240,3 +304,10 @@ class PortfolioTracker:
                 max_drawdown_pct=dd,
                 win_rate=win_rate,
             )
+
+        # Update Prometheus gauges
+        try:
+            from api.metrics import update_portfolio_metrics
+            update_portfolio_metrics(equity, dd, self.open_position_count(), win_rate)
+        except ImportError:
+            pass  # metrics module not available (e.g. in tests)

@@ -48,9 +48,26 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def init_db() -> None:
-    """Create all tables (run once on startup)."""
+    """Create all tables and add missing columns (run once on startup)."""
     async with get_engine().begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # Lightweight migration: add new columns if they don't exist yet
+    _migrations = [
+        ("positions", "direction", "VARCHAR(10) DEFAULT 'LONG'"),
+        ("trades", "direction", "VARCHAR(10) DEFAULT 'LONG'"),
+        ("trades", "borrow_fee", "FLOAT DEFAULT 0.0"),
+    ]
+    async with get_engine().begin() as conn:
+        for table, column, col_type in _migrations:
+            await conn.execute(
+                _sa_text(
+                    f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {col_type}"
+                )
+            )
+
+
+from sqlalchemy import text as _sa_text
 
 
 async def close_db() -> None:

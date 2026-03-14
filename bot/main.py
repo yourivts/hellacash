@@ -237,6 +237,13 @@ def _get_orderbook() -> OrderBookProvider:
     return _orderbook_provider
 
 
+def _get_walk_forward() -> WalkForwardOptimizer:
+    global _walk_forward
+    if _walk_forward is None:
+        _walk_forward = WalkForwardOptimizer()
+    return _walk_forward
+
+
 def _get_trading_loop() -> TradingLoop:
     global _trading_loop
     if _trading_loop is None:
@@ -334,6 +341,41 @@ async def _main() -> None:
     # Create BotScheduler
     sentiment = _get_sentiment()
     param_optimizer = _get_param_optimizer()
+    walk_forward = _get_walk_forward()
+
+    # Walk-forward candle fetcher: fetches BTC-EUR 5m candles for day ranges
+    async def _wf_candle_fetcher(start_day: int, end_day: int):
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        total_days = 120
+        start_dt = now - timedelta(days=total_days - start_day)
+        end_dt = now - timedelta(days=total_days - end_day)
+        logger.info("Walk-forward: fetching candles day %d-%d (%s to %s)",
+                     start_day, end_day, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"))
+        loop = asyncio.get_running_loop()
+        client = _get_client()
+        candles = await loop.run_in_executor(
+            None, lambda: client.get_candles_range("BTC-EUR", "5m", start_dt, end_dt)
+        )
+        logger.info("Walk-forward: got %d candles for day %d-%d", len(candles), start_day, end_day)
+        return candles
+
+    async def _run_walk_forward():
+        result = await walk_forward.run(_wf_candle_fetcher)
+        if result.adopted and result.recommended_params:
+            router = _get_router()
+            params = result.recommended_params
+            router.update_hybrid_params(
+                sentiment_weight=params.get("sentiment_weight", 0.25),
+                entry_threshold=params.get("entry_threshold", 0.40),
+                indicator_weights=params.get("indicator_weights"),
+            )
+            logger.info(
+                "Walk-forward adopted params: sentiment_weight=%.2f, entry_threshold=%.2f",
+                params.get("sentiment_weight", 0), params.get("entry_threshold", 0),
+            )
+        else:
+            logger.info("Walk-forward completed — params not adopted (avg_sharpe=%.2f)", result.avg_oos_sharpe)
 
     scheduler = BotScheduler(
         run_cycle=lambda: trading_loop.run_cycle(_tradeable_symbols, _running),
@@ -346,6 +388,7 @@ async def _main() -> None:
         active_symbols=get_active_symbols,
         settings=settings,
         discord_run=discord.run,
+        walk_forward_run=_run_walk_forward,
     )
     _scheduler = scheduler
 
@@ -397,7 +440,7 @@ async def _main() -> None:
                     )
                     await save_journal_entry(
                         session,
-                        trade_id=data.get("order_id"),
+                        entry_order_id=data.get("order_id"),
                         symbol=data.get("symbol"),
                         direction=sig.direction,
                         strategy_name=sig.strategy_name,

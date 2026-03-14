@@ -78,11 +78,24 @@ class TestManualClose:
 
     def test_partial_close(self):
         app, settings = _make_app_and_settings()
+        # Give position an id so DB update path is exercised
+        app.state.portfolio.get_position.return_value["id"] = 42
         client = TestClient(app)
-        with patch("api.middleware.auth.get_settings", return_value=settings):
+
+        mock_session = MagicMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("api.middleware.auth.get_settings", return_value=settings), \
+             patch("api.routers.positions.get_session", return_value=mock_session), \
+             patch("api.routers.positions.save_trade", new_callable=AsyncMock) as mock_save, \
+             patch("api.routers.positions.update_position", new_callable=AsyncMock) as mock_update:
             resp = client.post("/api/positions/BTC-EUR/close", json={"amount": 0.25})
         assert resp.status_code == 200
         data = resp.json()
         assert data["partial"] is True
         assert data["closed_amount"] == 0.25
         assert data["remaining_amount"] == 0.25
+        # Verify DB persistence was called
+        mock_save.assert_called_once()
+        mock_update.assert_called_once()

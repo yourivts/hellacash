@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Callable, Dict, List
 
 import pandas as pd
@@ -9,6 +10,7 @@ import pandas as pd
 from bot.config import get_settings
 from bot.data_loader import CandleCache
 from bot.events.bus import (
+    TOPIC_PORTFOLIO_UPDATE,
     TOPIC_SIGNAL,
     TOPIC_TICKER,
     TOPIC_TRADE_CLOSED,
@@ -61,6 +63,7 @@ class TradingLoop:
         self._trade_stats_cache: Dict[str, Any] = {}
         self._trade_stats_ts: float = 0
         self._last_halt_log: float = 0  # throttle halt log messages
+        self._last_portfolio_publish: float = 0  # throttle portfolio update events
 
     def is_symbol_pending(self, symbol: str) -> bool:
         """Check if a symbol has a pending order (used by manual close endpoint too)."""
@@ -91,6 +94,15 @@ class TradingLoop:
         if symbol and price:
             self.portfolio.update_price(symbol, price)
             await get_bus().publish(TOPIC_TICKER, data)
+
+            # Publish portfolio update (throttled to every 3s)
+            now = time.monotonic()
+            if now - self._last_portfolio_publish >= 3.0:
+                self._last_portfolio_publish = now
+                await get_bus().publish(TOPIC_PORTFOLIO_UPDATE, {
+                    "equity_eur": self.portfolio.get_equity_eur(),
+                    "positions_value_eur": self.portfolio.get_positions_value_eur(),
+                })
 
     async def on_fill(self, data: Dict[str, Any]) -> None:
         await self.order_mgr.on_fill_notification(data)

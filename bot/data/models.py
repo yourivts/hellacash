@@ -201,7 +201,8 @@ class TradeJournal(Base):
     __tablename__ = "trade_journal"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    trade_id: Mapped[int] = mapped_column(Integer, ForeignKey("trades.id"), unique=True)
+    trade_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("trades.id"), nullable=True, unique=True)
+    entry_order_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("orders.id"), nullable=True)
     symbol: Mapped[str] = mapped_column(String(20), nullable=False)
     direction: Mapped[str] = mapped_column(String(10), nullable=False)
     strategy_name: Mapped[str] = mapped_column(String(50), nullable=False)

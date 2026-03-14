@@ -93,7 +93,7 @@ class CandleCache:
         for interval in ["5m", "1h"]:
             try:
                 candles = await loop.run_in_executor(
-                    None, lambda iv=interval: client.get_candles(symbol, iv, limit=1500)
+                    None, lambda iv=interval: client.get_candles(symbol, iv, limit=1440)
                 )
                 for c in candles:
                     self.cache_candle(symbol, interval, {
@@ -112,7 +112,7 @@ class CandleCache:
         for interval in ["5m", "1h"]:
             try:
                 candles = await loop.run_in_executor(
-                    None, lambda s=symbol, iv=interval: client.get_candles(s, iv, limit=1500)
+                    None, lambda s=symbol, iv=interval: client.get_candles(s, iv, limit=1440)
                 )
                 for c in candles:
                     self.cache_candle(symbol, interval, {

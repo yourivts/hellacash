@@ -265,6 +265,55 @@ class BitvavoClient:
             logger.error("get_candles(%s) failed: %s", symbol, e)
             return []
 
+    def get_candles_range(
+        self, symbol: str, interval: str, start: datetime, end: datetime
+    ) -> List[CandleData]:
+        """Fetch candles between start and end timestamps, paginating as needed."""
+        import time as _time
+
+        # Map interval to milliseconds for pagination
+        _interval_ms = {
+            "1m": 60_000, "5m": 300_000, "15m": 900_000,
+            "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000,
+        }
+        step_ms = _interval_ms.get(interval, 300_000) * 1440  # 1440 candles per page
+
+        all_candles: List[CandleData] = []
+        cursor_ms = int(start.timestamp() * 1000)
+        end_ms = int(end.timestamp() * 1000)
+
+        while cursor_ms < end_ms:
+            page_end = min(cursor_ms + step_ms, end_ms)
+            url = f"{_API_BASE}/{symbol}/candles?interval={interval}&start={cursor_ms}&end={page_end}&limit=1440"
+            try:
+                raw = _api_get(url)
+                candles = self._parse_candles(symbol, interval, raw)
+                if not candles:
+                    break
+                all_candles.extend(candles)
+                # Move cursor past the last candle we got
+                last_ts = max(int(c.timestamp.timestamp() * 1000) for c in candles)
+                cursor_ms = last_ts + _interval_ms.get(interval, 300_000)
+                _time.sleep(0.2)  # rate limit between pages
+            except Exception as e:
+                logger.debug("get_candles_range(%s) page ended: %s", symbol, e)
+                break  # likely reached end of available data
+
+        # Sort chronologically and deduplicate
+        all_candles.sort(key=lambda c: c.timestamp)
+        seen = set()
+        deduped = []
+        for c in all_candles:
+            ts = c.timestamp
+            if ts not in seen:
+                seen.add(ts)
+                deduped.append(c)
+
+        logger.info("get_candles_range(%s, %s): fetched %d candles (%d days)",
+                     symbol, interval, len(deduped),
+                     (end - start).days)
+        return deduped
+
     def _public_candles(self, symbol: str, interval: str, limit: int) -> List[CandleData]:
         """Fetch candles from Bitvavo public REST API (no credentials needed)."""
         url = f"{_API_BASE}/{symbol}/candles?interval={interval}&limit={limit}"

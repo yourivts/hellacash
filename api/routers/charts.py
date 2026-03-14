@@ -91,6 +91,7 @@ def _fetch_markets() -> list:
         })
 
     result.sort(key=lambda x: x["volume_24h"], reverse=True)
+    result = result[:100]
     _markets_cache["data"] = result
     _markets_cache["ts"] = now
     return result
@@ -98,9 +99,28 @@ def _fetch_markets() -> list:
 
 @router.get("/markets")
 async def get_markets():
-    """Return all EUR markets on Bitvavo sorted by 24h volume."""
+    """Return only the bot's tradeable symbols (with ticker data for the dropdown)."""
     try:
-        result = await asyncio.get_event_loop().run_in_executor(None, _fetch_markets)
+        symbols = bot_main.get_tradeable_symbols()
+        if not symbols:
+            # Bot not started yet — fall back to public API
+            result = await asyncio.get_event_loop().run_in_executor(None, _fetch_markets)
+            return result
+        # Fetch tickers for price/volume display
+        tickers = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: _api_get(f"{_API_BASE}/ticker/24h")
+        )
+        ticker_map = {t["market"]: t for t in tickers}
+        result = []
+        for sym in symbols:
+            t = ticker_map.get(sym, {})
+            result.append({
+                "symbol": sym,
+                "base": sym.split("-")[0],
+                "price": float(t.get("last") or 0),
+                "volume_24h": float(t.get("volumeQuote") or 0),
+            })
+        result.sort(key=lambda x: x["volume_24h"], reverse=True)
         return result
     except Exception as e:
         logger.error("markets fetch failed: %s", e)
@@ -147,9 +167,9 @@ async def get_candles(
     interval: str = Query("5m"),
     limit: int = Query(200, le=500),
 ):
-    df = bot_main._get_df(symbol, interval)
-    if not df.empty:
+    df = bot_main.get_candle_cache().get_df(symbol, interval)
+    if len(df) >= limit:
         rows = df.tail(limit).reset_index()
         return _format_candles(rows)
-    # Cache not ready yet — fetch directly from public API
+    # Cache empty or too few candles — fetch from public API
     return _fetch_public(symbol, interval, limit)

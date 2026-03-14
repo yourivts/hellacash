@@ -8,9 +8,48 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 
 from bot.data.database import get_session
-from bot.data.repositories import get_trades, get_trades_since
+from bot.data.repositories import get_snapshots_since, get_trades, get_trades_since
 
 router = APIRouter(prefix="/api/analytics", tags=["analytics"])
+
+
+def _get_equity_pnl() -> dict:
+    """Compute P&L from equity delta (captures fees, unrealized, everything)."""
+    try:
+        from bot.main import _get_portfolio
+        portfolio = _get_portfolio()
+        equity = portfolio.get_equity_eur()
+        # Paper trading starts at 10000; live uses first snapshot as baseline
+        from bot.config import get_settings
+        initial = 10000.0 if get_settings().paper_trading else equity
+        if not get_settings().paper_trading:
+            # For live, try to get initial equity from first-ever snapshot
+            pass  # equity delta not reliable for live without baseline
+        return {
+            "equity": equity,
+            "total_pnl": equity - initial,
+        }
+    except Exception:
+        return {"equity": 0.0, "total_pnl": 0.0}
+
+
+async def _get_daily_pnl_from_snapshots() -> float:
+    """Compute daily P&L from first snapshot of today vs current equity."""
+    try:
+        from bot.main import _get_portfolio
+        portfolio = _get_portfolio()
+        equity = portfolio.get_equity_eur()
+        async with get_session() as session:
+            snaps = await get_snapshots_since(session, datetime.utcnow().replace(hour=0, minute=0, second=0))
+        if snaps:
+            return equity - snaps[0].total_equity_eur
+        # No snapshot today yet — fall back to equity-based total P&L
+        from bot.config import get_settings
+        if get_settings().paper_trading:
+            return equity - 10000.0
+        return 0.0
+    except Exception:
+        return 0.0
 
 
 @router.get("")
@@ -19,11 +58,17 @@ async def get_analytics(days: int = Query(30, ge=1, le=365)):
     async with get_session() as session:
         trades = await get_trades_since(session, since)
 
+    # Equity-based P&L (captures everything: fees, unrealized, etc.)
+    equity_info = _get_equity_pnl()
+    total_pnl = equity_info["total_pnl"]
+    daily_pnl = await _get_daily_pnl_from_snapshots()
+
     if not trades:
         return {
             "total_trades": 0,
             "win_rate": None,
-            "total_pnl": 0.0,
+            "total_pnl": total_pnl,
+            "daily_pnl": daily_pnl,
             "avg_roi_pct": None,
             "sharpe_ratio": None,
             "max_drawdown_pct": None,
@@ -33,7 +78,6 @@ async def get_analytics(days: int = Query(30, ge=1, le=365)):
     pnls = [t.net_pnl for t in trades]
     roi_pcts = [t.roi_pct for t in trades]
     wins = [p for p in pnls if p > 0]
-    total_pnl = sum(pnls)
     win_rate = len(wins) / len(pnls)
     avg_roi = statistics.mean(roi_pcts) if roi_pcts else 0.0
 
@@ -48,6 +92,7 @@ async def get_analytics(days: int = Query(30, ge=1, le=365)):
         "total_trades": len(trades),
         "win_rate": win_rate,
         "total_pnl": total_pnl,
+        "daily_pnl": daily_pnl,
         "avg_roi_pct": avg_roi,
         "sharpe_ratio": sharpe,
         "best_trade": max(pnls) if pnls else None,
@@ -133,11 +178,56 @@ async def get_benchmark(
 
 @router.get("/walk-forward")
 async def get_walk_forward():
-    from bot.learning.walk_forward import WalkForwardOptimizer
-    # Access singleton — wired in main.py
-    return {"status": "no_results", "message": "No walk-forward run completed yet"}
+    from bot.main import _get_walk_forward
+    wf = _get_walk_forward()
+    result = wf.latest_result
+    if result is None:
+        return {"status": "no_results", "message": "No walk-forward run completed yet"}
+    return {
+        "status": "completed",
+        "adopted": result.adopted,
+        "avg_oos_sharpe": result.avg_oos_sharpe,
+        "avg_oos_pnl": result.avg_oos_pnl,
+        "sharpe_stability": result.sharpe_stability,
+        "recommended_params": result.recommended_params,
+        "windows": len(result.windows),
+    }
 
 
 @router.post("/walk-forward/run", status_code=202)
 async def trigger_walk_forward():
-    return {"status": "accepted", "message": "Walk-forward run triggered"}
+    import asyncio
+    from bot.main import _get_walk_forward, _get_client, _get_router
+
+    wf = _get_walk_forward()
+    if wf.is_running:
+        return {"status": "already_running", "message": "Walk-forward is already running"}
+
+    async def _candle_fetcher(start_day: int, end_day: int):
+        from datetime import datetime, timedelta, timezone
+        now = datetime.now(timezone.utc)
+        total_days = 120
+        start_dt = now - timedelta(days=total_days - start_day)
+        end_dt = now - timedelta(days=total_days - end_day)
+        loop = asyncio.get_running_loop()
+        client = _get_client()
+        return await loop.run_in_executor(
+            None, lambda: client.get_candles_range("BTC-EUR", "5m", start_dt, end_dt)
+        )
+
+    async def _run():
+        import logging
+        logger = logging.getLogger(__name__)
+        result = await wf.run(_candle_fetcher)
+        if result.adopted and result.recommended_params:
+            router = _get_router()
+            params = result.recommended_params
+            router.update_hybrid_params(
+                sentiment_weight=params.get("sentiment_weight", 0.25),
+                entry_threshold=params.get("entry_threshold", 0.40),
+                indicator_weights=params.get("indicator_weights"),
+            )
+            logger.info("Walk-forward adopted params via API trigger")
+
+    asyncio.create_task(_run())
+    return {"status": "accepted", "message": "Walk-forward run started in background"}

@@ -22,8 +22,8 @@ NEWS_FEEDS = [
     "https://feeds.reuters.com/reuters/businessNews",
 ]
 
-# Cache parsed feeds for 30 minutes — articles don't change that fast
-CACHE_TTL = 1800
+# Cache feeds for 5 minutes — aligned with sentiment cycle
+CACHE_TTL = 300
 _feed_cache: Dict[str, Tuple[float, list]] = {}  # url → (timestamp, entries)
 
 

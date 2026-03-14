@@ -8,7 +8,7 @@ from typing import Dict, List
 logger = logging.getLogger(__name__)
 
 INDICATOR_KEYS = [
-    "rsi", "macd", "bollinger", "ema_trend", "supertrend", "volume", "cci"
+    "rsi", "macd", "bollinger", "ema_trend", "supertrend", "volume", "cci",
 ]
 
 

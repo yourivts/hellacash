@@ -93,6 +93,7 @@ class WalkForwardOptimizer:
             self._running = False
 
     async def _execute(self, candle_fetcher) -> WFResult:
+        import asyncio
         from bot.backtest.engine import BacktestEngine
 
         total_days = 120
@@ -110,9 +111,10 @@ class WalkForwardOptimizer:
             {"sentiment_weight": 0.10, "entry_threshold": 0.30},
         ]
 
+        loop = asyncio.get_running_loop()
         wf_windows: List[WFWindow] = []
 
-        for ws in windows_spec:
+        for i, ws in enumerate(windows_spec):
             if candle_fetcher is None:
                 break
 
@@ -122,22 +124,41 @@ class WalkForwardOptimizer:
             if not train_candles or not test_candles:
                 continue
 
-            best_pnl = float("-inf")
-            best_params = candidates[0]
+            logger.info("Walk-forward: running window %d/%d (%d train, %d test candles, %d candidates in parallel)...",
+                        i + 1, len(windows_spec), len(train_candles), len(test_candles), len(candidates))
 
-            for params in candidates:
-                engine = BacktestEngine(
-                    train_candles, strategy_params=params, slippage_pct=0.001,
-                )
+            # Run all candidate backtests in parallel across CPU cores
+            from concurrent.futures import ProcessPoolExecutor
+
+            def _run_single_backtest(candles, params):
+                from bot.backtest.engine import BacktestEngine as _BE
+                engine = _BE(candles, strategy_params=params, slippage_pct=0.001)
                 result = engine.run()
-                if result.total_pnl > best_pnl:
-                    best_pnl = result.total_pnl
-                    best_params = params
+                return params, result.total_pnl
 
-            test_engine = BacktestEngine(
-                test_candles, strategy_params=best_params, slippage_pct=0.001,
+            def _run_window_parallel(train, test, cands):
+                import os
+                workers = min(len(cands), os.cpu_count() or 4)
+                best_pnl = float("-inf")
+                best_params = cands[0]
+                with ProcessPoolExecutor(max_workers=workers) as pool:
+                    futures = [pool.submit(_run_single_backtest, train, p) for p in cands]
+                    for f in futures:
+                        params, pnl = f.result()
+                        if pnl > best_pnl:
+                            best_pnl = pnl
+                            best_params = params
+                # Test the winner on out-of-sample data
+                test_engine = BacktestEngine(test, strategy_params=best_params, slippage_pct=0.001)
+                test_result = test_engine.run()
+                return best_params, test_result
+
+            best_params, test_result = await loop.run_in_executor(
+                None, _run_window_parallel, train_candles, test_candles, candidates
             )
-            test_result = test_engine.run()
+
+            logger.info("Walk-forward: window %d/%d done — sharpe=%.2f, pnl=€%.2f, params=%s",
+                        i + 1, len(windows_spec), test_result.sharpe_ratio, test_result.total_pnl, best_params)
 
             wf_windows.append(WFWindow(
                 sharpe=test_result.sharpe_ratio,
