@@ -31,8 +31,8 @@ def kelly_size(
         Position size in EUR.
     """
     if win_rate <= 0 or avg_loss_pct <= 0:
-        # No history — use a conservative 5% of portfolio
-        base_pct = 5.0
+        # No history — use a conservative 1% of portfolio
+        base_pct = 1.0
     else:
         loss_rate = 1 - win_rate
         # Kelly formula: f = (W * b - L) / b  where b = avg_win / avg_loss
@@ -47,7 +47,7 @@ def kelly_size(
         base_pct *= scale
 
     # Hard cap
-    capped_pct = min(base_pct, max_position_pct)
+    capped_pct = max(0.0, min(base_pct, max_position_pct))
     size_eur = portfolio_eur * (capped_pct / 100.0)
 
     logger.debug(
