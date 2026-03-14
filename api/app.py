@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import os
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from api.middleware.auth import require_api_key, ws_auth
 from api.routers import analytics, backtest, charts, control, health, portfolio, risk, sentiment, trades
 from api.ws_hub import get_hub
 
@@ -21,15 +22,17 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # REST routers
-    app.include_router(trades.router)
-    app.include_router(portfolio.router)
-    app.include_router(analytics.router)
-    app.include_router(sentiment.router)
-    app.include_router(charts.router)
-    app.include_router(control.router)
-    app.include_router(backtest.router)
-    app.include_router(risk.router)
+    # REST routers (with auth)
+    app.include_router(trades.router, dependencies=[Depends(require_api_key)])
+    app.include_router(portfolio.router, dependencies=[Depends(require_api_key)])
+    app.include_router(analytics.router, dependencies=[Depends(require_api_key)])
+    app.include_router(sentiment.router, dependencies=[Depends(require_api_key)])
+    app.include_router(charts.router, dependencies=[Depends(require_api_key)])
+    app.include_router(control.router, dependencies=[Depends(require_api_key)])
+    app.include_router(backtest.router, dependencies=[Depends(require_api_key)])
+    app.include_router(risk.router, dependencies=[Depends(require_api_key)])
+
+    # No auth for health check
     app.include_router(health.router)
 
     # WebSocket live feed
@@ -40,7 +43,9 @@ def create_app() -> FastAPI:
         await hub.start_relay()
 
     @app.websocket("/ws/feed")
-    async def ws_feed(ws: WebSocket):
+    async def ws_feed(ws: WebSocket, api_key: str | None = Query(None)):
+        if not await ws_auth(ws, api_key):
+            return  # already closed by ws_auth
         await hub.connect(ws)
         try:
             while True:

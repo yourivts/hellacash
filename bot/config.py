@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     # ── API server ────────────────────────────────────────────────────────────
     api_host: str = "0.0.0.0"
     api_port: int = 8000
+    api_key: str = Field(default="", repr=False)  # empty = no auth
 
     # ── Discord notifications ──────────────────────────────────────────────────
     discord_webhook_url: str = Field(default="", repr=False)
