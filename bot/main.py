@@ -29,10 +29,13 @@ from bot.events.bus import (
 from bot.exchange.bitvavo_client import BitvavoClient
 from bot.exchange.bitvavo_ws import BitvavoWebSocket
 from bot.exchange.order_manager import OrderManager
+from bot.indicators.onchain import OnchainProvider
+from bot.indicators.orderbook import OrderBookProvider
 from bot.learning.param_optimizer import ParamOptimizer
 from bot.learning.regime_classifier import RegimeClassifier
 from bot.learning.signal_evaluator import SignalEvaluator
 from bot.learning.trade_analyzer import TradeAnalyzer
+from bot.learning.walk_forward import WalkForwardOptimizer
 from bot.portfolio.tracker import PortfolioTracker
 from bot.risk.drawdown_guard import DrawdownGuard
 from bot.risk.engine import RiskEngine
@@ -140,6 +143,9 @@ _router: Optional[StrategyRouter] = None
 _trade_analyzer: Optional[TradeAnalyzer] = None
 _signal_eval: Optional[SignalEvaluator] = None
 _param_optimizer: Optional[ParamOptimizer] = None
+_onchain_provider: Optional[OnchainProvider] = None
+_orderbook_provider: Optional[OrderBookProvider] = None
+_walk_forward: Optional[WalkForwardOptimizer] = None
 _trading_loop: Optional[TradingLoop] = None
 _scheduler: Optional[BotScheduler] = None
 
@@ -216,6 +222,21 @@ def _get_param_optimizer() -> ParamOptimizer:
     return _param_optimizer
 
 
+def _get_onchain() -> OnchainProvider:
+    global _onchain_provider
+    if _onchain_provider is None:
+        _onchain_provider = OnchainProvider()
+    return _onchain_provider
+
+
+def _get_orderbook() -> OrderBookProvider:
+    global _orderbook_provider
+    if _orderbook_provider is None:
+        settings = get_settings()
+        _orderbook_provider = OrderBookProvider(depth_levels=settings.orderbook_depth_levels)
+    return _orderbook_provider
+
+
 def _get_trading_loop() -> TradingLoop:
     global _trading_loop
     if _trading_loop is None:
@@ -230,6 +251,8 @@ def _get_trading_loop() -> TradingLoop:
             trade_analyzer=_get_trade_analyzer(),
             signal_eval=_get_signal_eval(),
             settings=get_settings(),
+            onchain=_get_onchain() if get_settings().onchain_enabled else None,
+            orderbook=_get_orderbook() if get_settings().orderbook_enabled else None,
         )
     return _trading_loop
 
@@ -268,12 +291,26 @@ async def _main() -> None:
     trading_loop = _get_trading_loop()
 
     # Start WebSocket
+    async def _on_book(msg):
+        symbol = msg.get("market")
+        bids = msg.get("bids", [])
+        asks = msg.get("asks", [])
+        ob = _get_orderbook()
+        if "nonce" in msg and not ob._books.get(symbol):
+            ob.set_snapshot(symbol, bids, asks)
+        else:
+            for price, qty in bids:
+                ob.update_level(symbol, "bid", float(price), float(qty))
+            for price, qty in asks:
+                ob.update_level(symbol, "ask", float(price), float(qty))
+
     ws = BitvavoWebSocket(
         api_key=settings.bitvavo_api_key,
         api_secret=settings.bitvavo_api_secret,
         on_candle=trading_loop.on_candle,
         on_ticker=trading_loop.on_ticker,
         on_fill=trading_loop.on_fill,
+        on_book=_on_book if settings.orderbook_enabled else None,
     )
     ws.set_markets(_active_symbols)
     _ws_instance = ws
@@ -302,6 +339,17 @@ async def _main() -> None:
     # Import the FastAPI app
     from api.app import create_app
     api_app = create_app()
+
+    from api.routers.analytics import router as analytics_router
+    from api.routers.journal import router as journal_router
+    from api.routers.orderbook import router as orderbook_router, set_provider as set_ob_provider
+
+    api_app.include_router(analytics_router)
+    api_app.include_router(journal_router)
+    api_app.include_router(orderbook_router)
+
+    if settings.orderbook_enabled:
+        set_ob_provider(_get_orderbook())
 
     # Expose bot singletons on app.state for API route access
     api_app.state.trading_loop = trading_loop
