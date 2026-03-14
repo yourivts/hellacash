@@ -1,65 +1,91 @@
-"""Primary hybrid strategy: technical composite + sentiment fusion."""
+"""Primary hybrid strategy: 4-component fusion (MTF technical + sentiment + on-chain + order book)."""
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
-from bot.indicators.composite import compute as compute_indicators, DEFAULT_WEIGHTS
+from bot.config import get_settings
 from bot.strategy.base import BaseStrategy, MarketContext, Signal
+from bot.strategy.mtf_voter import MTFVoter
 
 logger = logging.getLogger(__name__)
 
-# Sentiment weight in the final score (rest goes to technical)
-DEFAULT_SENTIMENT_WEIGHT = 0.25
-DEFAULT_ENTRY_THRESHOLD = 0.40
+DEFAULT_ENTRY_THRESHOLD = 0.35
+
+
+def redistribute_weights(
+    weights: Dict[str, float], disabled: Set[str]
+) -> Dict[str, float]:
+    active = {k: v for k, v in weights.items() if k not in disabled}
+    total = sum(active.values())
+    if total <= 0:
+        return active
+    return {k: v / total for k, v in active.items()}
 
 
 class HybridStrategy(BaseStrategy):
     """
-    Combines technical indicator composite score with sentiment score.
-    Final score = (1 - w_s) * technical + w_s * sentiment
-    Emits LONG/SHORT if |score| > threshold AND ≥3 indicators agree.
+    Combines MTF technical composite, sentiment, on-chain, and order book scores.
+    final_score = w_tech * mtf + w_sent * sentiment + w_onchain * onchain + w_book * orderbook
     """
 
     name = "hybrid"
 
     def __init__(
         self,
-        sentiment_weight: float = DEFAULT_SENTIMENT_WEIGHT,
+        sentiment_weight: float = 0.20,
         entry_threshold: float = DEFAULT_ENTRY_THRESHOLD,
         indicator_weights: Optional[Dict[str, float]] = None,
     ) -> None:
         self.sentiment_weight = sentiment_weight
         self.entry_threshold = entry_threshold
-        self.indicator_weights = indicator_weights or DEFAULT_WEIGHTS
+        self.indicator_weights = indicator_weights
+        self._mtf_voter = MTFVoter()
 
     def generate_signal(self, ctx: MarketContext) -> Signal:
         if len(ctx.candles_5m) < 30:
             return Signal(
-                symbol=ctx.symbol,
-                direction="NEUTRAL",
-                strength=0.0,
-                strategy_name=self.name,
+                symbol=ctx.symbol, direction="NEUTRAL",
+                strength=0.0, strategy_name=self.name,
             )
 
-        # Use ctx-level weights if provided (from DB optimizer)
-        weights = ctx.indicator_weights or self.indicator_weights
+        settings = get_settings()
 
-        tech = compute_indicators(ctx.candles_5m, weights)
-        technical_score = tech.technical_score
-        sentiment = ctx.sentiment_score
+        # MTF voting
+        mtf_result = self._mtf_voter.vote(
+            df_15m=ctx.candles_15m if ctx.candles_15m is not None else ctx.candles_5m,
+            df_1h=ctx.candles_1h,
+            df_4h=ctx.candles_4h if ctx.candles_4h is not None else ctx.candles_1h,
+            df_1d=ctx.candles_1d if ctx.candles_1d is not None else ctx.candles_1h,
+            regime=ctx.market_regime,
+            indicator_weights=ctx.indicator_weights or self.indicator_weights,
+        )
 
-        # Combine
-        w_s = self.sentiment_weight
-        final_score = (1 - w_s) * technical_score + w_s * sentiment
+        tech_score = mtf_result.mtf_score
+        sent_score = ctx.sentiment_score
+        onchain_score = ctx.onchain_score
+        book_score = ctx.orderbook_imbalance
 
-        # Higher timeframe alignment check (uses 1h for trend context)
-        if len(ctx.candles_1h) >= 20:
-            tech_1h = compute_indicators(ctx.candles_1h, weights)
-            # If 1h disagrees strongly, dampen the signal
-            if tech_1h.technical_score * final_score < -0.1:
-                final_score *= 0.5
-                logger.debug("1h timeframe dampened signal for %s", ctx.symbol)
+        base_w = {
+            "tech": settings.mtf_tech_weight,
+            "sent": settings.mtf_sent_weight,
+            "onchain": settings.mtf_onchain_weight,
+            "book": settings.mtf_book_weight,
+        }
+        disabled = set()
+        if not settings.onchain_enabled:
+            disabled.add("onchain")
+        if not settings.orderbook_enabled:
+            disabled.add("book")
+        w = redistribute_weights(base_w, disabled)
+
+        final_score = (
+            w.get("tech", 0) * tech_score
+            + w.get("sent", 0) * sent_score
+            + w.get("onchain", 0) * onchain_score
+            + w.get("book", 0) * book_score
+        )
+        final_score = max(-1.0, min(1.0, final_score))
 
         strength = min(abs(final_score), 1.0)
         direction = "NEUTRAL"
@@ -68,29 +94,27 @@ class HybridStrategy(BaseStrategy):
         elif final_score < -self.entry_threshold:
             direction = "SHORT"
 
-        snapshot = {
-            **tech.indicator_values,
-            "confirming_count": tech.confirming_count,
-            "final_score": final_score,
-            "technical_score": technical_score,
-            "sentiment_score": sentiment,
-            "sentiment_weight": w_s,
-        }
-
-        logger.debug(
-            "Hybrid %s: tech=%.3f sent=%.3f final=%.3f → %s (str=%.2f, confirm=%d)",
-            ctx.symbol, technical_score, sentiment, final_score,
-            direction, strength, tech.confirming_count,
+        confirming = sum(
+            1 for s in mtf_result.per_tf_scores.values()
+            if s * final_score > 0
         )
 
+        snapshot = {
+            "confirming_count": confirming,
+            "final_score": final_score,
+            "technical_score": tech_score,
+            "sentiment_score": sent_score,
+            "onchain_score": onchain_score,
+            "orderbook_imbalance": book_score,
+            "mtf_scores": mtf_result.per_tf_scores,
+            "mtf_agreement": mtf_result.agreement_ratio,
+            "market_regime": ctx.market_regime,
+        }
+
         return Signal(
-            symbol=ctx.symbol,
-            direction=direction,
-            strength=strength,
-            strategy_name=self.name,
-            technical_score=technical_score,
-            sentiment_score=sentiment,
-            indicator_snapshot=snapshot,
+            symbol=ctx.symbol, direction=direction, strength=strength,
+            strategy_name=self.name, technical_score=tech_score,
+            sentiment_score=sent_score, indicator_snapshot=snapshot,
         )
 
     def get_default_params(self) -> Dict[str, Any]:
