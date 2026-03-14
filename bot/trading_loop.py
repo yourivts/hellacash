@@ -311,23 +311,6 @@ class TradingLoop:
                 if direction not in ("LONG", "SHORT"):
                     continue
 
-                # Multi-timeframe confirmation: 1h trend must agree with direction
-                if len(df_1h) >= 20:
-                    ema20_1h = df_1h["close"].ewm(span=20).mean().iloc[-1]
-                    price_1h = df_1h["close"].iloc[-1]
-                    if direction == "LONG" and price_1h < ema20_1h:
-                        logger.info(
-                            "Signal SKIPPED %s %s — 1h trend bearish (price %.4f < EMA20 %.4f)",
-                            direction, symbol, price_1h, ema20_1h,
-                        )
-                        continue
-                    if direction == "SHORT" and price_1h > ema20_1h:
-                        logger.info(
-                            "Signal SKIPPED %s %s — 1h trend bullish (price %.4f > EMA20 %.4f)",
-                            direction, symbol, price_1h, ema20_1h,
-                        )
-                        continue
-
                 # Get win/loss stats from trade history for position sizing
                 win_rate, avg_win, avg_loss = await self._get_trade_stats(best_signal.strategy_name)
 
