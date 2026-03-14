@@ -318,6 +318,19 @@ async def _main() -> None:
     # Create Discord notifier
     discord = DiscordNotifier(settings)
 
+    import glob as _glob
+    import time as _time
+
+    async def _cleanup_old_charts():
+        charts_dir = "data/charts"
+        if not os.path.exists(charts_dir):
+            return
+        cutoff = _time.time() - (90 * 86400)  # 90 days
+        for f in _glob.glob(os.path.join(charts_dir, "*.png")):
+            if os.path.getmtime(f) < cutoff:
+                os.remove(f)
+                logger.info("Removed old chart: %s", f)
+
     # Create BotScheduler
     sentiment = _get_sentiment()
     param_optimizer = _get_param_optimizer()
