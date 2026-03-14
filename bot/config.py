@@ -12,8 +12,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     # ── Exchange ──────────────────────────────────────────────────────────────
-    bitvavo_api_key: str = ""
-    bitvavo_api_secret: str = ""
+    bitvavo_api_key: str = Field(default="", repr=False)
+    bitvavo_api_secret: str = Field(default="", repr=False)
     bitvavo_rest_url: str = "https://api.bitvavo.com/v2"
     bitvavo_ws_url: str = "wss://ws.bitvavo.com/v2/"
 
@@ -30,25 +30,25 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://hellacash:hellacash@localhost:5432/hellacash"
 
     # ── Social media sentiment ─────────────────────────────────────────────────
-    reddit_client_id: str = ""
-    reddit_client_secret: str = ""
-    reddit_user_agent: str = "hellacash/1.0"
-    twitter_bearer_token: str = ""   # optional; snscrape fallback if empty
-    sentiment_poll_interval_secs: int = 600  # 10 minutes
-    reddit_cache_ttl: int = 1800     # seconds to cache reddit data
-    news_cache_ttl: int = 1800       # seconds to cache news feeds
+    reddit_client_id: str = Field(default="", repr=False)
+    reddit_client_secret: str = Field(default="", repr=False)
+    reddit_user_agent: str = "linux:com.hellacash.sentiment:v1.0.0 (by /u/yourivts)"
+    twitter_bearer_token: str = Field(default="", repr=False)  # optional; snscrape fallback if empty
+    sentiment_poll_interval_secs: int = 300  # 5 minutes
+    reddit_cache_ttl: int = 300      # seconds to cache reddit data
+    news_cache_ttl: int = 300        # seconds to cache news feeds
 
     # ── Risk limits (NEVER modified by learning system) ───────────────────────
-    max_drawdown_pct: float = 8.0          # portfolio hard stop (%)
-    soft_drawdown_pct: float = 3.0        # reduce position sizes by 50%
-    max_position_size_pct: float = 20.0   # max single position (% of portfolio)
-    max_daily_loss_eur: float = 200.0      # daily loss circuit breaker
-    max_open_positions: int = 5
-    min_trade_roi_pct: float = 0.3         # min expected ROI before fees (%)
-    min_signal_confidence: float = 0.60   # min composite confidence to trade
-    kelly_fraction: float = 0.25          # quarter-Kelly sizing
-    taker_fee_pct: float = 0.25           # Bitvavo taker fee (%)
-    maker_fee_pct: float = 0.15           # Bitvavo maker fee (%)
+    max_drawdown_pct: float = Field(default=8.0, ge=0, le=100)    # portfolio hard stop (%)
+    soft_drawdown_pct: float = Field(default=3.0, ge=0, le=100)   # reduce position sizes by 50%
+    max_position_size_pct: float = Field(default=20.0, ge=0, le=100)  # max single position (% of portfolio)
+    max_daily_loss_eur: float = Field(default=200.0, ge=0)         # daily loss circuit breaker
+    max_open_positions: int = Field(default=5, ge=1)
+    min_trade_roi_pct: float = Field(default=0.3, ge=0)            # min expected ROI before fees (%)
+    min_signal_confidence: float = Field(default=0.60, ge=0, le=1) # min composite confidence to trade
+    kelly_fraction: float = Field(default=0.25, ge=0, le=1)        # quarter-Kelly sizing
+    taker_fee_pct: float = Field(default=0.25, ge=0)               # Bitvavo taker fee (%)
+    maker_fee_pct: float = Field(default=0.15, ge=0)               # Bitvavo maker fee (%)
 
     # ── API server ────────────────────────────────────────────────────────────
     api_host: str = "0.0.0.0"
