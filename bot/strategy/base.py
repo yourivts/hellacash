@@ -4,7 +4,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Protocol, runtime_checkable
 
 import pandas as pd
 
@@ -28,6 +28,20 @@ class Signal:
         )
 
 
+@runtime_checkable
+class SignalProvider(Protocol):
+    """Protocol for any component that can contribute a score to the voter."""
+    name: str
+
+    def score(self, symbol: str, **kwargs: Any) -> float:
+        """Return a score (typically -1.0 to +1.0 or 0.0 to 1.0)."""
+        ...
+
+    def is_available(self) -> bool:
+        """Return True when the provider has fresh data and is ready."""
+        ...
+
+
 @dataclass
 class MarketContext:
     symbol: str
@@ -38,6 +52,14 @@ class MarketContext:
     portfolio_equity_eur: float
     open_position_count: int
     indicator_weights: Optional[Dict[str, float]] = None
+    # Multi-timeframe candle data
+    candles_15m: Optional[pd.DataFrame] = None
+    candles_4h: Optional[pd.DataFrame] = None
+    candles_1d: Optional[pd.DataFrame] = None
+    # Additional market signals
+    onchain_score: float = 0.0
+    orderbook_imbalance: float = 0.0
+    market_regime: str = "unknown"
 
 
 class BaseStrategy(ABC):
