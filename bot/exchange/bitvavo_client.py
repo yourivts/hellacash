@@ -381,9 +381,10 @@ class BitvavoClient:
         price: Optional[float],
     ) -> Dict[str, Any]:
         """Simulate an immediate fill for paper trading."""
+        from bot.risk.fees import get_taker_fee
         ticker = self._stub_ticker(symbol)
         fill_price = price if (price and order_type != "market") else (ticker.price if ticker else 1.0)
-        fee = amount * fill_price * TAKER_FEE
+        fee = amount * fill_price * get_taker_fee(symbol)
         order_id = str(uuid.uuid4())
 
         base = symbol.split("-")[0]
@@ -429,10 +430,13 @@ class BitvavoClient:
         return {"EUR": 10000.0}
 
     def _save_paper_state(self) -> None:
-        """Persist paper balance to disk."""
+        """Persist paper balance to disk atomically."""
         try:
-            with open(_PAPER_STATE_FILE, "w") as f:
+            import os
+            tmp_file = _PAPER_STATE_FILE + ".tmp"
+            with open(tmp_file, "w") as f:
                 _json.dump(self._paper_balance, f, indent=2)
+            os.replace(tmp_file, _PAPER_STATE_FILE)
         except Exception as e:
             logger.warning("Failed to save paper state: %s", e)
 
@@ -472,11 +476,16 @@ class BitvavoClient:
             markets = _api_get(f"{_API_BASE}/markets")
             tickers = _api_get(f"{_API_BASE}/ticker/24h")
             vol_map = {t["market"]: float(t.get("volumeQuote") or 0) for t in tickers}
+
+            # Extract fee categories for the fee module
+            from bot.risk.fees import set_market_categories
+            fee_cats = {}
             result = []
             for m in markets:
                 sym = m.get("market", "")
                 if not sym.endswith("-EUR") or m.get("status") != "trading":
                     continue
+                fee_cats[sym] = m.get("feeCategory", "A")
                 result.append(MarketInfo(
                     symbol=sym,
                     base=sym.split("-")[0],
@@ -485,6 +494,7 @@ class BitvavoClient:
                     price_precision=int(m.get("pricePrecision") or 5),
                     volume_24h=vol_map.get(sym, 0),
                 ))
+            set_market_categories(fee_cats)
             result.sort(key=lambda x: x.volume_24h, reverse=True)
             logger.info("Fetched %d EUR markets from Bitvavo public API", len(result))
             return result
