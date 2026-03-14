@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from api.middleware.auth import require_api_key, ws_auth
-from api.routers import analytics, backtest, charts, control, health, portfolio, risk, sentiment, trades
+from api.routers import analytics, backtest, charts, control, health, portfolio, positions, risk, sentiment, trades
 from api.ws_hub import get_hub
 
 
@@ -31,6 +31,7 @@ def create_app() -> FastAPI:
     app.include_router(control.router, dependencies=[Depends(require_api_key)])
     app.include_router(backtest.router, dependencies=[Depends(require_api_key)])
     app.include_router(risk.router, dependencies=[Depends(require_api_key)])
+    app.include_router(positions.router, dependencies=[Depends(require_api_key)])
 
     # No auth for health check
     app.include_router(health.router)

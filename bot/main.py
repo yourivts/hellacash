@@ -303,6 +303,13 @@ async def _main() -> None:
     from api.app import create_app
     api_app = create_app()
 
+    # Expose bot singletons on app.state for API route access
+    api_app.state.trading_loop = trading_loop
+    api_app.state.portfolio = portfolio
+    api_app.state.order_mgr = _get_order_mgr()
+    api_app.state.sentiment = sentiment
+    api_app.state.client = _get_client()
+
     # Build uvicorn server config
     uvicorn_config = uvicorn.Config(
         app=api_app,
