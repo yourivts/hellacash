@@ -63,6 +63,20 @@ class Settings(BaseSettings):
     optimizer_min_trades: int = 50         # minimum trades before optimizer runs
     model_dir: str = "./models"
 
+    # ── Multi-timeframe voting ───────────────────────────────────────────────
+    mtf_tech_weight: float = Field(default=0.55, ge=0, le=1)
+    mtf_sent_weight: float = Field(default=0.20, ge=0, le=1)
+    mtf_onchain_weight: float = Field(default=0.15, ge=0, le=1)
+    mtf_book_weight: float = Field(default=0.10, ge=0, le=1)
+
+    # ── On-chain metrics ────────────────────────────────────────────────────
+    onchain_enabled: bool = True
+    onchain_poll_interval_secs: int = 300
+
+    # ── Order book ───────────────────────────────────────────────────────────
+    orderbook_enabled: bool = True
+    orderbook_depth_levels: int = 25
+
     @field_validator("database_url")
     @classmethod
     def check_db_url(cls, v: str) -> str:

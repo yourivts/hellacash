@@ -64,3 +64,22 @@ class TestRangeValidation:
     def test_max_position_size_pct_valid(self):
         s = Settings(**_base_settings(max_position_size_pct=20.0))
         assert s.max_position_size_pct == 20.0
+
+
+class TestNewConfigFields:
+    def test_mtf_weights_defaults(self):
+        s = Settings(database_url="postgresql+asyncpg://x:x@localhost/x")
+        assert s.mtf_tech_weight == 0.55
+        assert s.mtf_sent_weight == 0.20
+        assert s.mtf_onchain_weight == 0.15
+        assert s.mtf_book_weight == 0.10
+
+    def test_onchain_defaults(self):
+        s = Settings(database_url="postgresql+asyncpg://x:x@localhost/x")
+        assert s.onchain_enabled is True
+        assert s.onchain_poll_interval_secs == 300
+
+    def test_orderbook_defaults(self):
+        s = Settings(database_url="postgresql+asyncpg://x:x@localhost/x")
+        assert s.orderbook_enabled is True
+        assert s.orderbook_depth_levels == 25
