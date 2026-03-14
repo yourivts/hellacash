@@ -34,12 +34,14 @@ class BitvavoWebSocket:
         on_candle: Optional[Callable] = None,
         on_ticker: Optional[Callable] = None,
         on_fill: Optional[Callable] = None,
+        on_book: Optional[Callable] = None,
     ) -> None:
         self.api_key = api_key
         self.api_secret = api_secret
         self._on_candle = on_candle
         self._on_ticker = on_ticker
         self._on_fill = on_fill
+        self._on_book = on_book
         self._subscribed_markets: Set[str] = set()
         self._running = False
         self._ws = None
@@ -101,6 +103,13 @@ class BitvavoWebSocket:
             "channels": [{"name": "candles", "markets": markets, "interval": ["1m", "5m"]}],
         }))
 
+        # Order book subscription
+        if self._on_book and self._subscribed_markets:
+            await ws.send(json.dumps({
+                "action": "subscribe",
+                "channels": [{"name": "book", "markets": markets}],
+            }))
+
         # Account subscription (requires auth)
         if self.api_key and self.api_secret:
             ts = int(time.time() * 1000)
@@ -157,6 +166,9 @@ class BitvavoWebSocket:
                 "fee_currency": msg.get("feeCurrency"),
                 "timestamp": datetime.now(timezone.utc),
             })
+
+        elif event == "book" and self._on_book:
+            await self._on_book(msg)
 
     async def stop(self) -> None:
         self._running = False
