@@ -9,7 +9,7 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-MAX_CANDLES = 500
+MAX_CANDLES = 2000
 
 
 class CandleCache:
@@ -36,9 +36,14 @@ class CandleCache:
     def cache_candle(self, symbol: str, interval: str, candle: Dict[str, Any]) -> None:
         self._cache.setdefault(symbol, {}).setdefault(interval, [])
         cache = self._cache[symbol][interval]
-        cache.append(candle)
-        if len(cache) > MAX_CANDLES:
-            cache.pop(0)
+        # Upsert: update existing candle if same timestamp, else append
+        ts = candle.get("timestamp")
+        if cache and cache[-1].get("timestamp") == ts:
+            cache[-1] = candle
+        else:
+            cache.append(candle)
+            if len(cache) > MAX_CANDLES:
+                cache.pop(0)
 
     def get_df(self, symbol: str, interval: str) -> pd.DataFrame:
         rows = self._cache.get(symbol, {}).get(interval, [])
@@ -88,7 +93,7 @@ class CandleCache:
         for interval in ["5m", "1h"]:
             try:
                 candles = await loop.run_in_executor(
-                    None, lambda iv=interval: client.get_candles(symbol, iv, limit=200)
+                    None, lambda iv=interval: client.get_candles(symbol, iv, limit=1500)
                 )
                 for c in candles:
                     self.cache_candle(symbol, interval, {
@@ -107,7 +112,7 @@ class CandleCache:
         for interval in ["5m", "1h"]:
             try:
                 candles = await loop.run_in_executor(
-                    None, lambda s=symbol, iv=interval: client.get_candles(s, iv, limit=200)
+                    None, lambda s=symbol, iv=interval: client.get_candles(s, iv, limit=1500)
                 )
                 for c in candles:
                     self.cache_candle(symbol, interval, {
