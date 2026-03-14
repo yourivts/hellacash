@@ -151,6 +151,7 @@ class Position(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    direction: Mapped[str] = mapped_column(String(10), default="LONG")  # LONG or SHORT
     strategy_name: Mapped[str] = mapped_column(String(50), nullable=False)
     entry_price: Mapped[float] = mapped_column(Float, nullable=False)
     current_price: Mapped[float] = mapped_column(Float, nullable=False)
@@ -159,7 +160,7 @@ class Position(Base):
     stop_loss_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     take_profit_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     trailing_stop_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    highest_price: Mapped[float] = mapped_column(Float, nullable=False)  # for trailing stop
+    highest_price: Mapped[float] = mapped_column(Float, nullable=False)  # for trailing stop (lowest for SHORT)
     entry_order_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("orders.id"), nullable=True)
     paper_trade: Mapped[bool] = mapped_column(Boolean, default=True)
     opened_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
@@ -174,6 +175,7 @@ class Trade(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    direction: Mapped[str] = mapped_column(String(10), default="LONG")  # LONG or SHORT
     strategy_name: Mapped[str] = mapped_column(String(50), nullable=False)
     entry_order_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("orders.id"), nullable=True)
     exit_order_id: Mapped[Optional[int]] = mapped_column(Integer, ForeignKey("orders.id"), nullable=True)
@@ -189,7 +191,49 @@ class Trade(Base):
     exit_reason: Mapped[str] = mapped_column(String(30), nullable=False)
     paper_trade: Mapped[bool] = mapped_column(Boolean, default=True)
     entry_features: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    borrow_fee: Mapped[float] = mapped_column(Float, default=0.0)  # short selling borrow cost
+    market_regime: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class TradeJournal(Base):
+    """Structured trade journal with auto-generated reasoning and chart refs."""
+    __tablename__ = "trade_journal"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    trade_id: Mapped[int] = mapped_column(Integer, ForeignKey("trades.id"), unique=True)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    direction: Mapped[str] = mapped_column(String(10), nullable=False)
+    strategy_name: Mapped[str] = mapped_column(String(50), nullable=False)
+    market_regime: Mapped[str] = mapped_column(String(20), nullable=False)
+    entry_technical_scores: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    entry_mtf_scores: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    entry_sentiment_score: Mapped[float] = mapped_column(Float, default=0.0)
+    entry_onchain_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    entry_orderbook_imbalance: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    entry_composite_score: Mapped[float] = mapped_column(Float, default=0.0)
+    exit_technical_scores: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    exit_composite_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    entry_reasoning: Mapped[str] = mapped_column(Text, nullable=False)
+    exit_reasoning: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    entry_chart_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    exit_chart_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class OnchainScore(Base):
+    """Persisted on-chain metric scores for auditability."""
+    __tablename__ = "onchain_scores"
+    __table_args__ = (Index("ix_onchain_symbol_ts", "symbol", "computed_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    funding_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    oi_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    whale_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    composite_score: Mapped[float] = mapped_column(Float, nullable=False)
+    raw_data: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    computed_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class PortfolioSnapshot(Base):

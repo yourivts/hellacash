@@ -23,6 +23,8 @@ TOPIC_PORTFOLIO_UPDATE = "portfolio.update"
 TOPIC_RISK_DECISION = "risk.decision"
 TOPIC_BOT_STARTED = "bot.started"
 TOPIC_SENTIMENT_DEGRADED = "sentiment.degraded"
+TOPIC_ORDERBOOK_UPDATE = "orderbook.update"
+TOPIC_ONCHAIN_UPDATE = "onchain.update"
 
 
 # ── Event envelope ────────────────────────────────────────────────────────────
