@@ -9,7 +9,8 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-from bot.exchange.bitvavo_client import CandleData, TAKER_FEE
+from bot.exchange.bitvavo_client import CandleData
+from bot.risk.fees import compute_trade_fees, get_taker_fee
 from bot.indicators.volatility import atr as compute_atr
 from bot.risk.position_sizer import kelly_size
 from bot.risk.stop_loss import initial_stops, trail_stop, check_stop_triggered
@@ -85,13 +86,13 @@ class BacktestEngine:
         self,
         candles: List[CandleData | Dict[str, Any]],
         initial_capital: float = 10_000.0,
-        taker_fee: float = TAKER_FEE,
         max_open_positions: int = 3,
+        slippage_pct: float = 0.001,
     ) -> None:
         self._raw_candles = candles
         self.initial_capital = initial_capital
-        self.taker_fee = taker_fee
         self.max_open = max_open_positions
+        self.slippage_pct = slippage_pct
 
         self.balance = initial_capital
         self.peak_balance = initial_capital
@@ -149,7 +150,7 @@ class BacktestEngine:
                     sig = strat.generate_signal(ctx)
                 except Exception:
                     continue
-                if sig.direction in ("LONG",) and sig.strength > 0:
+                if sig.direction in ("LONG", "SHORT") and sig.strength > 0:
                     if best_signal is None or sig.strength > best_signal.strength:
                         best_signal = sig
 
@@ -199,24 +200,33 @@ class BacktestEngine:
         if size_eur < 10.0 or size_eur > self.balance:
             return  # skip tiny or over-sized trades
 
-        # Deduct cost (including fee)
-        cost = size_eur * (1 + self.taker_fee)
+        # Deduct cost (including entry fee)
+        symbol = signal.symbol
+        taker_fee = get_taker_fee(symbol)
+        cost = size_eur * (1 + taker_fee)
         if cost > self.balance:
             return
         self.balance -= cost
 
-        # Stops
-        sl, tp = initial_stops(price, df_window)
+        # Stops (direction-aware)
+        direction = signal.direction
+        sl, tp = initial_stops(price, df_window, direction=direction)
+
+        # Apply slippage to entry price (worse entry simulates real-world fill)
+        if direction == "SHORT":
+            slipped_price = price * (1 - self.slippage_pct)  # worse entry for short (sell lower)
+        else:
+            slipped_price = price * (1 + self.slippage_pct)  # worse entry for long (buy higher)
 
         self.positions.append(_OpenPosition(
-            symbol=signal.symbol,
-            direction=signal.direction,
-            entry_price=price,
+            symbol=symbol,
+            direction=direction,
+            entry_price=slipped_price,
             entry_time=time_str,
             size_eur=size_eur,
             stop_loss=sl,
             take_profit=tp,
-            highest_price=price,
+            highest_price=slipped_price,
             strategy=signal.strategy_name,
         ))
 
@@ -228,9 +238,15 @@ class BacktestEngine:
         df_up_to_now: pd.DataFrame,
     ) -> None:
         for pos in list(self.positions):
-            # Update trailing high
-            if price > pos.highest_price:
-                pos.highest_price = price
+            direction = pos.direction
+
+            # Update trailing price (highest for LONG, lowest for SHORT)
+            if direction == "SHORT":
+                if price < pos.highest_price:
+                    pos.highest_price = price
+            else:
+                if price > pos.highest_price:
+                    pos.highest_price = price
 
             # Trailing stop update
             if len(df_up_to_now) >= 15:
@@ -239,23 +255,31 @@ class BacktestEngine:
                 ).iloc[-1]
                 pos.stop_loss = trail_stop(
                     price, pos.highest_price, pos.stop_loss, atr_val,
+                    direction=direction,
                 )
 
-            # Use candle low for stop-loss check (more realistic)
+            # Direction-aware stop checks
             check_price_low = candle["low"]
             check_price_high = candle["high"]
 
             triggered = None
-            if check_price_low <= pos.stop_loss:
-                triggered = "stop_loss"
-                price_used = pos.stop_loss  # assume fill at stop
-            elif check_price_high >= pos.take_profit:
-                triggered = "take_profit"
-                price_used = pos.take_profit
+            if direction == "SHORT":
+                if check_price_high >= pos.stop_loss:
+                    triggered = "stop_loss"
+                    price_used = pos.stop_loss
+                elif check_price_low <= pos.take_profit:
+                    triggered = "take_profit"
+                    price_used = pos.take_profit
             else:
-                continue
+                if check_price_low <= pos.stop_loss:
+                    triggered = "stop_loss"
+                    price_used = pos.stop_loss
+                elif check_price_high >= pos.take_profit:
+                    triggered = "take_profit"
+                    price_used = pos.take_profit
 
-            self._close_position(pos, price_used, time_str, triggered)
+            if triggered:
+                self._close_position(pos, price_used, time_str, triggered)
 
     def _close_position(
         self,
@@ -268,14 +292,30 @@ class BacktestEngine:
             return
         self.positions.remove(pos)
 
-        # Proceeds after fee
-        gross = pos.size_eur * (exit_price / pos.entry_price)
-        fee = gross * self.taker_fee
-        proceeds = gross - fee
-        self.balance += proceeds
+        quantity = pos.size_eur / pos.entry_price
+        direction = pos.direction
 
-        pnl = proceeds - pos.size_eur
-        pnl_pct = ((exit_price / pos.entry_price) - 1) * 100.0
+        # Apply slippage to exit price (worse exit simulates real-world fill)
+        if direction == "SHORT":
+            slipped_exit = exit_price * (1 + self.slippage_pct)  # worse exit for short (buy higher)
+        else:
+            slipped_exit = exit_price * (1 - self.slippage_pct)  # worse exit for long (sell lower)
+
+        # Direction-aware gross P&L
+        if direction == "SHORT":
+            price_change_pct = (pos.entry_price - slipped_exit) / pos.entry_price
+        else:
+            price_change_pct = (slipped_exit - pos.entry_price) / pos.entry_price
+
+        gross_pnl = pos.size_eur * price_change_pct
+
+        # Use actual per-market fees (exit fee only — entry fee already deducted)
+        exit_fee = slipped_exit * quantity * get_taker_fee(pos.symbol)
+        pnl = gross_pnl - exit_fee
+        pnl_pct = price_change_pct * 100.0
+
+        # Return capital + P&L
+        self.balance += pos.size_eur + pnl
 
         self.closed_trades.append(TradeRecord(
             symbol=pos.symbol,
@@ -297,10 +337,14 @@ class BacktestEngine:
 
     def _equity(self, current_price: float) -> float:
         """Total equity = cash + mark-to-market value of open positions."""
-        pos_value = sum(
-            p.size_eur * (current_price / p.entry_price)
-            for p in self.positions
-        )
+        pos_value = 0.0
+        for p in self.positions:
+            if p.direction == "SHORT":
+                # Collateral + unrealized P&L
+                change = (p.entry_price - current_price) / p.entry_price
+                pos_value += p.size_eur * (1 + change)
+            else:
+                pos_value += p.size_eur * (current_price / p.entry_price)
         return self.balance + pos_value
 
     def _trade_stats(self) -> tuple[float, float, float]:
@@ -422,6 +466,7 @@ async def run_backtest(
     days: int = 30,
     initial_capital: float = 10_000.0,
     max_open_positions: int = 3,
+    slippage_pct: float = 0.001,
 ) -> BacktestResult:
     """
     Fetch historical candles from Bitvavo public API and run the backtest.
@@ -509,5 +554,5 @@ async def run_backtest(
         unique[-1].timestamp.isoformat() if unique else "?",
     )
 
-    engine = BacktestEngine(unique, initial_capital=initial_capital, max_open_positions=max_open_positions)
+    engine = BacktestEngine(unique, initial_capital=initial_capital, max_open_positions=max_open_positions, slippage_pct=slippage_pct)
     return engine.run()
