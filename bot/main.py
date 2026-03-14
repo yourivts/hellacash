@@ -351,6 +351,73 @@ async def _main() -> None:
     if settings.orderbook_enabled:
         set_ob_provider(_get_orderbook())
 
+    # Journal event subscriber
+    from bot.analytics.journal import generate_entry_reasoning
+    from bot.charts.snapshot import generate_entry_chart
+    from bot.events.bus import TOPIC_TRADE_OPENED as _TOPIC_TRADE_OPENED
+
+    async def _journal_on_trade_opened(queue):
+        while True:
+            event = await queue.get()
+            try:
+                data = event.payload
+                sig = data.get("signal")
+                if not sig:
+                    continue
+                snap = sig.indicator_snapshot or {}
+                from bot.data.database import get_session as _get_session
+                from bot.data.repositories import save_journal_entry
+                async with _get_session() as session:
+                    reasoning = generate_entry_reasoning(
+                        symbol=sig.symbol, direction=sig.direction,
+                        strategy=sig.strategy_name,
+                        regime=data.get("market_regime", "unknown"),
+                        final_score=snap.get("final_score", 0),
+                        threshold=0.35,
+                        mtf_scores=snap.get("mtf_scores", {}),
+                        mtf_agreement=snap.get("mtf_agreement", 0),
+                        technical_score=sig.technical_score,
+                        sentiment_score=sig.sentiment_score,
+                        onchain_score=snap.get("onchain_score", 0),
+                        orderbook_imbalance=snap.get("orderbook_imbalance", 0),
+                        indicator_values=snap,
+                    )
+                    await save_journal_entry(
+                        session,
+                        trade_id=data.get("order_id"),
+                        symbol=data.get("symbol"),
+                        direction=sig.direction,
+                        strategy_name=sig.strategy_name,
+                        market_regime=data.get("market_regime", "unknown"),
+                        entry_technical_scores=snap.get("mtf_scores"),
+                        entry_mtf_scores=snap.get("mtf_scores"),
+                        entry_sentiment_score=sig.sentiment_score,
+                        entry_onchain_score=snap.get("onchain_score"),
+                        entry_orderbook_imbalance=snap.get("orderbook_imbalance"),
+                        entry_composite_score=snap.get("final_score", 0),
+                        entry_reasoning=reasoning,
+                    )
+
+                # Chart in background thread
+                candle_data = data.get("candle_data", [])
+                if candle_data:
+                    import pandas as pd
+                    df = pd.DataFrame(candle_data)
+                    if not df.empty and "timestamp" in df.columns:
+                        df["timestamp"] = pd.to_datetime(df["timestamp"])
+                        df = df.set_index("timestamp").sort_index()
+                        loop = asyncio.get_event_loop()
+                        await loop.run_in_executor(
+                            None, generate_entry_chart,
+                            df, data.get("fill_price", 0), data.get("symbol", ""),
+                            data.get("order_id", 0),
+                        )
+            except Exception as e:
+                logger.error("Journal subscriber error: %s", e, exc_info=True)
+
+    _journal_queue = await get_bus().subscribe(_TOPIC_TRADE_OPENED)
+    asyncio.create_task(_journal_on_trade_opened(_journal_queue))
+
     # Expose bot singletons on app.state for API route access
     api_app.state.trading_loop = trading_loop
     api_app.state.portfolio = portfolio
