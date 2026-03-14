@@ -12,7 +12,9 @@ if __name__ == "__main__" and "bot.main" not in _sys.modules:
 
 import asyncio
 import logging
+import os
 import signal
+from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional
 
 import uvicorn
@@ -40,9 +42,21 @@ from bot.strategy.router import StrategyRouter
 from bot.notifications.discord import DiscordNotifier
 from bot.trading_loop import TradingLoop
 
+_LOG_DIR = os.path.join(os.path.dirname(__file__), "..", "logs")
+_LOG_FILE = os.path.join(_LOG_DIR, "bot.log")
+os.makedirs(_LOG_DIR, exist_ok=True)
+
+_log_format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format=_log_format,
+    handlers=[
+        logging.StreamHandler(),
+        RotatingFileHandler(
+            _LOG_FILE, mode="a", encoding="utf-8",
+            maxBytes=10_000_000, backupCount=5,
+        ),
+    ],
 )
 logger = logging.getLogger(__name__)
 
@@ -104,6 +118,10 @@ def is_running() -> bool:
 
 def get_active_symbols() -> List[str]:
     return list(_active_symbols)
+
+
+def get_tradeable_symbols() -> List[str]:
+    return list(_tradeable_symbols)
 
 
 def get_ws() -> Optional[BitvavoWebSocket]:
@@ -219,6 +237,12 @@ def _get_trading_loop() -> TradingLoop:
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 
+async def _shutdown_cleanup(discord) -> None:
+    """Clean up resources during shutdown."""
+    await discord.shutdown()
+    await close_db()
+
+
 async def _main() -> None:
     global _ws_instance, _scheduler
     settings = get_settings()
@@ -306,18 +330,24 @@ async def _main() -> None:
     # Run everything concurrently
     logger.info("Dashboard: http://%s:%d", settings.api_host, settings.api_port)
 
-    await asyncio.gather(
-        _candle_cache_obj.load_all(
-            _active_symbols, _get_client(),
-            batch_size=settings.candle_batch_size,
-        ),
-        ws.run(),
-        scheduler.run_all(),
-        server.serve(),
-    )
+    try:
+        await asyncio.gather(
+            _candle_cache_obj.load_all(
+                _active_symbols, _get_client(),
+                batch_size=settings.candle_batch_size,
+            ),
+            ws.run(),
+            scheduler.run_all(),
+            server.serve(),
+        )
+    except asyncio.CancelledError:
+        logger.info("Tasks cancelled — shutting down")
 
-    await discord.shutdown()
-    await close_db()
+    # Graceful shutdown with timeout
+    try:
+        await asyncio.wait_for(_shutdown_cleanup(discord), timeout=30)
+    except asyncio.TimeoutError:
+        logger.warning("Shutdown timed out after 30s — forcing exit")
 
 
 def main() -> None:
