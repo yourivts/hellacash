@@ -11,6 +11,7 @@ from bot.data.models import (
     Asset,
     Candle,
     LearningEvent,
+    OnchainScore,
     Order,
     PortfolioSnapshot,
     Position,
@@ -18,6 +19,7 @@ from bot.data.models import (
     Signal,
     StrategyParams,
     Trade,
+    TradeJournal,
 )
 
 
@@ -181,10 +183,16 @@ async def get_trades(
     symbol: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
 ) -> List[Trade]:
     q = select(Trade)
     if symbol:
         q = q.where(Trade.symbol == symbol)
+    if start_date:
+        q = q.where(Trade.created_at >= datetime.combine(start_date, datetime.min.time()))
+    if end_date:
+        q = q.where(Trade.created_at <= datetime.combine(end_date, datetime.max.time()))
     q = q.order_by(desc(Trade.created_at)).limit(limit).offset(offset)
     result = await session.execute(q)
     return list(result.scalars().all())
@@ -202,6 +210,18 @@ async def count_trades_since(session: AsyncSession, since: datetime) -> int:
         select(Trade).where(Trade.created_at >= since)
     )
     return len(result.scalars().all())
+
+
+async def clear_all_trade_data(session: AsyncSession) -> None:
+    """Delete all trading data (for paper reset). Order respects FK constraints:
+    LearningEvent → Trade → Order ← Position, Order → Signal
+    """
+    await session.execute(delete(LearningEvent))
+    await session.execute(delete(Trade))
+    await session.execute(delete(Position))
+    await session.execute(delete(Order))
+    await session.execute(delete(Signal))
+    await session.execute(delete(PortfolioSnapshot))
 
 
 # ── Portfolio snapshots ───────────────────────────────────────────────────────
@@ -329,3 +349,41 @@ async def count_learning_events(session: AsyncSession, strategy_name: str) -> in
         select(LearningEvent).where(LearningEvent.strategy_name == strategy_name)
     )
     return len(result.scalars().all())
+
+
+# ── Journal ──────────────────────────────────────────────────────────────────
+
+
+async def save_journal_entry(session: AsyncSession, **kwargs) -> TradeJournal:
+    entry = TradeJournal(**kwargs)
+    session.add(entry)
+    await session.flush()
+    return entry
+
+
+async def update_journal_exit(session: AsyncSession, trade_id: int, **kwargs) -> None:
+    stmt = update(TradeJournal).where(TradeJournal.trade_id == trade_id).values(**kwargs)
+    await session.execute(stmt)
+    await session.flush()
+
+
+async def get_journal_entries(session: AsyncSession, limit: int = 20, offset: int = 0):
+    stmt = select(TradeJournal).order_by(TradeJournal.created_at.desc()).limit(limit).offset(offset)
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+
+async def get_journal_by_trade_id(session: AsyncSession, trade_id: int):
+    stmt = select(TradeJournal).where(TradeJournal.trade_id == trade_id)
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+# ── On-chain ─────────────────────────────────────────────────────────────────
+
+
+async def save_onchain_score(session: AsyncSession, **kwargs) -> OnchainScore:
+    score = OnchainScore(**kwargs)
+    session.add(score)
+    await session.flush()
+    return score
