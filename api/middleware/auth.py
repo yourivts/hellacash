@@ -1,6 +1,8 @@
 """API key authentication for REST and WebSocket endpoints."""
 from __future__ import annotations
 
+import hmac
+
 from fastapi import Depends, HTTPException, Query, WebSocket, status
 from fastapi.security import APIKeyHeader
 
@@ -14,7 +16,7 @@ async def require_api_key(api_key: str | None = Depends(_api_key_header)) -> Non
     configured_key = get_settings().api_key
     if not configured_key:
         return  # no auth configured
-    if api_key != configured_key:
+    if not api_key or not hmac.compare_digest(api_key, configured_key):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
 
 
@@ -25,7 +27,7 @@ async def ws_auth(ws: WebSocket, api_key: str | None = Query(None)) -> bool:
     configured_key = get_settings().api_key
     if not configured_key:
         return True
-    if api_key != configured_key:
+    if not api_key or not hmac.compare_digest(api_key, configured_key):
         await ws.accept()
         await ws.close(code=4001, reason="Invalid API key")
         return False

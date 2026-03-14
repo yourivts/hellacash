@@ -28,6 +28,8 @@ signals_generated = Counter("hellacash_signals_generated", "Total signals genera
 
 router = APIRouter()
 
+_relay_task: asyncio.Task | None = None
+
 
 @router.get("/metrics", include_in_schema=False)
 async def metrics():
@@ -36,6 +38,7 @@ async def metrics():
 
 async def start_metrics_relay() -> None:
     """Subscribe to event bus topics and update Prometheus metrics."""
+    global _relay_task
     bus = get_bus()
 
     trade_q = await bus.subscribe(TOPIC_TRADE_CLOSED)
@@ -44,23 +47,30 @@ async def start_metrics_relay() -> None:
     async def _relay():
         while True:
             try:
-                event = trade_q.get_nowait()
-                p = event.payload
-                trades_total.labels(
-                    direction=p.get("direction", "LONG"),
-                    exit_reason=p.get("exit_reason", "unknown"),
-                ).inc()
-            except asyncio.QueueEmpty:
-                pass
-            try:
-                event = signal_q.get_nowait()
-                p = event.payload
-                signals_generated.labels(direction=p.get("direction", "NEUTRAL")).inc()
-            except asyncio.QueueEmpty:
-                pass
-            await asyncio.sleep(0.1)
+                # Drain all available trade events
+                while True:
+                    try:
+                        event = trade_q.get_nowait()
+                        p = event.payload
+                        trades_total.labels(
+                            direction=p.get("direction", "LONG"),
+                            exit_reason=p.get("exit_reason", "unknown"),
+                        ).inc()
+                    except asyncio.QueueEmpty:
+                        break
+                # Drain all available signal events
+                while True:
+                    try:
+                        event = signal_q.get_nowait()
+                        p = event.payload
+                        signals_generated.labels(direction=p.get("direction", "NEUTRAL")).inc()
+                    except asyncio.QueueEmpty:
+                        break
+            except Exception:
+                logger.exception("Metrics relay error")
+            await asyncio.sleep(0.5)
 
-    asyncio.create_task(_relay())
+    _relay_task = asyncio.create_task(_relay())
 
 
 def update_portfolio_metrics(
