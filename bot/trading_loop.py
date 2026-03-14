@@ -14,6 +14,7 @@ from bot.events.bus import (
     get_bus,
 )
 from bot.indicators.volatility import atr as compute_atr
+from bot.risk.fees import get_trading_fees
 from bot.risk.position_sizer import kelly_size
 from bot.risk.stop_loss import check_stop_triggered, initial_stops, trail_stop
 from bot.strategy.base import MarketContext
@@ -48,9 +49,16 @@ class TradingLoop:
         self.signal_eval = signal_eval
         self.settings = settings
 
+        self._pending_orders: set[str] = set()
+
         # Trade stats cache (instance-level)
         self._trade_stats_cache: Dict[str, Any] = {}
         self._trade_stats_ts: float = 0
+        self._last_halt_log: float = 0  # throttle halt log messages
+
+    def is_symbol_pending(self, symbol: str) -> bool:
+        """Check if a symbol has a pending order (used by manual close endpoint too)."""
+        return symbol in self._pending_orders
 
     # ── WebSocket event handlers ──────────────────────────────────────────────
 
@@ -79,23 +87,33 @@ class TradingLoop:
         if pos is None:
             return
 
+        direction = pos.get("direction", "LONG")
+
         # Update trailing stop
         df_5m = self.candle_cache.get_df(symbol, "5m")
         if len(df_5m) >= 14:
             atr_val = compute_atr(df_5m["high"], df_5m["low"], df_5m["close"]).iloc[-1]
+            default_stop = current_price * (1.05 if direction == "SHORT" else 0.95)
             new_stop = trail_stop(
                 current_price,
                 pos["highest_price"],
-                pos["stop_loss_price"] or (current_price * 0.95),
+                pos["stop_loss_price"] or default_stop,
                 atr_val,
+                direction=direction,
             )
-            if new_stop > (pos["stop_loss_price"] or 0):
-                pos["stop_loss_price"] = new_stop
+            if direction == "SHORT":
+                if new_stop < (pos["stop_loss_price"] or float("inf")):
+                    pos["stop_loss_price"] = new_stop
+            else:
+                if new_stop > (pos["stop_loss_price"] or 0):
+                    pos["stop_loss_price"] = new_stop
 
+        default_tp = 0.0 if direction == "SHORT" else float("inf")
         exit_reason = check_stop_triggered(
             current_price,
-            pos["stop_loss_price"] or 0,
-            pos["take_profit_price"] or float("inf"),
+            pos["stop_loss_price"] or (float("inf") if direction == "SHORT" else 0),
+            pos["take_profit_price"] or default_tp,
+            direction=direction,
         )
 
         if exit_reason:
@@ -110,37 +128,50 @@ class TradingLoop:
         if pos is None:
             return
 
-        quantity = pos["quantity"]
-        order_id = await order_mgr.submit_sell(symbol, quantity, pos["strategy_name"])
+        if symbol in self._pending_orders:
+            logger.warning("Skipping close for %s — order already pending", symbol)
+            return
 
-        sentiment_score = sentiment.get_score(symbol)
-        result = await portfolio.close_position(symbol, price, order_id, reason, sentiment_score)
+        self._pending_orders.add(symbol)
+        try:
+            quantity = pos["quantity"]
+            direction = pos.get("direction", "LONG")
 
-        if result:
-            # Trigger learning
-            analyzer = self.trade_analyzer
-            evaluator = self.signal_eval
-            await analyzer.process_closed_trade(
-                trade_id=result["trade_id"],
-                symbol=symbol,
-                strategy_name=pos["strategy_name"],
-                net_pnl=result["net_pnl"],
-                entry_features=pos.get("entry_features"),
-            )
+            # LONG: sell to close. SHORT: buy to close.
+            if direction == "SHORT":
+                order_id = await order_mgr.submit_buy(symbol, quantity, pos["strategy_name"])
+            else:
+                order_id = await order_mgr.submit_sell(symbol, quantity, pos["strategy_name"])
 
-            if pos.get("entry_features"):
-                breakdown = pos["entry_features"].get("breakdown", {})
-                direction = "LONG"  # we only go long currently
-                evaluator.record_trade(breakdown, direction, result["net_pnl"] > 0)
+            sentiment_score = sentiment.get_score(symbol)
+            result = await portfolio.close_position(symbol, price, order_id, reason, sentiment_score)
 
-            if result["net_pnl"] < 0:
-                self.drawdown.record_realized_loss(abs(result["net_pnl"]))
+            if result:
+                # Trigger learning
+                analyzer = self.trade_analyzer
+                evaluator = self.signal_eval
+                await analyzer.process_closed_trade(
+                    trade_id=result["trade_id"],
+                    symbol=symbol,
+                    strategy_name=pos["strategy_name"],
+                    net_pnl=result["net_pnl"],
+                    entry_features=pos.get("entry_features"),
+                )
 
-            await get_bus().publish(TOPIC_TRADE_CLOSED, {
-                **result,
-                "price": price,
-                "reason": reason,
-            })
+                if pos.get("entry_features"):
+                    breakdown = pos["entry_features"].get("breakdown", {})
+                    evaluator.record_trade(breakdown, direction, result["net_pnl"] > 0)
+
+                if result["net_pnl"] < 0:
+                    self.drawdown.record_realized_loss(abs(result["net_pnl"]))
+
+                await get_bus().publish(TOPIC_TRADE_CLOSED, {
+                    **result,
+                    "price": price,
+                    "reason": reason,
+                })
+        finally:
+            self._pending_orders.discard(symbol)
 
     # ── Trade stats for position sizing ───────────────────────────────────────
 
@@ -211,10 +242,18 @@ class TradingLoop:
                 if portfolio.has_position(symbol):
                     continue
 
+                # Skip if order is pending (prevents race condition)
+                if symbol in self._pending_orders:
+                    continue
+
                 # Check if trading is allowed
                 allowed, halt_reason = drawdown.is_trading_allowed(equity)
                 if not allowed:
-                    logger.warning("Trading halted: %s", halt_reason)
+                    import time as _t
+                    now = _t.time()
+                    if now - self._last_halt_log > 300:  # log once per 5 min
+                        logger.warning("Trading halted: %s", halt_reason)
+                        self._last_halt_log = now
                     return
 
                 # Detect regime and select strategies
@@ -261,16 +300,33 @@ class TradingLoop:
                 })
 
                 if not best_signal.is_actionable(settings.min_signal_confidence):
+                    logger.info(
+                        "Signal SKIPPED %s %s %s (strength=%.2f < min=%.2f)",
+                        best_signal.direction, symbol, best_signal.strategy_name,
+                        best_signal.strength, settings.min_signal_confidence,
+                    )
                     continue
 
-                if best_signal.direction != "LONG":
-                    continue  # only long positions (no shorting spot market)
+                direction = best_signal.direction
+                if direction not in ("LONG", "SHORT"):
+                    continue
 
-                # Multi-timeframe confirmation: 1h trend must agree
+                # Multi-timeframe confirmation: 1h trend must agree with direction
                 if len(df_1h) >= 20:
                     ema20_1h = df_1h["close"].ewm(span=20).mean().iloc[-1]
-                    if best_signal.direction == "LONG" and df_1h["close"].iloc[-1] < ema20_1h:
-                        continue  # 1h trend is bearish, skip long
+                    price_1h = df_1h["close"].iloc[-1]
+                    if direction == "LONG" and price_1h < ema20_1h:
+                        logger.info(
+                            "Signal SKIPPED %s %s — 1h trend bearish (price %.4f < EMA20 %.4f)",
+                            direction, symbol, price_1h, ema20_1h,
+                        )
+                        continue
+                    if direction == "SHORT" and price_1h > ema20_1h:
+                        logger.info(
+                            "Signal SKIPPED %s %s — 1h trend bullish (price %.4f > EMA20 %.4f)",
+                            direction, symbol, price_1h, ema20_1h,
+                        )
+                        continue
 
                 # Get win/loss stats from trade history for position sizing
                 win_rate, avg_win, avg_loss = await self._get_trade_stats(best_signal.strategy_name)
@@ -294,14 +350,16 @@ class TradingLoop:
                 amount_base = size_eur / entry_price
 
                 # Compute expected ROI from stop/TP levels
-                stop_loss, take_profit = initial_stops(entry_price, df_5m)
-                risk = (entry_price - stop_loss) / entry_price * 100
+                stop_loss, take_profit = initial_stops(entry_price, df_5m, direction=direction)
+                risk = abs(entry_price - stop_loss) / entry_price * 100
                 expected_roi = risk * 3.0  # 3:1 reward/risk
 
-                # Risk gate
+                # Risk gate (use actual per-market taker fee)
+                _, taker_pct = get_trading_fees(symbol)
+                side = "buy" if direction == "LONG" else "sell"
                 decision = risk_engine.approve(
                     symbol=symbol,
-                    side="buy",
+                    side=side,
                     position_size_eur=size_eur,
                     signal_confidence=best_signal.strength,
                     expected_roi_pct=expected_roi,
@@ -309,12 +367,20 @@ class TradingLoop:
                     open_position_count=portfolio.open_position_count(),
                     daily_loss_eur=drawdown.daily_realized_loss_eur(),
                     current_drawdown_pct=drawdown.current_drawdown_pct(equity),
+                    taker_fee_pct=taker_pct,
                 )
 
                 if not decision.approved:
+                    # RiskEngine already logs rejections
                     continue
 
-                # Execute buy
+                logger.info(
+                    "Signal ACCEPTED %s %s %s — size €%.2f, confidence=%.2f",
+                    direction, symbol, best_signal.strategy_name,
+                    size_eur, best_signal.strength,
+                )
+
+                # Save signal
                 from bot.data.database import get_session as _gs
                 from bot.data.repositories import save_signal
                 async with _gs() as session:
@@ -322,7 +388,7 @@ class TradingLoop:
                         session,
                         symbol=symbol,
                         strategy_name=best_signal.strategy_name,
-                        direction=best_signal.direction,
+                        direction=direction,
                         strength=best_signal.strength,
                         technical_score=best_signal.technical_score,
                         sentiment_score=best_signal.sentiment_score,
@@ -331,25 +397,36 @@ class TradingLoop:
                     )
                     signal_id = sig_record.id
 
-                order_id = await order_mgr.submit_buy(
-                    symbol, amount_base, best_signal.strategy_name, signal_id
-                )
+                self._pending_orders.add(symbol)
+                try:
+                    # LONG: buy to open. SHORT: sell to open.
+                    if direction == "SHORT":
+                        order_id = await order_mgr.submit_sell(
+                            symbol, amount_base, best_signal.strategy_name, signal_id
+                        )
+                    else:
+                        order_id = await order_mgr.submit_buy(
+                            symbol, amount_base, best_signal.strategy_name, signal_id
+                        )
 
-                if order_id:
-                    await portfolio.add_position(
-                        symbol=symbol,
-                        strategy_name=best_signal.strategy_name,
-                        entry_price=entry_price,
-                        quantity=amount_base,
-                        stop_loss=stop_loss,
-                        take_profit=take_profit,
-                        entry_order_id=order_id,
-                        paper_trade=settings.paper_trading,
-                    )
-                    # Store features on position for learning
-                    pos = portfolio.get_position(symbol)
-                    if pos:
-                        pos["entry_features"] = best_signal.indicator_snapshot
+                    if order_id:
+                        await portfolio.add_position(
+                            symbol=symbol,
+                            strategy_name=best_signal.strategy_name,
+                            entry_price=entry_price,
+                            quantity=amount_base,
+                            stop_loss=stop_loss,
+                            take_profit=take_profit,
+                            entry_order_id=order_id,
+                            paper_trade=settings.paper_trading,
+                            direction=direction,
+                        )
+                        # Store features on position for learning
+                        pos = portfolio.get_position(symbol)
+                        if pos:
+                            pos["entry_features"] = best_signal.indicator_snapshot
+                finally:
+                    self._pending_orders.discard(symbol)
 
             except Exception as e:
                 logger.error("Strategy cycle error for %s: %s", symbol, e, exc_info=True)
