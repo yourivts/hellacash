@@ -9,7 +9,7 @@ from bot.strategy.router import Regime, StrategyRouter, detect_regime
 from bot.strategy.hybrid import HybridStrategy
 from bot.strategy.trend_following import TrendFollowingStrategy
 from bot.strategy.breakout import BreakoutStrategy
-from bot.strategy.mean_reversion import MeanReversionStrategy
+from bot.strategy.range_trading import RangeStrategy
 
 
 def _make_df(n: int = 100, trend: str = "flat", volatility: float = 0.01) -> pd.DataFrame:
@@ -61,13 +61,13 @@ class TestStrategyRouter:
         assert TrendFollowingStrategy in types
         assert HybridStrategy in types
 
-    def test_ranging_includes_mean_reversion(self):
+    def test_ranging_includes_range_strategy(self):
         router = StrategyRouter()
         strategies = router.get_strategies(Regime.RANGING)
         types = [type(s) for s in strategies]
-        assert MeanReversionStrategy in types
+        assert RangeStrategy in types
 
     def test_volatile_position_modifier(self):
         router = StrategyRouter()
-        assert router.position_size_modifier(Regime.VOLATILE) == 0.5
+        assert router.position_size_modifier(Regime.VOLATILE) == 0.3
         assert router.position_size_modifier(Regime.TRENDING) == 1.0

@@ -11,7 +11,7 @@ from bot.indicators.volatility import atr
 from bot.strategy.base import BaseStrategy
 from bot.strategy.breakout import BreakoutStrategy
 from bot.strategy.hybrid import HybridStrategy
-from bot.strategy.mean_reversion import MeanReversionStrategy
+from bot.strategy.range_trading import RangeStrategy
 from bot.strategy.trend_following import TrendFollowingStrategy
 
 logger = logging.getLogger(__name__)
@@ -66,22 +66,24 @@ class StrategyRouter:
     def __init__(self) -> None:
         self._hybrid = HybridStrategy()
         self._trend = TrendFollowingStrategy()
-        self._mean_rev = MeanReversionStrategy()
+        self._range = RangeStrategy()
         self._breakout = BreakoutStrategy()
 
     def get_strategies(self, regime: str) -> List[BaseStrategy]:
         if regime == Regime.TRENDING:
             return [self._hybrid, self._trend, self._breakout]
         elif regime == Regime.RANGING:
-            return [self._hybrid, self._mean_rev]
+            return [self._hybrid, self._range]
         elif regime == Regime.VOLATILE:
             return [self._hybrid]  # only hybrid in volatile markets
         else:
             return [self._hybrid]
 
     def position_size_modifier(self, regime: str) -> float:
-        """Reduce position sizes in volatile markets."""
+        """Reduce position sizes in volatile/ranging markets."""
         if regime == Regime.VOLATILE:
+            return 0.3
+        if regime == Regime.RANGING:
             return 0.5
         return 1.0
 
