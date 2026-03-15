@@ -653,21 +653,21 @@ class BacktestEngine:
 
                     # LONG: price within 1% of lower BB + RSI < 40 + volume support
                     if bb_lower > 0 and abs(price - bb_lower) / bb_lower <= 0.01 and rsi_val < 40:
-                        if vol_score > 0.3:
+                        if vol_score > 0.10:
                             direction = "LONG"
                             confirming = 1
                             if abs(price - bb_lower) / bb_lower <= 0.005:
                                 confirming += 1
-                            if vol_score > 0.5:
+                            if vol_score > 0.3:
                                 confirming += 1
                     # SHORT: price within 1% of upper BB + RSI > 60 + volume resistance
                     elif bb_upper > 0 and abs(price - bb_upper) / bb_upper <= 0.01 and rsi_val > 60:
-                        if vol_score < -0.3:
+                        if vol_score < -0.10:
                             direction = "SHORT"
                             confirming = 1
                             if abs(price - bb_upper) / bb_upper <= 0.005:
                                 confirming += 1
-                            if vol_score < -0.5:
+                            if vol_score < -0.3:
                                 confirming += 1
 
                     strength = 0.0

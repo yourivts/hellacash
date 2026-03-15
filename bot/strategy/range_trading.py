@@ -25,7 +25,7 @@ ADX_RESET = 25
 ENTRY_PROXIMITY_PCT = 0.01
 RSI_LONG_THRESHOLD = 40
 RSI_SHORT_THRESHOLD = 60
-VOLUME_SCORE_THRESHOLD = 0.3
+VOLUME_SCORE_THRESHOLD = 0.10
 
 # Bounce limit
 MAX_BOUNCES = 3
@@ -108,7 +108,7 @@ class RangeStrategy(BaseStrategy):
                 confirming = 1
                 if abs(price - lower) / lower <= 0.005:
                     confirming += 1
-                if vol_score > 0.5:
+                if vol_score > 0.3:
                     confirming += 1
 
         # SHORT: price within 1% of upper BB + RSI > 60 + volume resistance
@@ -118,7 +118,7 @@ class RangeStrategy(BaseStrategy):
                 confirming = 1
                 if abs(price - upper) / upper <= 0.005:
                     confirming += 1
-                if vol_score < -0.5:
+                if vol_score < -0.3:
                     confirming += 1
 
         if direction == "NEUTRAL":
