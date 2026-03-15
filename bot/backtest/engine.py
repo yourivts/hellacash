@@ -395,7 +395,7 @@ class BacktestEngine:
         # Volume profile for range trading
         try:
             from bot.indicators.volume import volume_profile_support
-            result["vol_profile"] = volume_profile_support(close, volume, high, low).values
+            result["vol_profile"] = volume_profile_support(close, volume).values
         except Exception:
             result["vol_profile"] = np.zeros(len(df))
 
@@ -730,11 +730,14 @@ class BacktestEngine:
 
                 if sig.direction in ("LONG", "SHORT") and sig.strength > 0:
                     # Penalize counter-trend signals based on EMA200
+                    # Skip penalty for range strategy — range trades are mean-reversion
+                    # within bands, not trend-following, so EMA200 filter is harmful
                     effective_strength = sig.strength
-                    if sig.direction == "LONG" and price_below_ema200:
-                        effective_strength *= 0.3  # heavily penalize counter-trend longs
-                    elif sig.direction == "SHORT" and price_above_ema200:
-                        effective_strength *= 0.3  # heavily penalize counter-trend shorts
+                    if sig.strategy_name != "range":
+                        if sig.direction == "LONG" and price_below_ema200:
+                            effective_strength *= 0.3  # heavily penalize counter-trend longs
+                        elif sig.direction == "SHORT" and price_above_ema200:
+                            effective_strength *= 0.3  # heavily penalize counter-trend shorts
 
                     if best_signal is None or effective_strength > best_signal.strength:
                         sig.strength = effective_strength

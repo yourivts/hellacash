@@ -16,33 +16,29 @@ class TestVolumeProfileSupport:
         np.random.seed(seed)
         t = np.linspace(0, 8 * np.pi, n)
         close = 100 + 5 * np.sin(t) + np.random.normal(0, 0.5, n)
-        high = close + np.random.uniform(0.1, 1.0, n)
-        low = close - np.random.uniform(0.1, 1.0, n)
         volume = np.random.uniform(100, 1000, n)
         return (
             pd.Series(close, dtype=float),
             pd.Series(volume, dtype=float),
-            pd.Series(high, dtype=float),
-            pd.Series(low, dtype=float),
         )
 
     def test_returns_series_of_correct_length(self):
-        close, volume, high, low = self._make_ranging_data()
-        result = volume_profile_support(close, volume, high, low)
+        close, volume = self._make_ranging_data()
+        result = volume_profile_support(close, volume)
         assert isinstance(result, pd.Series)
         assert len(result) == len(close)
 
     def test_values_bounded_minus_one_to_plus_one(self):
-        close, volume, high, low = self._make_ranging_data()
-        result = volume_profile_support(close, volume, high, low)
+        close, volume = self._make_ranging_data()
+        result = volume_profile_support(close, volume)
         valid = result.dropna()
         assert (valid >= -1.0).all()
         assert (valid <= 1.0).all()
 
     def test_positive_score_near_support(self):
         """When price is near range bottom with volume below, score should be positive."""
-        close, volume, high, low = self._make_ranging_data(n=300)
-        result = volume_profile_support(close, volume, high, low, lookback=200)
+        close, volume = self._make_ranging_data(n=300)
+        result = volume_profile_support(close, volume, lookback=200)
         support_indices = close[close < close.rolling(200).quantile(0.2)].index
         if len(support_indices) > 0:
             support_scores = result.loc[support_indices].dropna()
@@ -53,16 +49,14 @@ class TestVolumeProfileSupport:
         """Should not crash when volume is zero."""
         close = pd.Series([100.0] * 50)
         volume = pd.Series([0.0] * 50)
-        high = close + 1.0
-        low = close - 1.0
-        result = volume_profile_support(close, volume, high, low, lookback=20)
+        result = volume_profile_support(close, volume, lookback=20)
         assert len(result) == 50
         assert not result.isna().all()
 
     def test_custom_lookback(self):
-        close, volume, high, low = self._make_ranging_data()
-        result_50 = volume_profile_support(close, volume, high, low, lookback=50)
-        result_200 = volume_profile_support(close, volume, high, low, lookback=200)
+        close, volume = self._make_ranging_data()
+        result_50 = volume_profile_support(close, volume, lookback=50)
+        result_200 = volume_profile_support(close, volume, lookback=200)
         assert len(result_50) == len(result_200) == len(close)
 
 
@@ -299,3 +293,147 @@ class TestRangeExitLogic:
         engine._close_position(pos, 50500.0, "2025-09-01T12:00", "take_profit")
 
         assert engine._range_bounces.get("BTC-EUR", 0) == 1
+
+    def test_range_dynamic_tp_shift_long(self):
+        """LONG range position shifts TP from mid to upper when RSI trending up."""
+        engine = BacktestEngine.__new__(BacktestEngine)
+        engine.positions = []
+        engine.closed_trades = []
+        engine.balance = 10000.0
+        engine.peak_balance = 10000.0
+        engine.slippage_pct = 0.001
+        engine._atr_multiplier = 2.0
+        engine._max_hold_bars = 576
+        engine._range_max_hold_bars = 288
+        engine._range_bounces = {}
+
+        pos = _OpenPosition(
+            symbol="BTC-EUR", direction="LONG", entry_price=49800.0,
+            entry_time="2025-09-01", size_eur=100.0, stop_loss=49500.0,
+            take_profit=50000.0, highest_price=49800.0, strategy="range",
+            entry_bar=0, range_mid=50000.0, range_upper=50500.0, range_lower=49500.0,
+        )
+        engine.positions.append(pos)
+
+        # RSI trending up: current > 3 bars ago
+        precomp_5m = {"rsi": np.array([0.0] * 10 + [45.0, 46.0, 47.0, 50.0])}
+        engine._check_exits_fast(
+            price=50050.0, candle_high=50100.0, candle_low=49900.0,
+            time_str="2025-09-01T06:00", atr_val=200.0, current_bar=50,
+            precomp_5m=precomp_5m, idx_5m=13,
+        )
+        # Position should still be open with shifted TP
+        assert len(engine.positions) == 1
+        assert engine.positions[0].tp_shifted is True
+        assert engine.positions[0].take_profit == 50500.0  # shifted to upper band
+
+    def test_range_mid_exit_when_rsi_flat(self):
+        """LONG range position closes at mid-band when RSI is flat/reversing."""
+        engine = BacktestEngine.__new__(BacktestEngine)
+        engine.positions = []
+        engine.closed_trades = []
+        engine.balance = 10000.0
+        engine.peak_balance = 10000.0
+        engine.slippage_pct = 0.001
+        engine._atr_multiplier = 2.0
+        engine._max_hold_bars = 576
+        engine._range_max_hold_bars = 288
+        engine._range_bounces = {}
+
+        pos = _OpenPosition(
+            symbol="BTC-EUR", direction="LONG", entry_price=49800.0,
+            entry_time="2025-09-01", size_eur=100.0, stop_loss=49500.0,
+            take_profit=50000.0, highest_price=49800.0, strategy="range",
+            entry_bar=0, range_mid=50000.0, range_upper=50500.0, range_lower=49500.0,
+        )
+        engine.positions.append(pos)
+
+        # RSI flat/declining: current <= 3 bars ago
+        precomp_5m = {"rsi": np.array([0.0] * 10 + [52.0, 51.0, 50.0, 49.0])}
+        engine._check_exits_fast(
+            price=50050.0, candle_high=50100.0, candle_low=49900.0,
+            time_str="2025-09-01T06:00", atr_val=200.0, current_bar=50,
+            precomp_5m=precomp_5m, idx_5m=13,
+        )
+        # Position should be closed at mid-band
+        assert len(engine.positions) == 0
+        assert len(engine.closed_trades) == 1
+        assert engine.closed_trades[0].exit_reason == "range_mid_exit"
+
+    def test_range_trailing_stop_after_tp_shift(self):
+        """After TP shift, a 1% trailing stop is activated for range positions."""
+        engine = BacktestEngine.__new__(BacktestEngine)
+        engine.positions = []
+        engine.closed_trades = []
+        engine.balance = 10000.0
+        engine.peak_balance = 10000.0
+        engine.slippage_pct = 0.001
+        engine._atr_multiplier = 2.0
+        engine._max_hold_bars = 576
+        engine._range_max_hold_bars = 288
+        engine._range_bounces = {}
+
+        pos = _OpenPosition(
+            symbol="BTC-EUR", direction="LONG", entry_price=49800.0,
+            entry_time="2025-09-01", size_eur=100.0, stop_loss=49500.0,
+            take_profit=50500.0, highest_price=50200.0, strategy="range",
+            entry_bar=0, range_mid=50000.0, range_upper=50500.0, range_lower=49500.0,
+            tp_shifted=True,
+        )
+        engine.positions.append(pos)
+
+        # Price above previous highest → trailing stop should update
+        engine._check_exits_fast(
+            price=50300.0, candle_high=50350.0, candle_low=50250.0,
+            time_str="2025-09-01T08:00", atr_val=200.0, current_bar=100,
+        )
+        # Position still open, highest_price updated, SL tightened to 1% below highest
+        assert len(engine.positions) == 1
+        assert engine.positions[0].highest_price == 50300.0
+        expected_sl = 50300.0 * 0.99  # 1% trailing
+        assert engine.positions[0].stop_loss == pytest.approx(expected_sl, rel=1e-6)
+
+    def test_range_stop_loss_levels(self):
+        """Range positions get SL at band edge +/- 0.5x bandwidth."""
+        from bot.strategy.base import Signal
+
+        engine = BacktestEngine.__new__(BacktestEngine)
+        engine.positions = []
+        engine.closed_trades = []
+        engine.balance = 10000.0
+        engine.peak_balance = 10000.0
+        engine.slippage_pct = 0.001
+        engine._range_bounces = {}
+        engine._kelly_fraction = 0.15
+        engine._atr_multiplier = 2.0
+        engine._rr_ratio = 2.0
+
+        # Create a signal with range indicator_snapshot
+        signal = Signal(
+            symbol="BTC-EUR", direction="LONG", strength=0.8,
+            strategy_name="range", technical_score=0.8,
+            indicator_snapshot={
+                "range_mid": 50000.0, "range_upper": 50500.0,
+                "range_lower": 49500.0, "bounce_count": 0,
+                "confirming_count": 3, "rsi": 35.0,
+                "bb_bandwidth": 0.06, "vol_profile_score": 0.5,
+            },
+        )
+
+        # Create minimal df for initial_stops
+        prices = np.linspace(49500, 50500, 50)
+        df_window = pd.DataFrame({
+            "open": prices, "high": prices * 1.002,
+            "low": prices * 0.998, "close": prices,
+            "volume": np.ones(50) * 100,
+        })
+
+        engine._open_position(signal, 49600.0, "2025-09-01", df_window, 0.5, bar_index=0)
+
+        assert len(engine.positions) == 1
+        pos = engine.positions[0]
+        bandwidth = 50500.0 - 49500.0  # 1000
+        expected_sl = 49500.0 - 0.5 * bandwidth  # 49000
+        expected_tp = 50000.0  # mid-band (Phase 1)
+        assert pos.stop_loss == pytest.approx(expected_sl, rel=1e-6)
+        assert pos.take_profit == pytest.approx(expected_tp, rel=1e-6)

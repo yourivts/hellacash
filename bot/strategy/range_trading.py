@@ -90,7 +90,7 @@ class RangeStrategy(BaseStrategy):
         bb_5m = bollinger_bands(close_5m)
         rsi_5m = rsi(close_5m).iloc[-1]
         vol_score = volume_profile_support(
-            close_5m, volume_5m, high_5m, low_5m, lookback=min(200, len(close_5m) - 1),
+            close_5m, volume_5m, lookback=min(200, len(close_5m) - 1),
         ).iloc[-1]
 
         price = ctx.current_price

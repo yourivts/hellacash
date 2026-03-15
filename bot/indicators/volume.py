@@ -1,6 +1,7 @@
 """Volume indicators: OBV, VWAP, CMF."""
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 
@@ -33,8 +34,6 @@ def volume_surge_ratio(volume: pd.Series, period: int = 20) -> pd.Series:
 def volume_profile_support(
     close: pd.Series,
     volume: pd.Series,
-    high: pd.Series,
-    low: pd.Series,
     lookback: int = 200,
 ) -> pd.Series:
     """Compute volume profile support/resistance score per bar.
@@ -44,8 +43,6 @@ def volume_profile_support(
     - Negative = volume concentrated from above (resistance)
     - Near zero = no clear volume clustering
     """
-    import numpy as np
-
     n = len(close)
     scores = np.zeros(n, dtype=float)
 

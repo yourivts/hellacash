@@ -76,7 +76,7 @@ bot/
 ├── config.py         # Settings from .env
 ├── exchange/         # Bitvavo REST + WebSocket client
 ├── indicators/       # RSI, MACD, Bollinger, ATR, EMA, volume, composite
-├── strategy/         # hybrid + trend + mean_reversion + breakout + regime router
+├── strategy/         # hybrid + trend + range + breakout + regime router
 ├── risk/             # Engine gate, Kelly sizer, ATR stops, drawdown guard
 ├── sentiment/        # Reddit/Twitter/RSS scrapers + VADER/FinBERT NLP
 ├── learning/         # Trade analyzer, signal evaluator, param optimizer
