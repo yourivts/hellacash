@@ -175,3 +175,73 @@ class TestRangeStrategy:
         ctx = self._make_ranging_ctx()
         sig = strat.generate_signal(ctx)
         assert sig.direction == "NEUTRAL"
+
+
+from bot.backtest.engine import BacktestEngine, _OpenPosition
+from bot.exchange.bitvavo_client import CandleData
+from datetime import datetime, timezone
+
+
+class TestRangeBacktestIntegration:
+    """Tests for range strategy in the backtest engine."""
+
+    def _make_ranging_candles(self, n=500, symbol="BTC-EUR"):
+        """Generate synthetic ranging candles for backtest."""
+        np.random.seed(42)
+        candles = []
+        base_price = 50000.0
+        t0 = datetime(2025, 9, 1, tzinfo=timezone.utc)
+
+        for i in range(n):
+            phase = np.sin(2 * np.pi * i / 100) * 0.01
+            price = base_price * (1 + phase + np.random.normal(0, 0.001))
+            candles.append(CandleData(
+                symbol=symbol,
+                interval="5m",
+                timestamp=t0 + pd.Timedelta(minutes=5 * i),
+                open=price * (1 + np.random.normal(0, 0.0005)),
+                high=price * (1 + abs(np.random.normal(0, 0.002))),
+                low=price * (1 - abs(np.random.normal(0, 0.002))),
+                close=price,
+                volume=float(np.random.uniform(0.5, 5.0)),
+            ))
+        return candles
+
+    def test_engine_has_range_bounce_counter(self):
+        candles = self._make_ranging_candles(n=100)
+        engine = BacktestEngine(candles)
+        assert hasattr(engine, "_range_bounces")
+        assert isinstance(engine._range_bounces, dict)
+
+    def test_open_position_has_range_fields(self):
+        pos = _OpenPosition(
+            symbol="BTC-EUR", direction="LONG", entry_price=50000.0,
+            entry_time="2025-09-01", size_eur=100.0, stop_loss=49000.0,
+            take_profit=51000.0, highest_price=50000.0, strategy="range",
+        )
+        assert pos.tp_shifted is False
+        assert pos.range_mid == 0.0
+        assert pos.range_upper == 0.0
+        assert pos.range_lower == 0.0
+
+    def test_precompute_includes_bb_full_arrays(self):
+        candles = self._make_ranging_candles(n=200)
+        engine = BacktestEngine(candles)
+        df = engine._to_dataframe(candles)
+        precomp = engine._precompute_signals(df, "BTC-EUR")
+        assert "bb_upper" in precomp
+        assert "bb_lower" in precomp
+        assert "bb_mid" in precomp
+        assert "bb_bandwidth" in precomp
+        assert "vol_profile" in precomp
+
+    def test_backtest_runs_without_error(self):
+        """Smoke test: backtest with range strategy doesn't crash."""
+        candles = self._make_ranging_candles(n=500)
+        engine = BacktestEngine(candles, strategy_params={
+            "min_confirmations": 1,
+            "entry_threshold": 0.30,
+            "cooldown_hours": 1,
+        })
+        result = engine.run()
+        assert result.total_trades >= 0
