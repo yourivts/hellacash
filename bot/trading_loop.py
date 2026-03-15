@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Callable, Dict, List
+from typing import Any, Dict, List
 
 import pandas as pd
 
@@ -58,6 +58,10 @@ class TradingLoop:
         self.orderbook = orderbook
 
         self._pending_orders: set[str] = set()
+
+        # Per-symbol cooldown: tracks last trade close time (monotonic)
+        self._last_trade_closed: Dict[str, float] = {}
+        self._cooldown_seconds: float = settings.trade_cooldown_hours * 3600 if hasattr(settings, "trade_cooldown_hours") else 96 * 3600
 
         # Trade stats cache (instance-level)
         self._trade_stats_cache: Dict[str, Any] = {}
@@ -135,6 +139,59 @@ class TradingLoop:
                 if new_stop > (pos["stop_loss_price"] or 0):
                     pos["stop_loss_price"] = new_stop
 
+        # Range 24h max hold time
+        if pos.get("strategy_name") == "range":
+            entry_time = pos.get("entry_time")
+            if entry_time is not None:
+                from datetime import datetime, timezone
+                try:
+                    if isinstance(entry_time, str):
+                        entry_dt = datetime.fromisoformat(entry_time)
+                    else:
+                        entry_dt = entry_time
+                    now = datetime.now(timezone.utc)
+                    if (now - entry_dt).total_seconds() >= 86400:  # 24 hours
+                        await self._close_position(symbol, current_price, "range_time_exit")
+                        return
+                except (ValueError, TypeError):
+                    pass
+
+        # Range dynamic TP: shift from mid to opposite band
+        if pos.get("strategy_name") == "range" and not pos.get("tp_shifted", False):
+            crossed_mid = (
+                (direction == "LONG" and current_price >= pos.get("range_mid", 0)) or
+                (direction == "SHORT" and current_price <= pos.get("range_mid", float("inf")))
+            )
+            if crossed_mid and pos.get("range_mid", 0) > 0:
+                from bot.indicators.momentum import rsi as compute_rsi
+                if len(df_5m) >= 20:
+                    rsi_series = compute_rsi(df_5m["close"])
+                    current_rsi = rsi_series.iloc[-1]
+                    prev_rsi = rsi_series.iloc[-4] if len(rsi_series) >= 4 else current_rsi
+
+                    if direction == "LONG" and current_rsi > prev_rsi:
+                        pos["tp_shifted"] = True
+                        pos["take_profit_price"] = pos["range_upper"]
+                        logger.info("Range TP shifted to upper band %.2f for %s", pos["range_upper"], symbol)
+                    elif direction == "SHORT" and current_rsi < prev_rsi:
+                        pos["tp_shifted"] = True
+                        pos["take_profit_price"] = pos["range_lower"]
+                        logger.info("Range TP shifted to lower band %.2f for %s", pos["range_lower"], symbol)
+                    else:
+                        await self._close_position(symbol, pos["range_mid"], "range_mid_exit")
+                        return
+
+        # Tight trailing stop for range positions with shifted TP
+        if pos.get("strategy_name") == "range" and pos.get("tp_shifted", False):
+            if direction == "LONG":
+                trail_level = pos["highest_price"] * 0.99
+                if trail_level > (pos["stop_loss_price"] or 0):
+                    pos["stop_loss_price"] = trail_level
+            elif direction == "SHORT":
+                trail_level = pos["highest_price"] * 1.01
+                if trail_level < (pos["stop_loss_price"] or float("inf")):
+                    pos["stop_loss_price"] = trail_level
+
         default_tp = 0.0 if direction == "SHORT" else float("inf")
         exit_reason = check_stop_triggered(
             current_price,
@@ -174,6 +231,14 @@ class TradingLoop:
             result = await portfolio.close_position(symbol, price, order_id, reason, sentiment_score)
 
             if result:
+                # Record cooldown start for this symbol
+                self._last_trade_closed[symbol] = time.monotonic()
+
+                # Increment range bounce counter
+                if pos.get("strategy_name") == "range":
+                    if hasattr(self.router, '_range'):
+                        self.router._range.increment_bounce(symbol)
+
                 # Trigger learning
                 analyzer = self.trade_analyzer
                 evaluator = self.signal_eval
@@ -272,6 +337,18 @@ class TradingLoop:
                 # Skip if order is pending (prevents race condition)
                 if symbol in self._pending_orders:
                     continue
+
+                # Per-symbol cooldown — prevent overtrading after a close
+                last_closed = self._last_trade_closed.get(symbol)
+                if last_closed is not None:
+                    elapsed = time.monotonic() - last_closed
+                    if elapsed < self._cooldown_seconds:
+                        remaining_h = (self._cooldown_seconds - elapsed) / 3600
+                        logger.debug(
+                            "Cooldown active for %s — %.1fh remaining",
+                            symbol, remaining_h,
+                        )
+                        continue
 
                 # Check if trading is allowed
                 allowed, halt_reason = drawdown.is_trading_allowed(equity)
@@ -377,7 +454,7 @@ class TradingLoop:
                 # Compute expected ROI from stop/TP levels
                 stop_loss, take_profit = initial_stops(entry_price, df_5m, direction=direction)
                 risk = abs(entry_price - stop_loss) / entry_price * 100
-                expected_roi = risk * 3.0  # 3:1 reward/risk
+                expected_roi = risk * 2.0  # 2:1 reward/risk
 
                 # Risk gate (use actual per-market taker fee)
                 _, taker_pct = get_trading_fees(symbol)
@@ -457,6 +534,23 @@ class TradingLoop:
                         pos = portfolio.get_position(symbol)
                         if pos:
                             pos["entry_features"] = best_signal.indicator_snapshot
+
+                            # Store range levels for range strategy
+                            if best_signal.strategy_name == "range":
+                                snap = best_signal.indicator_snapshot
+                                pos["range_mid"] = snap.get("range_mid", 0.0)
+                                pos["range_upper"] = snap.get("range_upper", 0.0)
+                                pos["range_lower"] = snap.get("range_lower", 0.0)
+                                pos["tp_shifted"] = False
+
+                                # Override ATR stops with range-specific stops
+                                bandwidth_price = pos["range_upper"] - pos["range_lower"]
+                                if direction == "LONG":
+                                    pos["stop_loss_price"] = pos["range_lower"] - 0.5 * bandwidth_price
+                                    pos["take_profit_price"] = pos["range_mid"]
+                                else:
+                                    pos["stop_loss_price"] = pos["range_upper"] + 0.5 * bandwidth_price
+                                    pos["take_profit_price"] = pos["range_mid"]
                 finally:
                     self._pending_orders.discard(symbol)
 
