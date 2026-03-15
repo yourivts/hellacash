@@ -343,39 +343,116 @@ async def _main() -> None:
     param_optimizer = _get_param_optimizer()
     walk_forward = _get_walk_forward()
 
-    # Walk-forward candle fetcher: fetches BTC-EUR 5m candles for day ranges
-    async def _wf_candle_fetcher(start_day: int, end_day: int):
-        from datetime import datetime, timedelta, timezone
-        now = datetime.now(timezone.utc)
-        total_days = 120
-        start_dt = now - timedelta(days=total_days - start_day)
-        end_dt = now - timedelta(days=total_days - end_day)
-        logger.info("Walk-forward: fetching candles day %d-%d (%s to %s)",
-                     start_day, end_day, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"))
-        loop = asyncio.get_running_loop()
-        client = _get_client()
-        candles = await loop.run_in_executor(
-            None, lambda: client.get_candles_range("BTC-EUR", "5m", start_dt, end_dt)
-        )
-        logger.info("Walk-forward: got %d candles for day %d-%d", len(candles), start_day, end_day)
-        return candles
+    # Walk-forward candle fetcher factory: returns a fetcher for a given symbol
+    def _wf_candle_fetcher_factory(symbol: str):
+        async def _fetcher(start_day: int, end_day: int):
+            from datetime import datetime, timedelta, timezone
+            now = datetime.now(timezone.utc)
+            total_days = 180
+            start_dt = now - timedelta(days=total_days - start_day)
+            end_dt = now - timedelta(days=total_days - end_day)
+            logger.info("Walk-forward: fetching %s candles day %d-%d (%s to %s)",
+                         symbol, start_day, end_day, start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"))
+            loop = asyncio.get_running_loop()
+            client = _get_client()
+            candles = await loop.run_in_executor(
+                None, lambda: client.get_candles_range(symbol, "5m", start_dt, end_dt)
+            )
+            logger.info("Walk-forward: got %d candles for %s day %d-%d", len(candles), symbol, start_day, end_day)
+            return candles
+        return _fetcher
 
     async def _run_walk_forward():
-        result = await walk_forward.run(_wf_candle_fetcher)
-        if result.adopted and result.recommended_params:
+        symbols = get_tradeable_symbols() or ["BTC-EUR"]
+        wf_symbols = symbols
+        logger.info("Walk-forward: running for %d symbols: %s", len(wf_symbols), wf_symbols)
+        results = await walk_forward.run_multi(_wf_candle_fetcher_factory, wf_symbols)
+        adopted_count = 0
+        for symbol, result in results.items():
+            if result.adopted and result.recommended_params:
+                adopted_count += 1
+                logger.info(
+                    "Walk-forward %s ADOPTED params (avg_sharpe=%.2f, avg_pnl=€%.2f): %s",
+                    symbol, result.avg_oos_sharpe, result.avg_oos_pnl, result.recommended_params,
+                )
+            else:
+                logger.info(
+                    "Walk-forward %s — params not adopted (avg_sharpe=%.2f, avg_pnl=€%.2f)",
+                    symbol, result.avg_oos_sharpe, result.avg_oos_pnl,
+                )
+        # Apply best adopted result to router (use the one with highest avg P&L)
+        best_adopted = None
+        best_pnl = float("-inf")
+        for symbol, result in results.items():
+            if result.adopted and result.recommended_params and result.avg_oos_pnl > best_pnl:
+                best_pnl = result.avg_oos_pnl
+                best_adopted = result
+        if best_adopted and best_adopted.recommended_params:
             router = _get_router()
-            params = result.recommended_params
+            params = best_adopted.recommended_params
             router.update_hybrid_params(
                 sentiment_weight=params.get("sentiment_weight", 0.25),
                 entry_threshold=params.get("entry_threshold", 0.40),
                 indicator_weights=params.get("indicator_weights"),
             )
+            # Apply cooldown to live trading loop if present
+            if "cooldown_hours" in params and trading_loop is not None:
+                trading_loop._cooldown_seconds = params["cooldown_hours"] * 3600
+                logger.info("Walk-forward: updated live cooldown to %dh", params["cooldown_hours"])
+            logger.info("Walk-forward: applied best adopted params to router")
+        # ── Final analysis summary ──
+        logger.info("=" * 70)
+        logger.info("WALK-FORWARD ANALYSIS COMPLETE — %d symbols evaluated", len(wf_symbols))
+        logger.info("=" * 70)
+        total_avg_pnl = 0.0
+        total_avg_sharpe = 0.0
+        best_symbol = None
+        best_symbol_pnl = float("-inf")
+        worst_symbol = None
+        worst_symbol_pnl = float("inf")
+        for symbol, result in results.items():
+            total_avg_pnl += result.avg_oos_pnl
+            total_avg_sharpe += result.avg_oos_sharpe
+            status = "ADOPTED" if result.adopted else "NOT ADOPTED"
+            n_windows = len(result.windows)
+            profitable = sum(1 for w in result.windows if w.pnl > 0)
             logger.info(
-                "Walk-forward adopted params: sentiment_weight=%.2f, entry_threshold=%.2f",
-                params.get("sentiment_weight", 0), params.get("entry_threshold", 0),
+                "  %-10s | %s | avg_pnl=€%+.2f | avg_sharpe=%+.2f | windows=%d/%d profitable",
+                symbol, status, result.avg_oos_pnl, result.avg_oos_sharpe, profitable, n_windows,
             )
-        else:
-            logger.info("Walk-forward completed — params not adopted (avg_sharpe=%.2f)", result.avg_oos_sharpe)
+            if result.avg_oos_pnl > best_symbol_pnl:
+                best_symbol_pnl = result.avg_oos_pnl
+                best_symbol = symbol
+            if result.avg_oos_pnl < worst_symbol_pnl:
+                worst_symbol_pnl = result.avg_oos_pnl
+                worst_symbol = symbol
+        n = len(results) or 1
+        logger.info("-" * 70)
+        logger.info("  Portfolio avg P&L:    €%+.2f across %d symbols", total_avg_pnl, len(results))
+        logger.info("  Portfolio avg Sharpe: %+.2f", total_avg_sharpe / n)
+        logger.info("  Best symbol:          %s (€%+.2f avg OOS P&L)", best_symbol, best_symbol_pnl)
+        logger.info("  Worst symbol:         %s (€%+.2f avg OOS P&L)", worst_symbol, worst_symbol_pnl)
+        logger.info("  Adopted:              %d/%d symbols", adopted_count, len(wf_symbols))
+        logger.info("=" * 70)
+        # Send report to Discord
+        try:
+            await discord.send_walk_forward_report(results)
+        except Exception as e:
+            logger.warning("Failed to send walk-forward report to Discord: %s", e)
+
+        # Auto-enable trading in paper mode after walk-forward completes
+        if settings.paper_trading and not is_running():
+            logger.info("Walk-forward complete — auto-enabling paper trading")
+            await start_bot()
+
+    # Market data snapshot callback: saves funding rate + orderbook data for future backtesting
+    async def _save_market_data_snapshots():
+        onchain_prov = _get_onchain()
+        orderbook_prov = _get_orderbook()
+        if onchain_prov and hasattr(onchain_prov, 'save_snapshots'):
+            await onchain_prov.save_snapshots()
+        if orderbook_prov and hasattr(orderbook_prov, 'save_snapshots'):
+            await orderbook_prov.save_snapshots()
 
     scheduler = BotScheduler(
         run_cycle=lambda: trading_loop.run_cycle(_tradeable_symbols, _running),
@@ -389,6 +466,7 @@ async def _main() -> None:
         settings=settings,
         discord_run=discord.run,
         walk_forward_run=_run_walk_forward,
+        market_data_snapshot=_save_market_data_snapshots,
     )
     _scheduler = scheduler
 
