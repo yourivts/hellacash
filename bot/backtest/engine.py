@@ -204,7 +204,14 @@ class BacktestEngine:
                 _h1_idx = h1_timestamps.searchsorted(current_ts, side="right") - 1
                 atr_val = atr_1h_series[_h1_idx] if 0 <= _h1_idx < len(atr_1h_series) else None
                 prev_closed = len(self.closed_trades)
-                self._check_exits_fast(current_price, highs[i], lows[i], current_time, atr_val, current_bar=i)
+                # Pass pre-computed 5m data for range dynamic TP
+                has_range = any(p.strategy == "range" for p in self.positions)
+                self._check_exits_fast(
+                    current_price, highs[i], lows[i], current_time, atr_val,
+                    current_bar=i,
+                    precomp_5m=precomp_5m if has_range else None,
+                    idx_5m=i if has_range else 0,
+                )
                 if len(self.closed_trades) > prev_closed:
                     last_trade_close_bar = i
 
@@ -837,15 +844,42 @@ class BacktestEngine:
         time_str: str,
         atr_val: Optional[float],
         current_bar: int = 0,
+        precomp_5m: Optional[Dict[str, Any]] = None,
+        idx_5m: int = 0,
     ) -> None:
         """Fast exit check using pre-computed values — no pandas overhead."""
         for pos in list(self.positions):
             direction = pos.direction
 
-            # Time-based exit: close stale trades after max hold time
-            if current_bar - pos.entry_bar >= self._max_hold_bars:
+            # Time-based exit: range uses 24h, others use max_hold_bars
+            if pos.strategy == "range":
+                max_hold = self._range_max_hold_bars
+            else:
+                max_hold = self._max_hold_bars
+            if current_bar - pos.entry_bar >= max_hold:
                 self._close_position(pos, price, time_str, "time_exit")
                 continue
+
+            # --- Range dynamic TP: shift TP from mid-band to opposite band ---
+            if pos.strategy == "range" and not pos.tp_shifted and precomp_5m is not None:
+                crossed_mid = (
+                    (direction == "LONG" and price >= pos.range_mid) or
+                    (direction == "SHORT" and price <= pos.range_mid)
+                )
+                if crossed_mid and idx_5m >= 3:
+                    current_rsi = precomp_5m["rsi"][idx_5m]
+                    prev_rsi = precomp_5m["rsi"][idx_5m - 3]  # 3 bars back (15 min at 5m)
+                    # RSI trending favorably?
+                    if direction == "LONG" and current_rsi > prev_rsi:
+                        pos.tp_shifted = True
+                        pos.take_profit = pos.range_upper
+                    elif direction == "SHORT" and current_rsi < prev_rsi:
+                        pos.tp_shifted = True
+                        pos.take_profit = pos.range_lower
+                    else:
+                        # RSI flat/reversing: close at mid-band
+                        self._close_position(pos, pos.range_mid, time_str, "range_mid_exit")
+                        continue
 
             # Update trailing price (highest for LONG, lowest for SHORT)
             if direction == "SHORT":
@@ -855,8 +889,19 @@ class BacktestEngine:
                 if price > pos.highest_price:
                     pos.highest_price = price
 
-            # Trailing stop: activate after 1× risk in profit
-            if atr_val is not None:
+            # Trailing stop logic
+            if pos.strategy == "range" and pos.tp_shifted:
+                # Tight 1% trailing stop for range positions after TP shift
+                if direction == "LONG":
+                    trail_level = pos.highest_price * 0.99
+                    if trail_level > pos.stop_loss:
+                        pos.stop_loss = trail_level
+                elif direction == "SHORT":
+                    trail_level = pos.highest_price * 1.01
+                    if trail_level < pos.stop_loss:
+                        pos.stop_loss = trail_level
+            elif atr_val is not None:
+                # Standard ATR trailing stop for non-range positions
                 trail_dist = atr_val * self._atr_multiplier
                 if direction == "SHORT":
                     in_profit = pos.entry_price - price
@@ -901,6 +946,10 @@ class BacktestEngine:
         if pos not in self.positions:
             return
         self.positions.remove(pos)
+
+        # Increment range bounce counter on closed range trades
+        if pos.strategy == "range":
+            self._range_bounces[pos.symbol] = self._range_bounces.get(pos.symbol, 0) + 1
 
         quantity = pos.size_eur / pos.entry_price
         direction = pos.direction

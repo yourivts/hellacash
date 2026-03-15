@@ -245,3 +245,57 @@ class TestRangeBacktestIntegration:
         })
         result = engine.run()
         assert result.total_trades >= 0
+
+
+class TestRangeExitLogic:
+    """Tests for range-specific exit handling in backtest."""
+
+    def test_range_time_exit_24h(self):
+        """Range positions close after 288 bars (24h)."""
+        engine = BacktestEngine.__new__(BacktestEngine)
+        engine.positions = []
+        engine.closed_trades = []
+        engine.balance = 10000.0
+        engine.peak_balance = 10000.0
+        engine.slippage_pct = 0.001
+        engine._atr_multiplier = 2.0
+        engine._max_hold_bars = 576  # 48h for trend
+        engine._range_max_hold_bars = 288  # 24h for range
+        engine._range_bounces = {}
+
+        pos = _OpenPosition(
+            symbol="BTC-EUR", direction="LONG", entry_price=50000.0,
+            entry_time="2025-09-01", size_eur=100.0, stop_loss=49000.0,
+            take_profit=50500.0, highest_price=50000.0, strategy="range",
+            entry_bar=0, range_mid=50250.0, range_upper=50500.0, range_lower=50000.0,
+        )
+        engine.positions.append(pos)
+
+        engine._check_exits_fast(
+            price=50100.0, candle_high=50150.0, candle_low=50050.0,
+            time_str="2025-09-02", atr_val=200.0, current_bar=288,
+        )
+        assert len(engine.positions) == 0
+        assert len(engine.closed_trades) == 1
+        assert engine.closed_trades[0].exit_reason == "time_exit"
+
+    def test_range_bounce_increments_on_close(self):
+        """Closing a range trade increments the bounce counter."""
+        engine = BacktestEngine.__new__(BacktestEngine)
+        engine.positions = []
+        engine.closed_trades = []
+        engine.balance = 10000.0
+        engine.peak_balance = 10000.0
+        engine.slippage_pct = 0.001
+        engine._range_bounces = {}
+
+        pos = _OpenPosition(
+            symbol="BTC-EUR", direction="LONG", entry_price=50000.0,
+            entry_time="2025-09-01", size_eur=100.0, stop_loss=49000.0,
+            take_profit=50500.0, highest_price=50000.0, strategy="range",
+            entry_bar=0,
+        )
+        engine.positions.append(pos)
+        engine._close_position(pos, 50500.0, "2025-09-01T12:00", "take_profit")
+
+        assert engine._range_bounces.get("BTC-EUR", 0) == 1
