@@ -53,6 +53,6 @@ class TestHybridNewFormula:
         sig = strat.generate_signal(ctx)
         assert sig.direction in ("LONG", "SHORT", "NEUTRAL")
 
-    def test_entry_threshold_default_is_035(self):
+    def test_entry_threshold_default_is_050(self):
         strat = HybridStrategy()
-        assert strat.entry_threshold == 0.35
+        assert strat.entry_threshold == 0.50
