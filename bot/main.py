@@ -183,7 +183,7 @@ def _get_drawdown() -> DrawdownGuard:
     global _drawdown
     if _drawdown is None:
         s = get_settings()
-        _drawdown = DrawdownGuard(s.max_drawdown_pct, daily_loss_limit_eur=s.max_daily_loss_eur)
+        _drawdown = DrawdownGuard(s.max_drawdown_pct, daily_loss_limit_eur=s.max_daily_loss_eur, paper_mode=s.paper_trading)
     return _drawdown
 
 

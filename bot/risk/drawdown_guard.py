@@ -28,10 +28,12 @@ class DrawdownGuard:
         max_drawdown_pct: float = 8.0,
         soft_drawdown_pct: float = 3.0,
         daily_loss_limit_eur: float = 200.0,
+        paper_mode: bool = False,
     ) -> None:
         self.max_drawdown_pct = max_drawdown_pct
         self.soft_drawdown_pct = soft_drawdown_pct
         self.daily_loss_limit_eur = daily_loss_limit_eur
+        self.paper_mode = paper_mode
 
         self._peak_equity: float = 0.0
         self._daily_loss: float = 0.0
@@ -74,7 +76,8 @@ class DrawdownGuard:
             # Check for automatic recovery after cooldown
             if self._halt_triggered_at is not None:
                 elapsed = (datetime.now(timezone.utc) - self._halt_triggered_at).total_seconds()
-                if elapsed >= COOLDOWN_MINUTES * 60 and dd < RECOVERY_THRESHOLD_PCT:
+                cooldown_expired = elapsed >= COOLDOWN_MINUTES * 60
+                if cooldown_expired and dd < RECOVERY_THRESHOLD_PCT:
                     logger.info(
                         "Cooldown expired (%.0f min) and drawdown recovered to %.1f%% "
                         "(< %.1f%%) — resuming trading",
@@ -82,6 +85,18 @@ class DrawdownGuard:
                     )
                     self._hard_halt = False
                     self._halt_triggered_at = None
+                elif cooldown_expired and self.paper_mode:
+                    # Paper mode: reset peak equity to current so drawdown
+                    # drops to 0% and trading can resume (no real money at risk)
+                    logger.info(
+                        "Paper mode: cooldown expired, resetting peak equity "
+                        "(%.2f → %.2f) to clear %.1f%% drawdown",
+                        self._peak_equity, current_equity, dd,
+                    )
+                    self._peak_equity = current_equity
+                    self._hard_halt = False
+                    self._halt_triggered_at = None
+                    return True, ""
                 else:
                     remaining = max(0, COOLDOWN_MINUTES * 60 - elapsed) / 60
                     return False, (

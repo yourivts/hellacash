@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 from unittest.mock import patch
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from bot.risk.drawdown_guard import DrawdownGuard
+from bot.risk.drawdown_guard import COOLDOWN_MINUTES, DrawdownGuard
 
 
 class TestUpdateTracksPeakEquity:
@@ -86,3 +86,53 @@ class TestResetHardHalt:
         guard.reset_hard_halt()
         allowed, _ = guard.is_trading_allowed(10_000.0)
         assert allowed is True
+
+
+class TestPaperModeAutoRecovery:
+    def test_paper_mode_resets_peak_after_cooldown(self):
+        """Paper mode auto-resets peak equity when cooldown expires, even if drawdown > threshold."""
+        guard = DrawdownGuard(max_drawdown_pct=8.0, paper_mode=True)
+        guard.update(10_000.0)
+
+        # Trigger hard halt (9% drawdown)
+        allowed, _ = guard.is_trading_allowed(9_100.0)
+        assert allowed is False
+
+        # Simulate cooldown expiry
+        guard._halt_triggered_at = datetime.now(timezone.utc) - timedelta(minutes=COOLDOWN_MINUTES + 1)
+
+        # Drawdown is still 21% but paper mode should auto-recover
+        allowed, _ = guard.is_trading_allowed(7_900.0)
+        assert allowed is True
+        assert guard._peak_equity == 7_900.0
+
+    def test_live_mode_stays_halted_with_high_drawdown(self):
+        """Live mode stays halted if drawdown hasn't recovered, even after cooldown."""
+        guard = DrawdownGuard(max_drawdown_pct=8.0, paper_mode=False)
+        guard.update(10_000.0)
+
+        # Trigger hard halt
+        guard.is_trading_allowed(9_100.0)
+
+        # Simulate cooldown expiry
+        guard._halt_triggered_at = datetime.now(timezone.utc) - timedelta(minutes=COOLDOWN_MINUTES + 1)
+
+        # Still 21% drawdown — live mode should NOT resume
+        allowed, reason = guard.is_trading_allowed(7_900.0)
+        assert allowed is False
+        assert "emergency halt" in reason.lower() or "drawdown" in reason.lower()
+
+    def test_paper_mode_still_enforces_cooldown(self):
+        """Paper mode doesn't skip the cooldown period itself."""
+        guard = DrawdownGuard(max_drawdown_pct=8.0, paper_mode=True)
+        guard.update(10_000.0)
+
+        # Trigger hard halt
+        guard.is_trading_allowed(9_100.0)
+
+        # Cooldown NOT expired yet
+        guard._halt_triggered_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+
+        # Should still be halted during cooldown
+        allowed, _ = guard.is_trading_allowed(7_900.0)
+        assert allowed is False
