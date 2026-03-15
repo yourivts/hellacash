@@ -532,7 +532,7 @@ class BacktestEngine:
         # EMA200 regime: determines allowed trade direction for directional strategies
         price_above_ema200 = current_price > h1_ema200 if h1_ema200 > 0 else True
         price_below_ema200 = current_price < h1_ema200 if h1_ema200 > 0 else True
-        # Strong trend for mean_reversion filter: both EMA20/50 alignment + EMA200
+        # Strong trend filter: both EMA20/50 alignment + EMA200
         strong_bull = h1_trend_bull and price_above_ema200
         strong_bear = h1_trend_bear and price_below_ema200
 
