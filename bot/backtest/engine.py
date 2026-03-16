@@ -14,7 +14,7 @@ import numpy as np
 from bot.exchange.bitvavo_client import CandleData
 from bot.risk.fees import compute_trade_fees, get_taker_fee
 from bot.indicators.volatility import atr as compute_atr
-from bot.risk.position_sizer import kelly_size
+from bot.risk.position_sizer import fixed_fractional_size
 from bot.risk.stop_loss import initial_stops, trail_stop, check_stop_triggered
 from bot.strategy.base import MarketContext, Signal
 from bot.strategy.router import StrategyRouter, detect_regime
@@ -112,7 +112,9 @@ class BacktestEngine:
         params = strategy_params or {}
         self._atr_multiplier = params.get("atr_multiplier", 2.0)
         self._rr_ratio = params.get("rr_ratio", 2.0)
-        self._kelly_fraction = params.get("kelly_fraction", 0.25)
+        self._kelly_fraction = params.get("kelly_fraction", 0.25)  # kept for walk-forward compat
+        self._base_risk_pct = params.get("base_risk_pct", 3.0)
+        self._atr_pct_history: List[float] = []  # rolling ATR% for median computation
         self._min_confirmations = params.get("min_confirmations", 2)
         self._indicator_weights = params.get("indicator_weights")
         # Trade cooldown: minimum bars between closing a trade and opening a new one
@@ -298,9 +300,15 @@ class BacktestEngine:
             ):
                 # Use 1h candles for ATR-based stop calculation (5m ATR is too tight)
                 window_1h = df_1h.iloc[max(0, h1_idx - 100): h1_idx + 1]
+                # Track rolling ATR% for median computation in position sizer
+                if atr_pct > 0:
+                    self._atr_pct_history.append(atr_pct)
+                    if len(self._atr_pct_history) > 200:
+                        self._atr_pct_history = self._atr_pct_history[-200:]
                 self._open_position(
                     best_signal, current_price, current_time,
                     window_1h, size_modifier, bar_index=i,
+                    atr_pct=atr_pct,
                 )
 
             equity_curve.append(current_equity)
@@ -399,9 +407,24 @@ class BacktestEngine:
         except Exception:
             result["vol_profile"] = np.zeros(len(df))
 
+        # OBV for orderflow strategy
+        try:
+            from bot.indicators.volume import obv
+            result["obv"] = obv(close, volume).values
+        except Exception:
+            result["obv"] = np.zeros(len(df))
+
+        # CMF for orderflow strategy
+        try:
+            result["cmf"] = cmf(high, low, close, volume).values
+        except Exception:
+            result["cmf"] = np.zeros(len(df))
+
         result["close"] = close.values
         result["high"] = high.values
         result["low"] = low.values
+        result["open"] = df["open"].values if "open" in df.columns else close.values
+        result["volume"] = volume.values
 
         return result
 
@@ -725,6 +748,133 @@ class BacktestEngine:
                                  strategy_name="trend_following",
                                  technical_score=strength if direction == "LONG" else -strength,
                                  indicator_snapshot={"confirming_count": confirming})
+                elif strat.name == "funding_contrarian":
+                    # Funding Rate Contrarian: use RSI + momentum extremes as
+                    # proxy for extreme funding rates (crowded leverage).
+                    # Extreme RSI + declining momentum = overleveraged crowd
+                    if idx_5m < 30:
+                        continue
+
+                    rsi_val = precomp_5m["rsi"][idx_5m]
+                    rsi_prev = precomp_5m["rsi"][idx_5m - 6] if idx_5m >= 6 else 50.0
+                    macd_h = precomp_5m["macd_hist"][idx_5m]
+                    macd_h_prev = precomp_5m["macd_hist"][idx_5m - 1] if idx_5m > 0 else 0.0
+
+                    # 1h confirmation: needs higher TF exhaustion too
+                    rsi_1h = precomp_1h["rsi"][idx_1h] if idx_1h < len(precomp_1h["rsi"]) else 50.0
+
+                    direction = "NEUTRAL"
+                    strength = 0.0
+                    confirming = 0
+
+                    # Volume confirmation: need above-average volume for conviction
+                    vsr = precomp_5m["vsr"][idx_5m]
+
+                    # Crowded longs (extreme overbought) → SHORT
+                    # RSI > 78 on 5m AND RSI > 60 on 1h AND MACD fading AND volume
+                    if rsi_val > 78 and rsi_1h > 60 and macd_h < macd_h_prev and vsr >= 1.2:
+                        direction = "SHORT"
+                        strength = min((rsi_val - 70) / 30.0 + 0.3, 1.0)
+                        confirming = 1
+                        if rsi_val > 82:
+                            confirming += 1
+                        if rsi_prev > 72:  # sustained overbought
+                            confirming += 1
+
+                    # Crowded shorts (extreme oversold) → LONG
+                    # RSI < 22 on 5m AND RSI < 40 on 1h AND MACD recovering AND volume
+                    elif rsi_val < 22 and rsi_1h < 40 and macd_h > macd_h_prev and vsr >= 1.2:
+                        direction = "LONG"
+                        strength = min((30 - rsi_val) / 30.0 + 0.3, 1.0)
+                        confirming = 1
+                        if rsi_val < 18:
+                            confirming += 1
+                        if rsi_prev < 28:  # sustained oversold
+                            confirming += 1
+
+                    sig = Signal(
+                        symbol=symbol, direction=direction, strength=strength,
+                        strategy_name="funding_contrarian",
+                        technical_score=strength if direction == "LONG" else -strength,
+                        indicator_snapshot={"confirming_count": confirming},
+                    )
+
+                elif strat.name == "orderflow":
+                    # Order Flow / Absorption: detect hidden buying/selling pressure
+                    # via candle structure + volume analysis
+                    if idx_5m < 30:
+                        continue
+
+                    price = current_price
+                    o = precomp_5m["open"][idx_5m]
+                    h = precomp_5m["high"][idx_5m]
+                    l = precomp_5m["low"][idx_5m]
+                    c = precomp_5m["close"][idx_5m]
+                    vol = precomp_5m["volume"][idx_5m]
+                    vsr = precomp_5m["vsr"][idx_5m]
+
+                    candle_range = h - l
+                    if candle_range <= 0:
+                        continue
+
+                    body = abs(c - o)
+                    body_ratio = body / candle_range  # small body = absorption
+                    upper_wick = h - max(o, c)
+                    lower_wick = min(o, c) - l
+                    upper_wick_ratio = upper_wick / candle_range
+                    lower_wick_ratio = lower_wick / candle_range
+
+                    # OBV divergence: price making new low but OBV not (bullish)
+                    # or price making new high but OBV not (bearish)
+                    obv_now = precomp_5m["obv"][idx_5m]
+                    obv_prev = precomp_5m["obv"][idx_5m - 12] if idx_5m >= 12 else obv_now
+                    price_prev = precomp_5m["close"][idx_5m - 12] if idx_5m >= 12 else price
+
+                    # CMF for money flow direction
+                    cmf_val = precomp_5m["cmf"][idx_5m]
+
+                    direction = "NEUTRAL"
+                    strength = 0.0
+                    confirming = 0
+
+                    # RSI for trend context (avoid absorptions against strong trends)
+                    rsi_val = precomp_5m["rsi"][idx_5m]
+
+                    # Buying absorption: high volume + small body + long lower wick
+                    # = sellers tried to push down but buyers absorbed all selling
+                    # Require RSI < 45 (not overbought — room to run up)
+                    if (vsr >= 2.0 and body_ratio < 0.25 and lower_wick_ratio > 0.55
+                            and rsi_val < 45):
+                        direction = "LONG"
+                        strength = min(vsr / 5.0 + 0.3, 1.0)
+                        confirming = 1
+                        if cmf_val > 0.1:  # money flowing in
+                            confirming += 1
+                        # OBV bullish divergence: price lower but OBV higher
+                        if price < price_prev and obv_now > obv_prev:
+                            confirming += 1
+
+                    # Selling absorption: high volume + small body + long upper wick
+                    # = buyers tried to push up but sellers absorbed all buying
+                    # Require RSI > 55 (not oversold — room to run down)
+                    elif (vsr >= 2.0 and body_ratio < 0.25 and upper_wick_ratio > 0.55
+                            and rsi_val > 55):
+                        direction = "SHORT"
+                        strength = min(vsr / 5.0 + 0.3, 1.0)
+                        confirming = 1
+                        if cmf_val < -0.1:  # money flowing out
+                            confirming += 1
+                        # OBV bearish divergence: price higher but OBV lower
+                        if price > price_prev and obv_now < obv_prev:
+                            confirming += 1
+
+                    sig = Signal(
+                        symbol=symbol, direction=direction, strength=strength,
+                        strategy_name="orderflow",
+                        technical_score=strength if direction == "LONG" else -strength,
+                        indicator_snapshot={"confirming_count": confirming},
+                    )
+
                 else:
                     continue
 
@@ -733,7 +883,7 @@ class BacktestEngine:
                     # Skip penalty for range strategy — range trades are mean-reversion
                     # within bands, not trend-following, so EMA200 filter is harmful
                     effective_strength = sig.strength
-                    if sig.strategy_name != "range":
+                    if sig.strategy_name not in ("range", "funding_contrarian", "orderflow"):
                         if sig.direction == "LONG" and price_below_ema200:
                             effective_strength *= 0.3  # heavily penalize counter-trend longs
                         elif sig.direction == "SHORT" and price_above_ema200:
@@ -751,24 +901,35 @@ class BacktestEngine:
     # Position management helpers
     # ------------------------------------------------------------------
 
-    def _compute_position_size(self, size_modifier: float, current_price: float) -> float:
-        """Compute position size in EUR with drawdown scaling.
+    def _compute_position_size(
+        self, size_modifier: float, current_price: float, atr_pct: float = 1.5
+    ) -> float:
+        """Compute position size in EUR with volatility scaling and drawdown scaling.
 
-        Uses equity (cash + unrealized P&L) for drawdown calculation,
-        matching live DrawdownGuard.position_size_multiplier behavior.
+        Uses fixed fractional sizing: position = (equity * risk_pct) / stop_distance_pct,
+        scaled by current ATR relative to its median.
         """
-        win_rate, avg_win, avg_loss = self._trade_stats()
-        raw_size = kelly_size(
-            win_rate=win_rate,
-            avg_win_pct=avg_win,
-            avg_loss_pct=avg_loss,
-            portfolio_eur=self.balance,
-            kelly_fraction=self._kelly_fraction,
+        equity = self._equity(current_price)
+
+        # Stop distance: ATR multiplier * current ATR%
+        stop_distance_pct = max(0.1, self._atr_multiplier * atr_pct)
+
+        # Median ATR over recent history (fallback to current if no history)
+        if len(self._atr_pct_history) >= 5:
+            median_atr_pct = float(sorted(self._atr_pct_history)[len(self._atr_pct_history) // 2])
+        else:
+            median_atr_pct = max(atr_pct, 0.1)
+
+        raw_size = fixed_fractional_size(
+            equity=equity,
+            base_risk_pct=self._base_risk_pct,
+            stop_distance_pct=stop_distance_pct,
+            atr_pct=atr_pct,
+            median_atr_pct=median_atr_pct,
         )
         size_eur = raw_size * size_modifier
 
         # Drawdown scaling (matches live DrawdownGuard.position_size_multiplier)
-        equity = self._equity(current_price)
         drawdown_pct = ((self.peak_balance - equity) / self.peak_balance * 100.0
                         if self.peak_balance > 0 else 0.0)
         if drawdown_pct >= 3.0:
@@ -784,8 +945,9 @@ class BacktestEngine:
         df_window: pd.DataFrame,
         size_modifier: float,
         bar_index: int = 0,
+        atr_pct: float = 1.5,
     ) -> None:
-        size_eur = self._compute_position_size(size_modifier, current_price=price)
+        size_eur = self._compute_position_size(size_modifier, current_price=price, atr_pct=atr_pct)
         if size_eur < 10.0 or size_eur > self.balance:
             return  # skip tiny or over-sized trades
 

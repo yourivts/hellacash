@@ -19,7 +19,7 @@ from bot.events.bus import (
 )
 from bot.indicators.volatility import atr as compute_atr
 from bot.risk.fees import get_trading_fees
-from bot.risk.position_sizer import kelly_size
+from bot.risk.position_sizer import fixed_fractional_size
 from bot.risk.stop_loss import check_stop_triggered, initial_stops, trail_stop
 from bot.strategy.base import MarketContext
 
@@ -430,31 +430,39 @@ class TradingLoop:
                 if direction not in ("LONG", "SHORT"):
                     continue
 
-                # Get win/loss stats from trade history for position sizing
-                win_rate, avg_win, avg_loss = await self._get_trade_stats(best_signal.strategy_name)
-
-                size_eur = kelly_size(
-                    win_rate=win_rate,
-                    avg_win_pct=avg_win,
-                    avg_loss_pct=avg_loss,
-                    portfolio_eur=equity,
-                    current_drawdown_pct=drawdown.current_drawdown_pct(equity),
-                    max_position_pct=settings.max_position_size_pct,
-                    kelly_fraction=settings.kelly_fraction,
-                )
-                # Apply regime modifier
-                size_eur *= router.position_size_modifier(regime)
-                size_eur *= drawdown.position_size_multiplier(equity)
-
                 entry_price = ctx.current_price
                 if entry_price <= 0:
                     continue
-                amount_base = size_eur / entry_price
 
-                # Compute expected ROI from stop/TP levels
-                stop_loss, take_profit = initial_stops(entry_price, df_5m, direction=direction)
-                risk = abs(entry_price - stop_loss) / entry_price * 100
+                # Compute stops first — stop distance drives position sizing
+                stop_loss, take_profit = initial_stops(entry_price, df_1h, direction=direction)
+                stop_distance_pct = max(0.1, abs(entry_price - stop_loss) / entry_price * 100.0)
+                risk = stop_distance_pct
                 expected_roi = risk * 2.0  # 2:1 reward/risk
+
+                # Compute current ATR% and median ATR% for volatility scaling
+                atr_series = compute_atr(df_1h["high"], df_1h["low"], df_1h["close"])
+                current_atr = float(atr_series.iloc[-1]) if len(atr_series) > 0 else 0.0
+                atr_pct = (current_atr / entry_price * 100.0) if entry_price > 0 else 1.5
+                atr_pct = max(atr_pct, 0.1)
+                # Median over last 50 bars as normalisation reference
+                atr_50 = atr_series.iloc[-50:] if len(atr_series) >= 50 else atr_series
+                median_atr = float(atr_50.median()) if len(atr_50) > 0 else current_atr
+                median_atr_pct = max((median_atr / entry_price * 100.0) if entry_price > 0 else atr_pct, 0.1)
+
+                # Fixed fractional position size
+                size_eur = fixed_fractional_size(
+                    equity=equity,
+                    base_risk_pct=settings.base_risk_pct,
+                    stop_distance_pct=stop_distance_pct,
+                    atr_pct=atr_pct,
+                    median_atr_pct=median_atr_pct,
+                )
+                # Apply regime modifier and drawdown scaling
+                size_eur *= router.position_size_modifier(regime)
+                size_eur *= drawdown.position_size_multiplier(equity)
+
+                amount_base = size_eur / entry_price
 
                 # Risk gate (use actual per-market taker fee)
                 _, taker_pct = get_trading_fees(symbol)
