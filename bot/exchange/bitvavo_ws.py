@@ -97,10 +97,10 @@ class BitvavoWebSocket:
             "channels": [{"name": "ticker", "markets": markets}],
         }))
 
-        # Candle subscription (1m for fast data, 5m for strategy)
+        # Candle subscription (5m for stop monitoring + 1h aggregation)
         await ws.send(json.dumps({
             "action": "subscribe",
-            "channels": [{"name": "candles", "markets": markets, "interval": ["1m", "5m"]}],
+            "channels": [{"name": "candles", "markets": markets, "interval": ["5m"]}],
         }))
 
         # Order book subscription
