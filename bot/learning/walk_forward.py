@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from bot.strategy.adopted_universe import CHAMPION_DEFAULTS
+
 logger = logging.getLogger(__name__)
 
 TRAIN_DAYS = 180  # was 90
@@ -16,12 +18,12 @@ MIN_WINDOWS = 4   # was 3
 OPTUNA_TRIALS = 40  # Bayesian trials per window
 
 
-def _run_single_backtest(candles, params):
+def _run_single_backtest(candles, params, target_strategy=None):
     """Top-level function so ProcessPoolExecutor can pickle it."""
     import time
     t0 = time.perf_counter()
     from bot.backtest.engine import BacktestEngine
-    engine = BacktestEngine(candles, strategy_params=params, slippage_pct=0.001)
+    engine = BacktestEngine(candles, strategy_params=params, slippage_pct=0.001, target_strategy=target_strategy)
     result = engine.run()
     elapsed = time.perf_counter() - t0
     pf = result.profit_factor if hasattr(result, 'profit_factor') else 1.0
@@ -44,16 +46,7 @@ def _sample_optuna_candidates(n_trials):
     )
 
     # Seed with champion params
-    study.enqueue_trial({
-        "atr_multiplier": 3.5,
-        "rr_ratio": 2.5,
-        "base_risk_pct": 3.0,
-        "min_profit_multiple": 3.0,
-        "cooldown_hours": 24,
-        "max_hold_hours": 120,
-        "quiet_atr_threshold": 1.0,
-        "regime_adx_threshold": 25,
-    })
+    study.enqueue_trial(dict(CHAMPION_DEFAULTS))
 
     # Phase 1: generate first batch of random+seeded candidates
     candidates = []
@@ -74,7 +67,7 @@ def _sample_optuna_candidates(n_trials):
     return study, candidates
 
 
-def _run_optuna_window(train_candles, test_candles, max_workers):
+def _run_optuna_window(train_candles, test_candles, max_workers, target_strategy=None):
     """Run Optuna Bayesian optimization on a single train/test window.
 
     Two-phase approach:
@@ -96,16 +89,7 @@ def _run_optuna_window(train_candles, test_candles, max_workers):
     )
 
     # Seed with champion params
-    study.enqueue_trial({
-        "atr_multiplier": 3.5,
-        "rr_ratio": 2.5,
-        "base_risk_pct": 3.0,
-        "min_profit_multiple": 3.0,
-        "cooldown_hours": 24,
-        "max_hold_hours": 120,
-        "quiet_atr_threshold": 1.0,
-        "regime_adx_threshold": 25,
-    })
+    study.enqueue_trial(dict(CHAMPION_DEFAULTS))
 
     half = OPTUNA_TRIALS // 2
 
@@ -129,7 +113,7 @@ def _run_optuna_window(train_candles, test_candles, max_workers):
         # Run all candidates in parallel across CPU cores
         with ProcessPoolExecutor(max_workers=max_workers) as pool:
             futures = {
-                pool.submit(_run_single_backtest, train_candles, params): (trial, params)
+                pool.submit(_run_single_backtest, train_candles, params, target_strategy): (trial, params)
                 for trial, params in trials_and_params
             }
             for future in futures:
@@ -153,7 +137,7 @@ def _run_optuna_window(train_candles, test_candles, max_workers):
     logger.info("Optuna best in-sample: score=%.2f, params=%s", study.best_value, best_params)
 
     # Test the winner on out-of-sample data
-    test_engine = BacktestEngine(test_candles, strategy_params=best_params, slippage_pct=0.001)
+    test_engine = BacktestEngine(test_candles, strategy_params=best_params, slippage_pct=0.001, target_strategy=target_strategy)
     test_result = test_engine.run()
 
     return best_params, test_result
@@ -198,7 +182,22 @@ class WalkForwardOptimizer:
         return self._latest_result
 
     def result_for_symbol(self, symbol: str) -> Optional[WFResult]:
+        """Backward-compat: return first result matching this symbol."""
+        # Check composite keys first (new format)
+        for key, val in self._results_by_symbol.items():
+            if key.startswith(f"{symbol}:"):
+                return val
+        # Fall back to direct key (old format)
         return self._results_by_symbol.get(symbol)
+
+    def results_for_symbol(self, symbol: str) -> Dict[str, WFResult]:
+        """Return all per-strategy results for a symbol."""
+        results = {}
+        for key, val in self._results_by_symbol.items():
+            if key.startswith(f"{symbol}:"):
+                strategy = key.split(":", 1)[1]
+                results[strategy] = val
+        return results
 
     def _generate_windows(self, total_days: int) -> List[dict]:
         windows = []
@@ -262,6 +261,57 @@ class WalkForwardOptimizer:
         finally:
             self._running = False
 
+    async def run_multi_per_strategy(
+        self, candle_fetcher_factory=None, symbols: List[str] = None, strategies: List[str] = None,
+    ) -> Dict[str, Dict[str, WFResult]]:
+        """Run walk-forward for each strategy-symbol combo.
+
+        Fetches candles once per symbol, then runs optimization for each strategy.
+        Returns: {symbol: {strategy_name: WFResult}}
+        """
+        from bot.strategy.adopted_universe import ALL_STRATEGIES
+
+        if not symbols:
+            symbols = ["BTC-EUR"]
+        if not strategies:
+            strategies = ALL_STRATEGIES
+
+        self._running = True
+        results: Dict[str, Dict[str, WFResult]] = {}
+
+        try:
+            for symbol in symbols:
+                logger.info("Walk-forward: fetching full candle range for %s", symbol)
+
+                total_days = TRAIN_DAYS + TEST_DAYS * MIN_WINDOWS
+                if candle_fetcher_factory:
+                    fetcher = candle_fetcher_factory(symbol)
+                    all_candles = await fetcher(0, total_days)
+                else:
+                    all_candles = []
+
+                if not all_candles:
+                    logger.warning("Walk-forward: no candles for %s — skipping", symbol)
+                    continue
+
+                logger.info(
+                    "Walk-forward: got %d candles for %s — running %d strategies",
+                    len(all_candles), symbol, len(strategies),
+                )
+
+                results[symbol] = {}
+                for strategy in strategies:
+                    result = await self._execute_from_candles(
+                        all_candles, symbol, target_strategy=strategy,
+                    )
+                    results[symbol][strategy] = result
+                    self._results_by_symbol[f"{symbol}:{strategy}"] = result
+                    self._latest_result = result
+
+            return results
+        finally:
+            self._running = False
+
     async def _execute(self, candle_fetcher, symbol: str = "BTC-EUR") -> WFResult:
         import asyncio
         from bot.backtest.engine import BacktestEngine
@@ -307,6 +357,81 @@ class WalkForwardOptimizer:
                 pnl=test_result.total_pnl,
                 params=best_params,
                 profit_per_fee=getattr(test_result, 'profit_per_fee', 0.0),
+            ))
+
+        adopted = self._should_adopt(wf_windows)
+        avg_sharpe = statistics.mean(w.sharpe for w in wf_windows) if wf_windows else 0
+        avg_pnl = statistics.mean(w.pnl for w in wf_windows) if wf_windows else 0
+        sharpe_std = statistics.stdev(w.sharpe for w in wf_windows) if len(wf_windows) > 1 else 0
+
+        best_params = None
+        if adopted and wf_windows:
+            best_window = max(wf_windows, key=lambda w: w.sharpe)
+            best_params = best_window.params
+
+        return WFResult(
+            windows=wf_windows,
+            avg_oos_sharpe=avg_sharpe,
+            avg_oos_pnl=avg_pnl,
+            sharpe_stability=sharpe_std,
+            recommended_params=best_params,
+            adopted=adopted,
+        )
+
+    async def _execute_from_candles(
+        self, all_candles, symbol: str = "BTC-EUR", target_strategy: str = None,
+    ) -> WFResult:
+        """Execute walk-forward using pre-fetched candles (no API calls)."""
+        import asyncio
+        import os
+
+        total_days = TRAIN_DAYS + TEST_DAYS * MIN_WINDOWS
+        windows_spec = self._generate_windows(total_days)
+
+        if len(windows_spec) < MIN_WINDOWS:
+            logger.warning("Walk-forward: insufficient windows for %s", symbol)
+            return WFResult()
+
+        candles_per_day = len(all_candles) / total_days if total_days > 0 else 288
+
+        loop = asyncio.get_running_loop()
+        wf_windows: List[WFWindow] = []
+        max_workers = os.cpu_count() or 4
+
+        for i, ws in enumerate(windows_spec):
+            train_start = int(ws["train_start_day"] * candles_per_day)
+            train_end = int(ws["train_end_day"] * candles_per_day)
+            test_start = int(ws["test_start_day"] * candles_per_day)
+            test_end = int(ws["test_end_day"] * candles_per_day)
+
+            train_candles = all_candles[train_start:train_end]
+            test_candles = all_candles[test_start:test_end]
+
+            if not train_candles or not test_candles:
+                continue
+
+            strat_label = f" [{target_strategy}]" if target_strategy else ""
+            logger.info(
+                "Walk-forward [%s]%s: window %d/%d (%d train, %d test candles, %d Optuna trials across %d cores)...",
+                symbol, strat_label, i + 1, len(windows_spec),
+                len(train_candles), len(test_candles), OPTUNA_TRIALS, max_workers,
+            )
+
+            best_params, test_result = await loop.run_in_executor(
+                None, _run_optuna_window, train_candles, test_candles, max_workers, target_strategy,
+            )
+
+            logger.info(
+                "Walk-forward [%s]%s: window %d/%d done — sharpe=%.2f, pnl=€%.2f",
+                symbol, strat_label, i + 1, len(windows_spec),
+                test_result.sharpe_ratio, test_result.total_pnl,
+            )
+
+            wf_windows.append(WFWindow(
+                sharpe=test_result.sharpe_ratio,
+                pnl=test_result.total_pnl,
+                params=best_params,
+                profit_per_fee=getattr(test_result, "profit_per_fee", 0.0),
             ))
 
         adopted = self._should_adopt(wf_windows)
