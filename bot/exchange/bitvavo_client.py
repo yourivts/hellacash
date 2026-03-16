@@ -33,6 +33,14 @@ _RATE_SAFETY_MARGIN = 50          # stop making calls when this few points remai
 _RATE_COOLDOWN = 0.15             # min seconds between calls (~6.6/sec)
 _last_api_call: float = 0
 
+# ── Stablecoin exclusion ─────────────────────────────────────────────────────
+# Base assets that are stablecoins — no point trading EUR↔stablecoin.
+STABLECOIN_BASES = frozenset({
+    "USDC", "USDT", "DAI", "BUSD", "TUSD", "USDP", "GUSD", "FRAX",
+    "EURC", "EURCV", "EUROP", "USDCV", "EURT", "PYUSD", "FDUSD",
+    "UST", "LUSD", "SUSD", "RAI", "CRVUSD", "GHO", "USDD", "AEUR",
+})
+
 
 def _update_rate_limits(resp) -> None:
     """Read Bitvavo rate limit headers from response."""
@@ -216,6 +224,9 @@ class BitvavoClient:
             for m in raw:
                 sym = m.get("market", "")
                 if not sym.endswith("-EUR"):
+                    continue
+                base = m.get("base", sym.split("-")[0])
+                if base in STABLECOIN_BASES:
                     continue
                 t = tickers.get(sym, {})
                 result.append(
@@ -535,6 +546,9 @@ class BitvavoClient:
             for m in markets:
                 sym = m.get("market", "")
                 if not sym.endswith("-EUR") or m.get("status") != "trading":
+                    continue
+                base = sym.split("-")[0]
+                if base in STABLECOIN_BASES:
                     continue
                 fee_cats[sym] = m.get("feeCategory", "A")
                 result.append(MarketInfo(
