@@ -115,8 +115,11 @@ class BacktestEngine:
         max_open_positions: int = 10,
         slippage_pct: float = 0.001,
         strategy_params: Optional[Dict[str, Any]] = None,
+        target_strategy: Optional[str] = None,
     ) -> None:
         self._raw_candles = candles
+        self._strategy_params = strategy_params or {}
+        self._target_strategy = target_strategy
         self.initial_capital = initial_capital
         self.max_open = max_open_positions
         self.slippage_pct = slippage_pct
@@ -272,11 +275,13 @@ class BacktestEngine:
             adx_4h = regime_adx_4h[h4_idx] if 0 <= h4_idx < len(regime_adx_4h) else 20
             atr_pct_4h = (atr_val_4h / price_4h * 100.0) if price_4h > 0 else 0.0
 
-            if atr_pct_4h < 1.0:
+            _quiet_thresh = self._strategy_params.get("quiet_atr_threshold", 1.0)
+            _regime_adx = self._strategy_params.get("regime_adx_threshold", 24)
+            if atr_pct_4h < _quiet_thresh:
                 regime = Regime.QUIET
             elif atr_pct_4h > 4.0:
                 regime = Regime.VOLATILE
-            elif adx_4h > 25:
+            elif adx_4h > _regime_adx:
                 regime = Regime.TRENDING
             elif adx_4h < 20:
                 regime = Regime.RANGING
@@ -300,6 +305,11 @@ class BacktestEngine:
                 continue
 
             strategies = self._router.get_strategies(regime)
+            if self._target_strategy:
+                strategies = [s for s in strategies if s.name == self._target_strategy]
+                if not strategies:
+                    equity_curve.append(current_equity)
+                    continue
 
             # Look up pre-computed signal scores and run strategy evaluate_1h()
             best_signal = self._evaluate_precomputed(
@@ -396,7 +406,11 @@ class BacktestEngine:
     @staticmethod
     def _precompute_signals(df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
         """Compute all indicator series once on the full DataFrame."""
-        from bot.indicators.divergence import rsi_divergence, volume_divergence
+        try:
+            from bot.indicators.divergence import rsi_divergence, volume_divergence
+        except ImportError:
+            rsi_divergence = None  # type: ignore[assignment]
+            volume_divergence = None  # type: ignore[assignment]
         from bot.indicators.momentum import rsi, stochastic, cci
         from bot.indicators.trend import ema, macd, adx, supertrend
         from bot.indicators.volatility import bollinger_bands, atr
@@ -608,6 +622,18 @@ class BacktestEngine:
             return None
 
         # --- Confluence gate ---
+        if self._target_strategy:
+            # Single strategy isolation — skip confluence
+            best = max(collected_signals, key=lambda s: s["strength"])
+            return Signal(
+                symbol=symbol,
+                direction=best["direction"],
+                strength=best["strength"],
+                strategy_name=best["strategy"],
+                technical_score=best["strength"] if best["direction"] == "LONG" else -best["strength"],
+                indicator_snapshot={"confirming_count": 1},
+            )
+
         confluence = check_confluence(collected_signals)
         if confluence.triggered:
             # Confluence gives a boost — use best strength from agreeing strategies
