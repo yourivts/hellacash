@@ -25,6 +25,8 @@ services:
       db:
         condition: service_healthy
     env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://hellacash:hellacash@db:5432/hellacash
     ports:
       - "8000:8000"
     volumes:
