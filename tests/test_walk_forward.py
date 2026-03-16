@@ -21,7 +21,7 @@ from bot.learning.walk_forward import WalkForwardOptimizer, WFWindow, WFResult
 class TestWalkForwardOptimizer:
     def test_window_generation(self):
         wfo = WalkForwardOptimizer()
-        windows = wfo._generate_windows(total_days=120)
+        windows = wfo._generate_windows(total_days=300)
         assert len(windows) >= 3
 
     def test_adoption_criteria_rejects_poor_results(self):
@@ -36,8 +36,9 @@ class TestWalkForwardOptimizer:
     def test_adoption_criteria_accepts_good_results(self):
         wfo = WalkForwardOptimizer()
         windows = [
-            WFWindow(sharpe=1.2, pnl=200, params={"sentiment_weight": 0.3}),
-            WFWindow(sharpe=0.8, pnl=150, params={"sentiment_weight": 0.3}),
-            WFWindow(sharpe=1.0, pnl=180, params={"sentiment_weight": 0.3}),
+            WFWindow(sharpe=1.2, pnl=200, params={"sentiment_weight": 0.3}, profit_per_fee=2.0),
+            WFWindow(sharpe=0.8, pnl=150, params={"sentiment_weight": 0.3}, profit_per_fee=2.0),
+            WFWindow(sharpe=1.0, pnl=180, params={"sentiment_weight": 0.3}, profit_per_fee=2.0),
+            WFWindow(sharpe=0.9, pnl=160, params={"sentiment_weight": 0.3}, profit_per_fee=2.0),
         ]
         assert wfo._should_adopt(windows)

@@ -245,7 +245,7 @@ class TestRangeExitLogic:
     """Tests for range-specific exit handling in backtest."""
 
     def test_range_time_exit_24h(self):
-        """Range positions close after 288 bars (24h)."""
+        """Range positions close after 864 bars (72h)."""
         engine = BacktestEngine.__new__(BacktestEngine)
         engine.positions = []
         engine.closed_trades = []
@@ -254,8 +254,11 @@ class TestRangeExitLogic:
         engine.slippage_pct = 0.001
         engine._atr_multiplier = 2.0
         engine._max_hold_bars = 576  # 48h for trend
-        engine._range_max_hold_bars = 288  # 24h for range
+        engine._range_max_hold_bars = 864  # 72h for range
         engine._range_bounces = {}
+        engine._trade_regime = {}
+        engine._total_fees_paid = 0.0
+        engine._regime_pnl = {}
 
         pos = _OpenPosition(
             symbol="BTC-EUR", direction="LONG", entry_price=50000.0,
@@ -267,7 +270,7 @@ class TestRangeExitLogic:
 
         engine._check_exits_fast(
             price=50100.0, candle_high=50150.0, candle_low=50050.0,
-            time_str="2025-09-02", atr_val=200.0, current_bar=288,
+            time_str="2025-09-02", atr_val=200.0, current_bar=864,
         )
         assert len(engine.positions) == 0
         assert len(engine.closed_trades) == 1
@@ -282,6 +285,9 @@ class TestRangeExitLogic:
         engine.peak_balance = 10000.0
         engine.slippage_pct = 0.001
         engine._range_bounces = {}
+        engine._trade_regime = {}
+        engine._total_fees_paid = 0.0
+        engine._regime_pnl = {}
 
         pos = _OpenPosition(
             symbol="BTC-EUR", direction="LONG", entry_price=50000.0,
@@ -304,8 +310,11 @@ class TestRangeExitLogic:
         engine.slippage_pct = 0.001
         engine._atr_multiplier = 2.0
         engine._max_hold_bars = 576
-        engine._range_max_hold_bars = 288
+        engine._range_max_hold_bars = 864
         engine._range_bounces = {}
+        engine._trade_regime = {}
+        engine._total_fees_paid = 0.0
+        engine._regime_pnl = {}
 
         pos = _OpenPosition(
             symbol="BTC-EUR", direction="LONG", entry_price=49800.0,
@@ -337,8 +346,11 @@ class TestRangeExitLogic:
         engine.slippage_pct = 0.001
         engine._atr_multiplier = 2.0
         engine._max_hold_bars = 576
-        engine._range_max_hold_bars = 288
+        engine._range_max_hold_bars = 864
         engine._range_bounces = {}
+        engine._trade_regime = {}
+        engine._total_fees_paid = 0.0
+        engine._regime_pnl = {}
 
         pos = _OpenPosition(
             symbol="BTC-EUR", direction="LONG", entry_price=49800.0,
@@ -370,8 +382,11 @@ class TestRangeExitLogic:
         engine.slippage_pct = 0.001
         engine._atr_multiplier = 2.0
         engine._max_hold_bars = 576
-        engine._range_max_hold_bars = 288
+        engine._range_max_hold_bars = 864
         engine._range_bounces = {}
+        engine._trade_regime = {}
+        engine._total_fees_paid = 0.0
+        engine._regime_pnl = {}
 
         pos = _OpenPosition(
             symbol="BTC-EUR", direction="LONG", entry_price=49800.0,
@@ -404,7 +419,11 @@ class TestRangeExitLogic:
         engine.peak_balance = 10000.0
         engine.slippage_pct = 0.001
         engine._range_bounces = {}
-        engine._kelly_fraction = 0.15
+        engine._trade_regime = {}
+        engine._total_fees_paid = 0.0
+        engine._regime_pnl = {}
+        engine._atr_pct_history = []
+        engine._base_risk_pct = 3.0
         engine._atr_multiplier = 2.0
         engine._rr_ratio = 2.0
 
