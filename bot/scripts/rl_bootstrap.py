@@ -25,16 +25,14 @@ async def main():
     logger.info("Running alembic upgrade head to ensure candle_1m table exists...")
     subprocess.run(["alembic", "upgrade", "head"], check=True)
 
-    # Step 2: Download candles
-    symbols = None
-    try:
-        from bot.main import get_tradeable_symbols
-        symbols = get_tradeable_symbols()
-    except Exception as e:
-        logger.warning("Could not get tradeable symbols: %s", e)
+    # Step 2: Download candles — get symbols from public API
+    from bot.exchange.bitvavo_client import BitvavoClient
+    client = BitvavoClient(api_key="", api_secret="", paper_trading=True)
+    markets = client.get_markets()
+    symbols = [m.symbol for m in markets if m.volume_24h >= 10_000][:25]
     if not symbols:
         symbols = ["BTC-EUR", "ETH-EUR"]
-        logger.warning("Could not get tradeable symbols, using fallback: %s", symbols)
+        logger.warning("Could not get markets, using fallback: %s", symbols)
 
     logger.info("Downloading 1m candles for %d symbols...", len(symbols))
     await candle_store.bulk_download(symbols)

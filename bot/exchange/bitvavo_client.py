@@ -186,6 +186,19 @@ class MarketInfo:
 
 _PAPER_STATE_FILE = "paper_state.json"
 
+_singleton_client: Optional["BitvavoClient"] = None
+
+
+def get_client() -> "BitvavoClient":
+    """Return a module-level singleton BitvavoClient (paper-trading, no API keys).
+
+    Used by CandleStore for candle downloads via the public API.
+    """
+    global _singleton_client
+    if _singleton_client is None:
+        _singleton_client = BitvavoClient(api_key="", api_secret="", paper_trading=True)
+    return _singleton_client
+
 
 class BitvavoClient:
     """

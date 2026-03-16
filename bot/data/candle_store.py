@@ -35,19 +35,12 @@ class CandleStore:
         self._candle_cache_order: List[str] = []  # LRU order
         self._date_range_cache: Dict[str, Optional[Tuple[datetime, datetime]]] = {}
 
-    async def bulk_download(self, symbols: List[str],
-                            min_days: int = 90) -> None:
+    async def bulk_download(self, symbols: List[str]) -> None:
         """Pull all available 1m candles from Bitvavo for each symbol.
         Resumes from last stored timestamp per symbol.
-        Skips symbols with <min_days of history (too new for training).
         """
-        import asyncio
         for symbol in symbols:
             try:
-                span = self._get_data_span_days(symbol)
-                if span is not None and span < min_days:
-                    logger.info("CandleStore: skipping %s (only %d days of data)", symbol, span)
-                    continue
                 await self._download_symbol(symbol)
             except Exception as e:
                 logger.error("CandleStore: failed to download %s: %s", symbol, e)
@@ -58,27 +51,39 @@ class CandleStore:
         await self.bulk_download(symbols)
 
     async def _download_symbol(self, symbol: str) -> None:
-        """Download 1m candles for one symbol from Bitvavo."""
+        """Download 1m candles for one symbol from Bitvavo public REST API.
+
+        Bitvavo returns candles newest-first.  We paginate backwards using the
+        ``end`` parameter, stepping from now towards the oldest available data.
+        """
         import asyncio
-        from bot.exchange.bitvavo_client import get_client
+        import time as _time
+        from bot.exchange.bitvavo_client import _api_get, _API_BASE
 
         loop = asyncio.get_running_loop()
-        client = get_client()
 
-        last_ts = self._get_last_timestamp(symbol)
-        start_ms = int(last_ts.timestamp() * 1000) if last_ts else 0
+        # Start from now and walk backwards up to 180 days
+        cursor_ms = int(_time.time() * 1000)
+        stop_ms = cursor_ms - 180 * 86_400_000
+
+        # If we already have data, start from the oldest existing candle
+        # (to fill in history before what we have)
+        oldest_ts = self._get_oldest_timestamp(symbol)
+        if oldest_ts:
+            oldest_ms = int(oldest_ts.timestamp() * 1000)
+            if oldest_ms <= stop_ms:
+                logger.info("CandleStore: %s already has data back to %s, skipping", symbol, oldest_ts)
+                return
+            cursor_ms = oldest_ms  # start from where existing data ends (going back)
 
         total_stored = 0
         retries = 0
         max_retries = 3
 
-        while True:
+        while cursor_ms > stop_ms:
+            url = f"{_API_BASE}/{symbol}/candles?interval=1m&end={cursor_ms}&limit=1440"
             try:
-                candles = await loop.run_in_executor(
-                    None,
-                    lambda: client.bitvavo.candles(symbol.replace("-", ""), "1m",
-                                                    {"start": start_ms, "limit": 1440}),
-                )
+                candles = await loop.run_in_executor(None, _api_get, url)
             except Exception as e:
                 retries += 1
                 if retries > max_retries:
@@ -97,13 +102,31 @@ class CandleStore:
             self._store_candles(symbol, candles)
             total_stored += len(candles)
 
-            last_candle_ts = max(c[0] for c in candles)
-            start_ms = last_candle_ts + 60_000
+            # Bitvavo returns newest first — oldest candle is last in list
+            oldest_ts = min(c[0] for c in candles)
+            days_back = (int(_time.time() * 1000) - oldest_ts) / 86_400_000
+            logger.info("CandleStore: %s — %d candles stored so far (%.0f days back)",
+                        symbol, total_stored, days_back)
+            cursor_ms = oldest_ts - 1  # step before the oldest we just got
 
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.2)
 
         if total_stored > 0:
-            logger.info("CandleStore: stored %d candles for %s", total_stored, symbol)
+            logger.info("CandleStore: %s download complete — %d total candles", symbol, total_stored)
+
+    def _get_oldest_timestamp(self, symbol: str) -> Optional[datetime]:
+        """Get oldest stored timestamp for a symbol (sync)."""
+        conn = psycopg2.connect(self._sync_url)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT MIN(timestamp) FROM candle_1m WHERE symbol = %s",
+                    (symbol,),
+                )
+                row = cur.fetchone()
+                return row[0] if row and row[0] else None
+        finally:
+            conn.close()
 
     def _get_last_timestamp(self, symbol: str) -> Optional[datetime]:
         """Get last stored timestamp for a symbol (sync)."""
