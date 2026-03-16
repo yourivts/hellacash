@@ -1,99 +1,84 @@
-"""Market regime detection and strategy selector."""
+"""Strategy router: regime detection on 4h data, strategy dispatch."""
 from __future__ import annotations
 
-import logging
+from enum import Enum
 from typing import List
 
 import pandas as pd
 
-from bot.indicators.trend import adx
-from bot.indicators.volatility import atr
 from bot.strategy.base import BaseStrategy
-from bot.strategy.breakout import BreakoutStrategy
-from bot.strategy.hybrid import HybridStrategy
+from bot.strategy.orderflow import OrderFlowStrategy
+from bot.strategy.funding_contrarian import FundingContrarianStrategy
 from bot.strategy.range_trading import RangeStrategy
-from bot.strategy.trend_following import TrendFollowingStrategy
-
-logger = logging.getLogger(__name__)
+from bot.strategy.squeeze import SqueezeStrategy
 
 
-class Regime:
+class Regime(str, Enum):
+    QUIET = "quiet"
+    VOLATILE = "volatile"
     TRENDING = "trending"
     RANGING = "ranging"
-    VOLATILE = "volatile"
-    UNKNOWN = "unknown"
+    NEUTRAL = "neutral"
 
 
-def detect_regime(df_1h: pd.DataFrame) -> str:
+def detect_regime(
+    df_4h: pd.DataFrame,
+    quiet_atr_threshold: float = 1.0,
+    volatile_atr_threshold: float = 4.0,
+    trending_adx_threshold: float = 25.0,
+    ranging_adx_threshold: float = 20.0,
+) -> Regime:
+    """Detect market regime from 4h candle data.
+
+    Evaluation order (first match wins):
+    1. QUIET:    ATR% < quiet_atr_threshold
+    2. VOLATILE: ATR% > volatile_atr_threshold
+    3. TRENDING: ADX > trending_adx_threshold
+    4. RANGING:  ADX < ranging_adx_threshold
+    5. NEUTRAL:  everything else
     """
-    Classify market regime from 1h candle data.
-    Returns one of: 'trending', 'ranging', 'volatile', 'unknown'
-    """
-    if len(df_1h) < 30:
-        return Regime.UNKNOWN
+    if df_4h is None or len(df_4h) < 2:
+        return Regime.NEUTRAL
 
-    close = df_1h["close"]
-    high = df_1h["high"]
-    low = df_1h["low"]
+    last = df_4h.iloc[-1]
+    adx = float(last.get("adx", 20.0))
 
-    try:
-        a = adx(high, low, close).iloc[-1]
-        current_atr = atr(high, low, close).iloc[-1]
-        price = close.iloc[-1]
-        atr_pct = (current_atr / price) * 100.0 if price > 0 else 0.0
+    close = float(last.get("close", 1.0))
+    atr = float(last.get("atr", 0.0))
+    atr_pct = (atr / close * 100.0) if close > 0 else 0.0
 
-        # High ATR relative to price = volatile
-        if atr_pct > 3.0:
-            return Regime.VOLATILE
-
-        # Strong ADX = trending
-        if a > 25:
-            return Regime.TRENDING
-
-        # Weak ADX = ranging
-        if a < 20:
-            return Regime.RANGING
-
-        return Regime.UNKNOWN
-    except Exception as e:
-        logger.warning("Regime detection failed: %s", e)
-        return Regime.UNKNOWN
+    if atr_pct < quiet_atr_threshold:
+        return Regime.QUIET
+    if atr_pct > volatile_atr_threshold:
+        return Regime.VOLATILE
+    if adx > trending_adx_threshold:
+        return Regime.TRENDING
+    if adx < ranging_adx_threshold:
+        return Regime.RANGING
+    return Regime.NEUTRAL
 
 
 class StrategyRouter:
-    """Selects which strategies to run based on detected market regime."""
-
     def __init__(self) -> None:
-        self._hybrid = HybridStrategy()
-        self._trend = TrendFollowingStrategy()
+        self._orderflow = OrderFlowStrategy()
+        self._funding = FundingContrarianStrategy()
         self._range = RangeStrategy()
-        self._breakout = BreakoutStrategy()
+        self._squeeze = SqueezeStrategy()
 
-    def get_strategies(self, regime: str) -> List[BaseStrategy]:
-        if regime == Regime.TRENDING:
-            return [self._hybrid, self._trend, self._breakout]
-        elif regime == Regime.RANGING:
-            return [self._hybrid, self._range]
+    def get_strategies(self, regime: Regime) -> List[BaseStrategy]:
+        if regime == Regime.QUIET:
+            return []
         elif regime == Regime.VOLATILE:
-            return [self._hybrid]  # only hybrid in volatile markets
-        else:
-            return [self._hybrid]
+            return [self._funding, self._squeeze]
+        elif regime == Regime.TRENDING:
+            return [self._orderflow, self._funding, self._squeeze]
+        elif regime == Regime.RANGING:
+            return [self._range, self._orderflow, self._funding]
+        else:  # NEUTRAL
+            return [self._funding, self._orderflow]
 
-    def position_size_modifier(self, regime: str) -> float:
-        """Reduce position sizes in volatile/ranging markets."""
-        if regime == Regime.VOLATILE:
-            return 0.3
-        if regime == Regime.RANGING:
-            return 0.5
-        return 1.0
-
-    def update_hybrid_params(
-        self,
-        sentiment_weight: float,
-        entry_threshold: float,
-        indicator_weights: dict,
-    ) -> None:
-        """Called by learning optimizer to update hybrid params."""
-        self._hybrid.sentiment_weight = sentiment_weight
-        self._hybrid.entry_threshold = entry_threshold
-        self._hybrid.indicator_weights = indicator_weights
+    def update_params(self, **kwargs) -> None:
+        for strat in [self._orderflow, self._funding, self._range, self._squeeze]:
+            for key, val in kwargs.items():
+                if hasattr(strat, key):
+                    setattr(strat, key, val)
