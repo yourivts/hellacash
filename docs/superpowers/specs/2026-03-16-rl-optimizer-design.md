@@ -2,7 +2,7 @@
 
 ## Goal
 
-Replace Optuna's blind Bayesian optimization with a PPO reinforcement learning agent that learns optimal trading parameters from 8 years of historical 1m candle data. One model per strategy, 22 wide-range parameters (23 for range model), 27 market observation features.
+Replace Optuna's blind Bayesian optimization with a PPO reinforcement learning agent that learns optimal trading parameters from 8 years of historical 1m candle data. One model per strategy, 21 wide-range parameters (22 for range model), 27 market observation features.
 
 ## Motivation
 
@@ -142,7 +142,7 @@ class TradingParamEnv(gymnasium.Env):
     """RL environment for trading parameter optimization.
 
     Observation: 27 market features (float32)
-    Action: 22 parameters normalized to [-1, 1] (23 for range model)
+    Action: 21 parameters normalized to [-1, 1] (22 for range model)
     Reward: composite score with guardrails
     """
 
@@ -150,7 +150,7 @@ class TradingParamEnv(gymnasium.Env):
         self.observation_space = spaces.Box(
             low=-1.0, high=1.0, shape=(27,), dtype=np.float32
         )  # All features hard-clipped to [-1, 1] by feature_extractor
-        n_actions = 23 if strategy == "range" else 22
+        n_actions = 22 if strategy == "range" else 21
         self.action_space = spaces.Box(low=-1, high=1, shape=(n_actions,), dtype=np.float32)
 
     def reset(self, seed=None, options=None):
@@ -165,32 +165,35 @@ Action-to-parameter mapping:
 
 | Index | Parameter | Range | Mapping from [-1, 1] |
 |-------|-----------|-------|---------------------|
-| 0 | atr_multiplier | 0.5-20.0 | (a+1)/2 * 19.5 + 0.5 |
-| 1 | rr_ratio | 0.5-10.0 | (a+1)/2 * 9.5 + 0.5 |
-| 2 | base_risk_pct | 0.5-10.0 | (a+1)/2 * 9.5 + 0.5 |
+| 0 | atr_multiplier | 1.0-15.0 | (a+1)/2 * 14.0 + 1.0 |
+| 1 | rr_ratio | 1.0-8.0 | (a+1)/2 * 7.0 + 1.0 |
+| 2 | base_risk_pct | 1.0-8.0 | (a+1)/2 * 7.0 + 1.0 |
 | 3 | min_profit_multiple | 0.5-8.0 | (a+1)/2 * 7.5 + 0.5 |
-| 4 | max_hold_hours | 1-720 | int((a+1)/2 * 719 + 1) |
+| 4 | max_hold_hours | 6-720 | int((a+1)/2 * 714 + 6) |
 | 5 | quiet_atr_threshold | 0.1-5.0 | (a+1)/2 * 4.9 + 0.1 |
 | 6 | regime_adx_threshold | 5-50 | (a+1)/2 * 45 + 5 |
 | 7 | ranging_adx_threshold | 5-50 | (a+1)/2 * 45 + 5 |
 | 8 | signal_strength_min | 0.1-1.0 | (a+1)/2 * 0.9 + 0.1 |
-| 9 | min_confirmations | 1-5 | int((a+1)/2 * 4 + 1) |
-| 10 | tf_weight_1h | 0.0-1.0 | (a+1)/2 |
-| 11 | tf_weight_4h | 0.0-1.0 | (a+1)/2 |
-| 12 | tf_weight_1d | 0.0-1.0 | (a+1)/2 |
-| 13 | max_concurrent_positions | 1-10 | int((a+1)/2 * 9 + 1) |
-| 14 | confidence_size_scaling | 0.0-2.0 | (a+1)/2 * 2.0 |
-| 15 | ema200_filter_pct | 0.0-10.0 | (a+1)/2 * 10.0 |
-| 16 | volatile_atr_threshold | 1.0-10.0 | (a+1)/2 * 9.0 + 1.0 |
-| 17 | consecutive_confirms | 1-5 | int((a+1)/2 * 4 + 1) |
-| 18 | confluence_boost | 1.0-2.0 | (a+1)/2 * 1.0 + 1.0 |
-| 19 | drawdown_scale_pct | 1.0-15.0 | (a+1)/2 * 14.0 + 1.0 |
-| 20 | max_position_pct | 0.1-0.5 | (a+1)/2 * 0.4 + 0.1 |
-| 21 | trail_activation_mult | 0.5-3.0 | (a+1)/2 * 2.5 + 0.5 |
-| 22 | range_max_hold_hours | 6-168 | int((a+1)/2 * 162 + 6) |
+| 9 | tf_weight_1h | 0.0-1.0 | (a+1)/2 |
+| 10 | tf_weight_4h | 0.0-1.0 | (a+1)/2 |
+| 11 | tf_weight_1d | 0.0-1.0 | (a+1)/2 |
+| 12 | max_concurrent_positions | 1-10 | int((a+1)/2 * 9 + 1) |
+| 13 | confidence_size_scaling | 0.0-2.0 | (a+1)/2 * 2.0 |
+| 14 | ema200_filter_pct | 0.0-10.0 | (a+1)/2 * 10.0 |
+| 15 | volatile_atr_threshold | 1.0-10.0 | (a+1)/2 * 9.0 + 1.0 |
+| 16 | consecutive_confirms | 1-5 | int((a+1)/2 * 4 + 1) |
+| 17 | confluence_boost | 1.0-2.0 | (a+1)/2 * 1.0 + 1.0 |
+| 18 | drawdown_scale_pct | 1.0-15.0 | (a+1)/2 * 14.0 + 1.0 |
+| 19 | max_position_pct | 0.1-0.5 | (a+1)/2 * 0.4 + 0.1 |
+| 20 | trail_activation_mult | 0.5-3.0 | (a+1)/2 * 2.5 + 0.5 |
+| 21 | range_max_hold_hours | 6-168 | int((a+1)/2 * 162 + 6) |
 
-Parameters 0-21 are used by all 4 strategy models (action space shape 22).
-Parameter 22 (`range_max_hold_hours`) is only used by the range model (action space shape 23). Non-range models ignore index 22.
+Parameters 0-20 are used by all 4 strategy models (action space shape 21).
+Parameter 21 (`range_max_hold_hours`) is only used by the range model (action space shape 22). Non-range models ignore index 21.
+
+**Excluded parameter: `min_confirmations`** — removed from the RL action space. In single-strategy isolation mode (which all per-strategy backtests use), the engine's `confirming_count` is always 1. Setting `min_confirmations > 1` would block all entries. The existing `min_confirmations` param in BacktestEngine remains at its default (2) but is unused in isolation mode.
+
+**Models trained per strategy:** Only the 4 strategies in `ALL_STRATEGIES` (`orderflow`, `range`, `squeeze`, `funding_contrarian`) get RL models. Other strategies (`hybrid`, `trend_following`, `breakout`) are not in `ALL_STRATEGIES` and are excluded from walk-forward optimization — they continue using `CHAMPION_DEFAULTS`.
 
 Each episode is one 90-day window on one symbol. The environment picks a random window on `reset()`, the agent takes a single action (parameter set), the backtest runs, reward is computed, episode ends (single-step episode).
 
@@ -299,7 +302,7 @@ class RLOptimizer:
 
 Inference flow:
 1. `feature_extractor.extract_features(candles_1m, btc_candles_1m)` → 27-element array
-2. `model.predict(features, deterministic=True)` → 22-element action (23 for range)
+2. `model.predict(features, deterministic=True)` → 21-element action (22 for range)
 3. Map action to parameter dict (same mapping table as environment)
 4. Return parameter dict
 
@@ -311,22 +314,60 @@ Fallback: if model file missing or corrupt, return `CHAMPION_DEFAULTS` and log w
 
 **`bot/learning/walk_forward.py`** — Replace `_run_optuna_window` with `_run_rl_window`.
 
+Constructor change:
 ```python
-def _run_rl_window(train_candles, test_candles, max_workers,
-                    target_strategy=None, rl_optimizer=None):
+class WalkForwardOptimizer:
+    def __init__(self, rl_optimizer: Optional[RLOptimizer] = None,
+                 candle_store: Optional[CandleStore] = None) -> None:
+        self._rl_optimizer = rl_optimizer
+        self._candle_store = candle_store
+        self._latest_result: Optional[WFResult] = None
+        self._results_by_symbol: Dict[str, WFResult] = {}
+        self._running = False
+```
+
+New method (replaces `_run_optuna_window`):
+```python
+def _run_rl_window(self, train_candles_5m, test_candles_5m,
+                    target_strategy=None):
     """RL-driven parameter optimization for a single train/test window.
 
-    Flow:
-      1. rl_optimizer.predict(train_candles, strategy) → params  (<1ms)
-      2. Backtest train_candles with params (validation)           (~5s)
-      3. Backtest test_candles with params (OOS test)              (~5s)
-      4. Return (params, test_result)                              (~10s total)
+    Data flow:
+      1. Get 1m candles from CandleStore for the train window's date range
+      2. extract_features(candles_1m) → 27-element observation  (<100ms)
+      3. rl_optimizer.predict(features, strategy) → params      (<1ms)
+      4. Backtest train_candles_5m with params (validation)      (~5s)
+      5. Backtest test_candles_5m with params (OOS test)         (~5s)
+      6. Return (params, test_result)                            (~10s total)
+
+    The walk-forward still passes 5m candles for backtesting (matches
+    production). Feature extraction uses 1m candles from CandleStore
+    for higher precision — these are NOT the same candles used for
+    backtesting.
     """
+```
+
+This is now a method on `WalkForwardOptimizer` (not a top-level function) because:
+- It needs `self._rl_optimizer` and `self._candle_store`
+- RL inference is <1ms — no need for `ProcessPoolExecutor` / pickling
+- The backtest still runs in the same call, which is CPU-bound but completes in ~5s
+
+The calling methods (`_execute`, `_execute_from_candles`) change from:
+```python
+best_params, test_result = await loop.run_in_executor(
+    None, _run_optuna_window, train_candles, test_candles, max_workers
+)
+```
+to:
+```python
+best_params, test_result = await loop.run_in_executor(
+    None, self._run_rl_window, train_candles, test_candles, target_strategy
+)
 ```
 
 Return value: `(best_params, BacktestResult)` — same shape as current `_run_optuna_window`.
 
-The `WalkForwardOptimizer` receives an `RLOptimizer` instance via constructor injection. If no RL optimizer is provided (models not trained yet), falls back to CHAMPION_DEFAULTS.
+Fallback: if `self._rl_optimizer` is None or has no model for the strategy, return `(CHAMPION_DEFAULTS, BacktestResult())` and log a warning.
 
 **`bot/backtest/engine.py`** — Accept new parameters.
 
@@ -340,23 +381,14 @@ New `strategy_params` keys and exact integration points:
   ```
   Since `signal_strength_min` defaults to 0.0 and the RL agent's range is [0.1, 1.0], this subsumes the old `> 0` check.
 
-**2. `min_confirmations`** (int, default 2) — minimum confirming indicators before entry.
-- Already extracted at line 138: `self._min_confirmations = params.get("min_confirmations", 2)`
-- **Currently unused in entry path.** Must add a check in `run()` at the entry logic (line ~347):
-  ```python
-  and best_signal.indicator_snapshot.get("confirming_count", 0) >= self._min_confirmations
-  ```
-- This gates entries on having enough confirming indicators (e.g., RSI + MACD + ADX agreeing). The `confirming_count` is already populated by all strategies in `_evaluate_precomputed()` (lines 646, 658, 669).
-- **Note:** This is distinct from `consecutive_confirms` (line 150), which requires the signal to persist for N consecutive cycles. `min_confirmations` requires N indicators to agree in a single cycle.
-
-**3. `tf_weight_1h`, `tf_weight_4h`, `tf_weight_1d`** (float, default 1.0 each) — weight per-timeframe trend agreement.
+**2. `tf_weight_1h`, `tf_weight_4h`, `tf_weight_1d`** (float, default 1.0 each) — weight per-timeframe trend agreement.
 - Extract in `__init__`:
   ```python
   self._tf_weight_1h = params.get("tf_weight_1h", 1.0)
   self._tf_weight_4h = params.get("tf_weight_4h", 1.0)
   self._tf_weight_1d = params.get("tf_weight_1d", 1.0)
   ```
-- Apply in `_evaluate_precomputed()` after collecting signals (around line 623). After computing the best signal's strength, scale it by timeframe alignment:
+- Apply in `_evaluate_precomputed()` **after the confluence gate** (after line 670, just before returning the final Signal). Scale the final signal's strength by timeframe alignment. This runs on the chosen signal, not on individual collected signals:
   ```python
   # Timeframe weight scaling: check if 4h and 1d trends agree with signal direction
   tf_score = self._tf_weight_1h  # 1h always contributes (signal source)
@@ -480,7 +512,7 @@ New `strategy_params` keys and exact integration points:
 candle_store = CandleStore(db_url=settings.database_url)
 rl_optimizer = RLOptimizer()
 rl_optimizer.load_models()
-walk_forward = WalkForwardOptimizer(rl_optimizer=rl_optimizer)
+walk_forward = WalkForwardOptimizer(rl_optimizer=rl_optimizer, candle_store=candle_store)
 
 # Weekly retrain callback (passed to scheduler):
 async def _retrain_rl():
@@ -556,6 +588,18 @@ Remove:
 - All `import optuna` references removed
 - `OPTUNA_TRIALS` constant removed
 
+## Deployment / Migration
+
+The RL system requires a bootstrap phase before it can replace Optuna. Steps:
+
+1. **Pre-deployment**: Run bulk candle download (2-3 hours) and initial training (1-2 hours) as a one-time script BEFORE deploying the code change. This can run alongside the live bot since it only reads from Bitvavo and writes to a new DB table + model files.
+   ```bash
+   python -m bot.scripts.rl_bootstrap  # downloads candles, trains models
+   ```
+2. **Deploy**: Once models exist in `models/rl_optimizer/`, deploy the new code. The bot starts with trained models and walk-forward uses RL immediately.
+3. **Fallback**: If models don't exist at startup (e.g., fresh deployment), `RLOptimizer` falls back to `CHAMPION_DEFAULTS` for all predictions. Walk-forward still runs, just with default parameters — equivalent to no optimization, not worse than a cold start.
+4. **Optuna removal**: Optuna is removed from `requirements.txt` and all code. No gradual migration — the fallback to `CHAMPION_DEFAULTS` covers the gap.
+
 ## Error Handling
 
 | Failure | Behavior |
@@ -602,7 +646,7 @@ Remove:
 4. **Unit test `candle_store.py`**: Mock Bitvavo API, verify download/resume logic, verify resampling.
 5. **Unit test `_run_rl_window`**: Mock rl_optimizer, verify flow (predict → backtest train → backtest OOS → return).
 6. **Integration test**: Train a tiny model (100 timesteps) on synthetic data, verify it produces valid parameters, verify walk-forward accepts them.
-7. **Backtest engine test**: Verify new parameters (signal_strength_min, min_confirmations, tf_weights, max_concurrent_positions, confidence_size_scaling) affect trade behavior.
+7. **Backtest engine test**: Verify new parameters (signal_strength_min, tf_weights, max_concurrent_positions, confidence_size_scaling, ema200_filter_pct, volatile_atr_threshold, consecutive_confirms, confluence_boost, drawdown_scale_pct, max_position_pct, trail_activation_mult, range_max_hold_hours) affect trade behavior.
 
 ## Dependencies
 
