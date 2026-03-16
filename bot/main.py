@@ -35,7 +35,8 @@ from bot.learning.param_optimizer import ParamOptimizer
 from bot.learning.regime_classifier import RegimeClassifier
 from bot.learning.signal_evaluator import SignalEvaluator
 from bot.learning.trade_analyzer import TradeAnalyzer
-from bot.learning.walk_forward import WalkForwardOptimizer
+from bot.learning.walk_forward import WalkForwardOptimizer, TRAIN_DAYS, TEST_DAYS, MIN_WINDOWS
+from bot.execution.limit_order_manager import LimitOrderManager
 from bot.portfolio.tracker import PortfolioTracker
 from bot.risk.drawdown_guard import DrawdownGuard
 from bot.risk.engine import RiskEngine
@@ -148,6 +149,14 @@ _orderbook_provider: Optional[OrderBookProvider] = None
 _walk_forward: Optional[WalkForwardOptimizer] = None
 _trading_loop: Optional[TradingLoop] = None
 _scheduler: Optional[BotScheduler] = None
+_limit_mgr: Optional[LimitOrderManager] = None
+
+
+def _get_limit_mgr() -> LimitOrderManager:
+    global _limit_mgr
+    if _limit_mgr is None:
+        _limit_mgr = LimitOrderManager()
+    return _limit_mgr
 
 
 def _get_client() -> BitvavoClient:
@@ -261,6 +270,7 @@ def _get_trading_loop() -> TradingLoop:
             onchain=_get_onchain() if get_settings().onchain_enabled else None,
             orderbook=_get_orderbook() if get_settings().orderbook_enabled else None,
         )
+        _trading_loop._limit_mgr = _get_limit_mgr()
     return _trading_loop
 
 
@@ -294,11 +304,7 @@ async def _process_walk_forward_results(
     if best_adopted and best_adopted.recommended_params:
         router = get_router_fn()
         params = best_adopted.recommended_params
-        router.update_hybrid_params(
-            sentiment_weight=params.get("sentiment_weight", 0.25),
-            entry_threshold=params.get("entry_threshold", 0.40),
-            indicator_weights=params.get("indicator_weights"),
-        )
+        router.update_params(**params)
         # Apply cooldown to live trading loop if present
         if "cooldown_hours" in params and trading_loop is not None:
             trading_loop._cooldown_seconds = params["cooldown_hours"] * 3600
@@ -435,7 +441,7 @@ async def _main() -> None:
         async def _fetcher(start_day: int, end_day: int):
             from datetime import datetime, timedelta, timezone
             now = datetime.now(timezone.utc)
-            total_days = 180
+            total_days = TRAIN_DAYS + TEST_DAYS * MIN_WINDOWS
             start_dt = now - timedelta(days=total_days - start_day)
             end_dt = now - timedelta(days=total_days - end_day)
             logger.info("Walk-forward: fetching %s candles day %d-%d (%s to %s)",
