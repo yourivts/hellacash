@@ -245,11 +245,11 @@ async def get_universe():
         strategies = {}
         for strat in universe.get_enabled_strategies(sym):
             sp = universe.get_strategy_params(sym, strat)
-            sc = universe._adopted[sym].strategies[strat]
+            metrics = universe.get_strategy_metrics(sym, strat)
             strategies[strat] = {
                 "params": sp,
-                "avg_sharpe": sc.avg_sharpe,
-                "avg_pnl": sc.avg_pnl,
+                "avg_sharpe": metrics["avg_sharpe"],
+                "avg_pnl": metrics["avg_pnl"],
             }
             total_combos += 1
         symbols[sym] = {

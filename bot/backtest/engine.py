@@ -371,6 +371,7 @@ class BacktestEngine:
                     position_size=size_eur_est,
                     tp_distance_pct=tp_distance_pct,
                     is_short=(direction == "SHORT"),
+                    min_profit_multiple=self._strategy_params.get("min_profit_multiple", 3.0),
                 )
                 if not fee_result.approved:
                     equity_curve.append(current_equity)

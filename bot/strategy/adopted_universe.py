@@ -61,6 +61,13 @@ class AdoptedUniverse:
             return list(self._adopted[symbol].strategies.keys())
         return []
 
+    def get_strategy_metrics(self, symbol: str, strategy: str) -> Dict[str, float]:
+        """Return avg_sharpe and avg_pnl for a strategy-symbol combo."""
+        if symbol in self._adopted and strategy in self._adopted[symbol].strategies:
+            sc = self._adopted[symbol].strategies[strategy]
+            return {"avg_sharpe": sc.avg_sharpe, "avg_pnl": sc.avg_pnl}
+        return {"avg_sharpe": 0.0, "avg_pnl": 0.0}
+
     def adopted_symbols(self) -> List[str]:
         return list(self._adopted.keys())
 

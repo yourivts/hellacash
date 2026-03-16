@@ -35,37 +35,6 @@ def _run_single_backtest(candles, params, target_strategy=None):
     return params, result.total_pnl, result.sharpe_ratio, pf, ppf
 
 
-def _sample_optuna_candidates(n_trials):
-    """Use Optuna's TPE sampler to generate smart candidates in batches."""
-    import optuna
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-    study = optuna.create_study(
-        direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=10),
-    )
-
-    # Seed with champion params
-    study.enqueue_trial(dict(CHAMPION_DEFAULTS))
-
-    # Phase 1: generate first batch of random+seeded candidates
-    candidates = []
-    for _ in range(n_trials):
-        trial = study.ask()
-        params = {
-            "atr_multiplier": trial.suggest_float("atr_multiplier", 2.5, 5.0, step=0.5),
-            "rr_ratio": trial.suggest_float("rr_ratio", 2.0, 4.0, step=0.5),
-            "base_risk_pct": trial.suggest_float("base_risk_pct", 2.0, 5.0, step=0.5),
-            "min_profit_multiple": trial.suggest_float("min_profit_multiple", 2.0, 4.0, step=0.5),
-            "cooldown_hours": trial.suggest_int("cooldown_hours", 12, 72, step=12),
-            "max_hold_hours": trial.suggest_int("max_hold_hours", 48, 240, step=24),
-            "quiet_atr_threshold": trial.suggest_float("quiet_atr_threshold", 0.8, 1.5, step=0.1),
-            "regime_adx_threshold": trial.suggest_float("regime_adx_threshold", 20, 30, step=2),
-        }
-        candidates.append((trial.number, params))
-
-    return study, candidates
-
 
 def _run_optuna_window(train_candles, test_candles, max_workers, target_strategy=None):
     """Run Optuna Bayesian optimization on a single train/test window.

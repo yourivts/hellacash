@@ -70,7 +70,6 @@ class TradingLoop:
 
         # Per-symbol cooldown: tracks last trade close time (monotonic)
         self._last_trade_closed: Dict[str, float] = {}
-        self._cooldown_seconds: float = settings.trade_cooldown_hours * 3600 if hasattr(settings, "trade_cooldown_hours") else 96 * 3600
 
         self._last_halt_log: float = 0  # throttle halt log messages
         self._last_portfolio_publish: float = 0  # throttle portfolio update events
@@ -504,7 +503,7 @@ class TradingLoop:
                     "strategy_name": strategy_name,
                     "entry_price": entry_price,
                     "size_eur": size_eur,
-                    "confluence": confluence.agreeing_strategies,
+                    "confluence": confluence.agreeing_strategies if confluence else [],
                 })
         finally:
             self._pending_orders.discard(symbol)
@@ -869,6 +868,17 @@ class TradingLoop:
                 size_eur *= drawdown.position_size_multiplier(equity)
 
                 amount_base = size_eur / entry_price
+
+                # Fee gate: reject trades where fees eat the profit
+                tp_distance_pct = abs(take_profit - entry_price) / entry_price * 100.0 if entry_price > 0 else 0.0
+                fee_result = check_fee_gate(
+                    position_size=size_eur,
+                    tp_distance_pct=tp_distance_pct,
+                    is_short=(direction == "SHORT"),
+                    min_profit_multiple=strat_params["min_profit_multiple"],
+                )
+                if not fee_result.approved:
+                    continue
 
                 # Risk gate (use actual per-market taker fee)
                 _, taker_pct = get_trading_fees(symbol)
