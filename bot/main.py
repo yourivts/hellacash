@@ -44,6 +44,7 @@ from bot.scheduler import BotScheduler
 from bot.sentiment.aggregator import SentimentAggregator
 from bot.strategy.router import StrategyRouter
 from bot.notifications.discord import DiscordNotifier
+from bot.strategy.adopted_universe import AdoptedUniverse
 from bot.trading_loop import TradingLoop
 
 _LOG_DIR = os.path.join(os.path.dirname(__file__), "..", "logs")
@@ -253,6 +254,15 @@ def _get_walk_forward() -> WalkForwardOptimizer:
     return _walk_forward
 
 
+_universe: Optional[AdoptedUniverse] = None
+
+def _get_universe() -> AdoptedUniverse:
+    global _universe
+    if _universe is None:
+        _universe = AdoptedUniverse()
+    return _universe
+
+
 def _get_trading_loop() -> TradingLoop:
     global _trading_loop
     if _trading_loop is None:
@@ -271,6 +281,7 @@ def _get_trading_loop() -> TradingLoop:
             orderbook=_get_orderbook() if get_settings().orderbook_enabled else None,
         )
         _trading_loop._limit_mgr = _get_limit_mgr()
+        _trading_loop._universe = _get_universe()
     return _trading_loop
 
 
@@ -278,73 +289,34 @@ def _get_trading_loop() -> TradingLoop:
 
 
 async def _process_walk_forward_results(
-    results, get_router_fn, trading_loop, discord, settings,
+    results, get_router_fn, trading_loop, discord, settings, universe,
 ):
-    """Process walk-forward results: adopt params, log summary, auto-start paper trading."""
-    adopted_count = 0
-    for symbol, result in results.items():
-        if result.adopted and result.recommended_params:
-            adopted_count += 1
-            logger.info(
-                "Walk-forward %s ADOPTED params (avg_sharpe=%.2f, avg_pnl=€%.2f): %s",
-                symbol, result.avg_oos_sharpe, result.avg_oos_pnl, result.recommended_params,
-            )
-        else:
-            logger.info(
-                "Walk-forward %s — params not adopted (avg_sharpe=%.2f, avg_pnl=€%.2f)",
-                symbol, result.avg_oos_sharpe, result.avg_oos_pnl,
-            )
-    # Apply best adopted result to router (use the one with highest avg P&L)
-    best_adopted = None
-    best_pnl = float("-inf")
-    for symbol, result in results.items():
-        if result.adopted and result.recommended_params and result.avg_oos_pnl > best_pnl:
-            best_pnl = result.avg_oos_pnl
-            best_adopted = result
-    if best_adopted and best_adopted.recommended_params:
-        router = get_router_fn()
-        params = best_adopted.recommended_params
-        router.update_params(**params)
-        # Apply cooldown to live trading loop if present
-        if "cooldown_hours" in params and trading_loop is not None:
-            trading_loop._cooldown_seconds = params["cooldown_hours"] * 3600
-            logger.info("Walk-forward: updated live cooldown to %dh", params["cooldown_hours"])
-        logger.info("Walk-forward: applied best adopted params to router")
+    """Process per-strategy walk-forward results: update universe, log summary."""
+    universe.update(results)
+
     # ── Final analysis summary ──
-    wf_symbols = list(results.keys())
     logger.info("=" * 70)
-    logger.info("WALK-FORWARD ANALYSIS COMPLETE — %d symbols evaluated", len(wf_symbols))
+    logger.info("WALK-FORWARD ANALYSIS COMPLETE")
     logger.info("=" * 70)
-    total_avg_pnl = 0.0
-    total_avg_sharpe = 0.0
-    best_symbol = None
-    best_symbol_pnl = float("-inf")
-    worst_symbol = None
-    worst_symbol_pnl = float("inf")
-    for symbol, result in results.items():
-        total_avg_pnl += result.avg_oos_pnl
-        total_avg_sharpe += result.avg_oos_sharpe
-        status = "ADOPTED" if result.adopted else "NOT ADOPTED"
-        n_windows = len(result.windows)
-        profitable = sum(1 for w in result.windows if w.pnl > 0)
-        logger.info(
-            "  %-10s | %s | avg_pnl=€%+.2f | avg_sharpe=%+.2f | windows=%d/%d profitable",
-            symbol, status, result.avg_oos_pnl, result.avg_oos_sharpe, profitable, n_windows,
-        )
-        if result.avg_oos_pnl > best_symbol_pnl:
-            best_symbol_pnl = result.avg_oos_pnl
-            best_symbol = symbol
-        if result.avg_oos_pnl < worst_symbol_pnl:
-            worst_symbol_pnl = result.avg_oos_pnl
-            worst_symbol = symbol
-    n = len(results) or 1
+
+    total_combos = 0
+    adopted_combos = 0
+    for symbol, strat_results in results.items():
+        parts = []
+        for strat_name, result in strat_results.items():
+            total_combos += 1
+            if result.adopted:
+                adopted_combos += 1
+                parts.append(f"{strat_name}: ADOPTED (sharpe={result.avg_oos_sharpe:.2f}, pnl=€{result.avg_oos_pnl:+.2f})")
+            else:
+                parts.append(f"{strat_name}: NOT ADOPTED")
+        logger.info("  %-12s | %s", symbol, " | ".join(parts))
+
     logger.info("-" * 70)
-    logger.info("  Portfolio avg P&L:    €%+.2f across %d symbols", total_avg_pnl, len(results))
-    logger.info("  Portfolio avg Sharpe: %+.2f", total_avg_sharpe / n)
-    logger.info("  Best symbol:          %s (€%+.2f avg OOS P&L)", best_symbol, best_symbol_pnl)
-    logger.info("  Worst symbol:         %s (€%+.2f avg OOS P&L)", worst_symbol, worst_symbol_pnl)
-    logger.info("  Adopted:              %d/%d symbols", adopted_count, len(wf_symbols))
+    logger.info("  Adopted: %d symbols, %d strategy-combos out of %d",
+                universe.count(), adopted_combos, total_combos)
     logger.info("=" * 70)
+
     # Send report to Discord
     try:
         await discord.send_walk_forward_report(results)
@@ -457,11 +429,12 @@ async def _main() -> None:
 
     async def _run_walk_forward():
         symbols = get_tradeable_symbols() or ["BTC-EUR"]
-        wf_symbols = symbols
-        logger.info("Walk-forward: running for %d symbols: %s", len(wf_symbols), wf_symbols)
-        results = await walk_forward.run_multi(_wf_candle_fetcher_factory, wf_symbols)
+        logger.info("Walk-forward: running for %d symbols (per-strategy)", len(symbols))
+        results = await walk_forward.run_multi_per_strategy(
+            _wf_candle_fetcher_factory, symbols,
+        )
         await _process_walk_forward_results(
-            results, _get_router, trading_loop, discord, settings,
+            results, _get_router, trading_loop, discord, settings, _get_universe(),
         )
 
     # Market data snapshot callback: saves funding rate + orderbook data for future backtesting
