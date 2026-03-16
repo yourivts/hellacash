@@ -7,6 +7,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+import numpy as np
+
+from bot.backtest.engine import BacktestResult
 from bot.strategy.adopted_universe import CHAMPION_DEFAULTS
 
 logger = logging.getLogger(__name__)
@@ -15,7 +18,6 @@ TRAIN_DAYS = 90
 TEST_DAYS = 14
 STEP_DAYS = 14
 MIN_WINDOWS = 4
-OPTUNA_TRIALS = 40  # Bayesian trials per window
 
 
 def _run_single_backtest(candles, params, target_strategy=None):
@@ -34,94 +36,6 @@ def _run_single_backtest(candles, params, target_strategy=None):
     )
     return params, result.total_pnl, result.sharpe_ratio, pf, ppf
 
-
-
-def _run_optuna_window(train_candles, test_candles, max_workers, target_strategy=None):
-    """Run Optuna Bayesian optimization on a single train/test window.
-
-    Two-phase approach:
-      Phase 1 (explore): generate 20 candidates via TPE, run all in parallel,
-                         feed results back to Optuna.
-      Phase 2 (exploit): generate 20 more candidates informed by Phase 1,
-                         run all in parallel.
-    Single persistent process pool across both phases to avoid spawn overhead.
-    """
-    import optuna
-    from concurrent.futures import ProcessPoolExecutor
-    from bot.backtest.engine import BacktestEngine
-
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-    study = optuna.create_study(
-        direction="maximize",
-        sampler=optuna.samplers.TPESampler(n_startup_trials=15),
-    )
-
-    # Seed with champion params
-    study.enqueue_trial(dict(CHAMPION_DEFAULTS))
-
-    half = OPTUNA_TRIALS // 2
-
-    # Single pool for both phases — avoids spawning 2 * max_workers processes
-    with ProcessPoolExecutor(max_workers=max_workers) as pool:
-        for phase in range(2):
-            # Ask Optuna for a batch of candidates
-            trials_and_params = []
-            for _ in range(half):
-                trial = study.ask()
-                params = {
-                    "atr_multiplier": trial.suggest_float("atr_multiplier", 2.5, 5.0, step=0.5),
-                    "rr_ratio": trial.suggest_float("rr_ratio", 2.0, 4.0, step=0.5),
-                    "base_risk_pct": trial.suggest_float("base_risk_pct", 2.0, 5.0, step=0.5),
-                    "min_profit_multiple": trial.suggest_float("min_profit_multiple", 2.0, 4.0, step=0.5),
-                    "max_hold_hours": trial.suggest_int("max_hold_hours", 48, 240, step=24),
-                    "quiet_atr_threshold": trial.suggest_float("quiet_atr_threshold", 0.8, 1.5, step=0.1),
-                    "regime_adx_threshold": trial.suggest_float("regime_adx_threshold", 20, 30, step=2),
-                    "ranging_adx_threshold": trial.suggest_float("ranging_adx_threshold", 15, 25, step=2),
-                }
-                trials_and_params.append((trial, params))
-
-            # Run all candidates in parallel across CPU cores
-            futures = {
-                pool.submit(_run_single_backtest, train_candles, params, target_strategy): (trial, params)
-                for trial, params in trials_and_params
-            }
-            for future in futures:
-                trial, params = futures[future]
-                try:
-                    _, pnl, sharpe, pf, ppf = future.result()
-                    # Penalize zero-trade results so Optuna avoids dead zones
-                    if pnl == 0.0 and sharpe == 0.0:
-                        sharpe = -10.0
-                        pf = 0.0
-                        ppf = 0.0
-                    # Normalize P&L to ~[-1, 1] range (€1000 = 1.0)
-                    pnl_norm = max(min(pnl / 1000.0, 3.0), -3.0)
-                    score = sharpe * 0.30 + pnl_norm * 0.30 + pf * 0.20 + ppf * 0.20
-                    study.tell(trial, score)
-                except Exception:
-                    study.tell(trial, float("-inf"))
-
-            if study.best_trial:
-                bp = study.best_params
-                logger.info(
-                    "Optuna phase %d/%d done — best score=%.2f | "
-                    "atr=%.1f rr=%.1f risk=%.1f hold=%dh",
-                    phase + 1, 2, study.best_value,
-                    bp.get("atr_multiplier", 0), bp.get("rr_ratio", 0),
-                    bp.get("base_risk_pct", 0), bp.get("max_hold_hours", 0),
-                )
-            else:
-                logger.info("Optuna phase %d/%d done — no valid trial", phase + 1, 2)
-
-    best_params = study.best_params
-    logger.info("Optuna best in-sample: score=%.2f, params=%s", study.best_value, best_params)
-
-    # Test the winner on out-of-sample data
-    test_engine = BacktestEngine(test_candles, strategy_params=best_params, slippage_pct=0.001, target_strategy=target_strategy)
-    test_result = test_engine.run()
-
-    return best_params, test_result
 
 
 @dataclass
@@ -149,7 +63,9 @@ class WFResult:
 class WalkForwardOptimizer:
     """Rolling walk-forward optimization using BacktestEngine."""
 
-    def __init__(self) -> None:
+    def __init__(self, rl_optimizer=None, candle_store=None) -> None:
+        self._rl_optimizer = rl_optimizer
+        self._candle_store = candle_store
         self._latest_result: Optional[WFResult] = None
         self._results_by_symbol: Dict[str, WFResult] = {}
         self._running = False
@@ -212,6 +128,58 @@ class WalkForwardOptimizer:
             and sharpe_std < 1.5
             and avg_ppf > 1.5
         )
+
+    def _run_rl_window(self, train_candles_5m, test_candles_5m,
+                        target_strategy=None):
+        """RL-driven parameter optimization for a single window."""
+        from bot.learning.feature_extractor import extract_features
+
+        if self._rl_optimizer is None or not self._rl_optimizer.has_model(target_strategy or ""):
+            return dict(CHAMPION_DEFAULTS), BacktestResult()
+
+        # Get 1m candles for feature extraction from CandleStore
+        features = np.zeros(27, dtype=np.float32)
+        if self._candle_store is not None and train_candles_5m:
+            try:
+                # Determine date range from 5m candles
+                if isinstance(train_candles_5m[0], dict):
+                    first_ts = train_candles_5m[0].get("timestamp", "")
+                    last_ts = train_candles_5m[-1].get("timestamp", "")
+                else:
+                    first_ts = train_candles_5m[0].timestamp
+                    last_ts = train_candles_5m[-1].timestamp
+
+                start = datetime.fromisoformat(str(first_ts).replace("Z", "+00:00"))
+                end = datetime.fromisoformat(str(last_ts).replace("Z", "+00:00"))
+
+                symbol = (train_candles_5m[0].get("symbol", "BTC-EUR")
+                          if isinstance(train_candles_5m[0], dict)
+                          else getattr(train_candles_5m[0], "symbol", "BTC-EUR"))
+
+                candles_1m = self._candle_store.get_candles(symbol, start, end, resample="1m")
+                btc_1m = None
+                if symbol != "BTC-EUR":
+                    btc_1m = self._candle_store.get_candles("BTC-EUR", start, end, resample="1m")
+                features = extract_features(candles_1m, btc_1m)
+            except Exception as e:
+                logger.warning("Feature extraction failed in walk-forward: %s", e)
+
+        # Predict parameters
+        params = self._rl_optimizer.predict(features, target_strategy or "orderflow")
+
+        # Run backtest on test candles (OOS validation)
+        try:
+            from bot.backtest.engine import BacktestEngine
+            test_engine = BacktestEngine(
+                test_candles_5m,
+                strategy_params=params,
+                target_strategy=target_strategy,
+            )
+            test_result = test_engine.run()
+        except Exception:
+            test_result = BacktestResult()
+
+        return params, test_result
 
     async def run(self, candle_fetcher=None, symbol: str = "BTC-EUR") -> WFResult:
         """Execute full walk-forward optimization for a single symbol."""
@@ -295,7 +263,6 @@ class WalkForwardOptimizer:
 
     async def _execute(self, candle_fetcher, symbol: str = "BTC-EUR") -> WFResult:
         import asyncio
-        from bot.backtest.engine import BacktestEngine
 
         total_days = TRAIN_DAYS + TEST_DAYS * MIN_WINDOWS
         windows_spec = self._generate_windows(total_days)
@@ -304,14 +271,11 @@ class WalkForwardOptimizer:
             logger.warning("Walk-forward: insufficient data for %d windows", MIN_WINDOWS)
             return WFResult()
 
-        logger.info("Walk-forward [%s]: Optuna Bayesian optimization, %d trials/window, %d windows",
-                     symbol, OPTUNA_TRIALS, len(windows_spec))
+        logger.info("Walk-forward [%s]: RL optimization, %d windows",
+                     symbol, len(windows_spec))
 
         loop = asyncio.get_running_loop()
         wf_windows: List[WFWindow] = []
-
-        import os
-        max_workers = os.cpu_count() or 4
 
         for i, ws in enumerate(windows_spec):
             if candle_fetcher is None:
@@ -323,11 +287,11 @@ class WalkForwardOptimizer:
             if not train_candles or not test_candles:
                 continue
 
-            logger.info("Walk-forward [%s]: window %d/%d (%d train, %d test candles, %d Optuna trials across %d cores)...",
-                        symbol, i + 1, len(windows_spec), len(train_candles), len(test_candles), OPTUNA_TRIALS, max_workers)
+            logger.info("Walk-forward [%s]: window %d/%d (%d train, %d test candles)...",
+                        symbol, i + 1, len(windows_spec), len(train_candles), len(test_candles))
 
             best_params, test_result = await loop.run_in_executor(
-                None, _run_optuna_window, train_candles, test_candles, max_workers
+                None, self._run_rl_window, train_candles, test_candles, None
             )
 
             logger.info("Walk-forward [%s]: window %d/%d done — sharpe=%.2f, pnl=€%.2f, params=%s",
@@ -364,7 +328,6 @@ class WalkForwardOptimizer:
     ) -> WFResult:
         """Execute walk-forward using pre-fetched candles (no API calls)."""
         import asyncio
-        import os
 
         total_days = TRAIN_DAYS + TEST_DAYS * MIN_WINDOWS
         windows_spec = self._generate_windows(total_days)
@@ -377,7 +340,6 @@ class WalkForwardOptimizer:
 
         loop = asyncio.get_running_loop()
         wf_windows: List[WFWindow] = []
-        max_workers = os.cpu_count() or 4
 
         for i, ws in enumerate(windows_spec):
             train_start = int(ws["train_start_day"] * candles_per_day)
@@ -393,13 +355,13 @@ class WalkForwardOptimizer:
 
             strat_label = f" [{target_strategy}]" if target_strategy else ""
             logger.info(
-                "Walk-forward [%s]%s: window %d/%d (%d train, %d test candles, %d Optuna trials across %d cores)...",
+                "Walk-forward [%s]%s: window %d/%d (%d train, %d test candles)...",
                 symbol, strat_label, i + 1, len(windows_spec),
-                len(train_candles), len(test_candles), OPTUNA_TRIALS, max_workers,
+                len(train_candles), len(test_candles),
             )
 
             best_params, test_result = await loop.run_in_executor(
-                None, _run_optuna_window, train_candles, test_candles, max_workers, target_strategy,
+                None, self._run_rl_window, train_candles, test_candles, target_strategy,
             )
 
             logger.info(
