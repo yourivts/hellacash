@@ -62,25 +62,20 @@ class CandleStore:
 
         loop = asyncio.get_running_loop()
 
-        # Start from now and walk backwards up to 180 days
+        # Start from now and walk backwards until the API returns no more data
         cursor_ms = int(_time.time() * 1000)
-        stop_ms = cursor_ms - 180 * 86_400_000
 
         # If we already have data, start from the oldest existing candle
         # (to fill in history before what we have)
         oldest_ts = self._get_oldest_timestamp(symbol)
         if oldest_ts:
-            oldest_ms = int(oldest_ts.timestamp() * 1000)
-            if oldest_ms <= stop_ms:
-                logger.info("CandleStore: %s already has data back to %s, skipping", symbol, oldest_ts)
-                return
-            cursor_ms = oldest_ms  # start from where existing data ends (going back)
+            cursor_ms = int(oldest_ts.timestamp() * 1000)
 
         total_stored = 0
         retries = 0
         max_retries = 3
 
-        while cursor_ms > stop_ms:
+        while True:
             url = f"{_API_BASE}/{symbol}/candles?interval=1m&end={cursor_ms}&limit=1440"
             try:
                 candles = await loop.run_in_executor(None, _api_get, url)
