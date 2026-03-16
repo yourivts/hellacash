@@ -12,12 +12,11 @@ import pandas as pd
 import numpy as np
 
 from bot.exchange.bitvavo_client import CandleData
-from bot.risk.fees import compute_trade_fees, get_taker_fee, get_maker_fee  # noqa: F401
 from bot.indicators.volatility import atr as compute_atr
 from bot.risk.position_sizer import fixed_fractional_size
-from bot.risk.stop_loss import initial_stops, trail_stop, check_stop_triggered
+from bot.risk.stop_loss import initial_stops, trail_stop
 from bot.risk.fee_gate import check_fee_gate
-from bot.strategy.base import MarketContext, Signal
+from bot.strategy.base import Signal
 from bot.strategy.confluence import check_confluence
 from bot.strategy.router import StrategyRouter, detect_regime, Regime
 
@@ -89,6 +88,7 @@ class _OpenPosition:
     highest_price: float
     strategy: str
     entry_bar: int = 0
+    entry_fee: float = 0.0
     # Range strategy fields
     tp_shifted: bool = False
     range_mid: float = 0.0
@@ -130,7 +130,6 @@ class BacktestEngine:
         params = strategy_params or {}
         self._atr_multiplier = params.get("atr_multiplier", 2.0)
         self._rr_ratio = params.get("rr_ratio", 2.0)
-        self._kelly_fraction = params.get("kelly_fraction", 0.25)  # kept for walk-forward compat
         self._base_risk_pct = params.get("base_risk_pct", 3.0)
         self._atr_pct_history: List[float] = []  # rolling ATR% for median computation
         self._min_confirmations = params.get("min_confirmations", 2)
@@ -721,6 +720,7 @@ class BacktestEngine:
             highest_price=slipped_price,
             strategy=signal.strategy_name,
             entry_bar=bar_index,
+            entry_fee=entry_fee,
         ))
         # Track entry regime for regime P&L breakdown
         self._trade_regime[id(self.positions[-1])] = regime.value if isinstance(regime, Regime) else str(regime)
@@ -880,8 +880,8 @@ class BacktestEngine:
             exit_fee_rate = TAKER_FEE_PCT
         exit_fee = slipped_exit * quantity * exit_fee_rate
         self._total_fees_paid += exit_fee
-        pnl = gross_pnl - exit_fee
-        pnl_pct = price_change_pct * 100.0
+        pnl = gross_pnl - exit_fee - pos.entry_fee
+        pnl_pct = (pnl / pos.size_eur) * 100.0 if pos.size_eur > 0 else 0.0
 
         # Return capital + P&L
         self.balance += pos.size_eur + pnl
@@ -948,7 +948,7 @@ class BacktestEngine:
         # Profit factor
         gross_wins = sum(t.pnl_eur for t in wins)
         gross_losses = abs(sum(t.pnl_eur for t in losses))
-        profit_factor = (gross_wins / gross_losses) if gross_losses > 0 else 0.0
+        profit_factor = (gross_wins / gross_losses) if gross_losses > 0 else 999.0
 
         # Profit per fee
         profit_per_fee = (total_pnl / self._total_fees_paid) if self._total_fees_paid > 0 else 0.0
