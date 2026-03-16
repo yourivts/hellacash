@@ -155,7 +155,7 @@ _limit_mgr: Optional[LimitOrderManager] = None
 def _get_limit_mgr() -> LimitOrderManager:
     global _limit_mgr
     if _limit_mgr is None:
-        _limit_mgr = LimitOrderManager()
+        _limit_mgr = LimitOrderManager(_get_client())
     return _limit_mgr
 
 
