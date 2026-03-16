@@ -128,9 +128,28 @@ This ensures that when Optuna optimizes `quiet_atr_threshold` and `regime_adx_th
 
 ### 3. Walk-Forward Per-Strategy Optimization (`bot/learning/walk_forward.py`)
 
-**New method: `run_multi_per_strategy()`**
+#### Candle prefetch optimization
 
-Replaces `run_multi()` as the primary entry point. For each symbol, runs walk-forward independently for each strategy:
+Currently each walk-forward window fetches candles separately via the API, causing massive redundancy (overlapping 180d windows re-fetch most of the same data). With per-strategy optimization this would be `25 symbols × 4 strategies × 8 fetches = 800 API calls`.
+
+**Fix: fetch once per symbol, slice in memory.**
+
+The caller (`_run_walk_forward` in `main.py`) fetches the full date range for each symbol (total_days = TRAIN_DAYS + TEST_DAYS × MIN_WINDOWS = 300 days) in a single API call, then passes the full candle array to `run_multi_per_strategy()`. The walk-forward slices it per window using array indexing — no additional API calls.
+
+```python
+# In main.py _run_walk_forward():
+for symbol in symbols:
+    all_candles = await fetch_full_range(symbol, total_days=300)
+    results[symbol] = await walk_forward.run_symbol_per_strategy(
+        all_candles, symbol, strategies
+    )
+```
+
+This reduces API calls from 800 to 25 (one per symbol). The same candle array is reused across all 4 strategies and all 4 windows for that symbol.
+
+#### New method: `run_multi_per_strategy()`
+
+Replaces `run_multi()` as the primary entry point. For each symbol, fetches candles once, then runs walk-forward independently for each strategy:
 
 ```python
 async def run_multi_per_strategy(
@@ -142,17 +161,36 @@ async def run_multi_per_strategy(
     strategies = strategies or ALL_STRATEGIES
     results = {}
     for symbol in symbols:
+        # Fetch all candles once for this symbol
+        all_candles = await self._fetch_full_range(candle_fetcher_factory, symbol)
         results[symbol] = {}
         for strategy in strategies:
-            fetcher = candle_fetcher_factory(symbol) if candle_fetcher_factory else None
-            result = await self._execute(
-                fetcher, symbol, target_strategy=strategy
+            result = await self._execute_from_candles(
+                all_candles, symbol, target_strategy=strategy
             )
             results[symbol][strategy] = result
     return results
 ```
 
-**`_execute()` gains `target_strategy` parameter**, passed through to `BacktestEngine`:
+#### `_execute_from_candles()` — new method replacing `_execute()`
+
+Takes the full candle array and slices per window instead of fetching:
+
+```python
+async def _execute_from_candles(
+    self, all_candles, symbol, target_strategy=None
+) -> WFResult:
+    windows_spec = self._generate_windows(total_days)
+    for ws in windows_spec:
+        train_candles = slice_candles(all_candles, ws["train_start_day"], ws["train_end_day"])
+        test_candles = slice_candles(all_candles, ws["test_start_day"], ws["test_end_day"])
+        best_params, test_result = await loop.run_in_executor(
+            None, _run_optuna_window, train_candles, test_candles, max_workers, target_strategy
+        )
+        ...
+```
+
+**`_run_optuna_window()` and `_run_single_backtest()` gain `target_strategy` parameter**, passed through to `BacktestEngine`:
 
 ```python
 engine = BacktestEngine(
@@ -161,9 +199,7 @@ engine = BacktestEngine(
 )
 ```
 
-Same change in `_run_optuna_window()` and `_run_single_backtest()`.
-
-**Compute budget:** 25 symbols × 4 strategies = 100 walk-forward optimizations. Each single-strategy backtest is faster (fewer trades), but the sequential outer loop is 4x longer. Estimated wall-clock: ~8-10h for a weekly run. The weekly scheduler (168h interval) easily accommodates this. If faster turnaround is needed, parallelism can be added at the strategy level within each symbol (4 strategies can run concurrently since they share the same candle data).
+**Compute budget:** 25 symbols × 4 strategies = 100 walk-forward optimizations. Each single-strategy backtest is faster (fewer trades). API calls reduced from 800 to 25. Estimated wall-clock: ~6-8h for a weekly run. The weekly scheduler (168h interval) easily accommodates this.
 
 **`_should_adopt()` is unchanged** — same criteria (median_sharpe > 0.3, 70%+ windows profitable, sharpe_std < 1.5, avg_ppf > 1.5) applied independently to each strategy-symbol combo.
 
@@ -348,13 +384,17 @@ Startup:
 
 Walk-Forward (weekly):
   run_multi_per_strategy(ALL tradeable symbols, ALL strategies)
-  For each symbol × strategy:
-    1. BacktestEngine(target_strategy="orderflow") → Optuna optimizes params
-       - Engine uses strategy_params for regime thresholds (not hardcoded)
-       - Confluence disabled (single strategy isolation)
-    2. 4 rolling windows: 180d train, 30d test
-    3. _should_adopt() applied independently to this combo
-    4. Store WFResult per strategy per symbol
+  For each symbol:
+    1. Fetch full 300-day candle range ONCE via API (single call)
+    2. For each strategy:
+       a. Slice candles per window from prefetched array (no API calls)
+       b. BacktestEngine(target_strategy="orderflow") → Optuna optimizes params
+          - Engine uses strategy_params for regime thresholds (not hardcoded)
+          - Confluence disabled (single strategy isolation)
+       c. 4 rolling windows: 180d train, 30d test
+       d. _should_adopt() applied independently to this combo
+       e. Store WFResult per strategy per symbol
+  API calls: 25 total (1 per symbol) instead of 800
   → _process_walk_forward_results()
     → universe.update(results)
       → for each symbol: collect adopted strategies + their params
