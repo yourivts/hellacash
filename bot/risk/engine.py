@@ -156,3 +156,22 @@ class RiskEngine:
     def get_recent_decisions(self, limit: int = 20) -> list:
         """Return the most recent risk decisions, newest first."""
         return list(self._recent_decisions)[:limit]
+
+
+def check_correlation_guard(
+    new_direction: str,
+    open_positions: list,
+    threshold: int = 3,
+) -> float:
+    """Returns position size multiplier based on directional concentration.
+
+    If 3+ open positions are in the same direction as the new trade,
+    reduce new position size by 50%.
+    """
+    same_direction = sum(
+        1 for p in open_positions
+        if p.get("direction") == new_direction
+    )
+    if same_direction >= threshold:
+        return 0.5
+    return 1.0

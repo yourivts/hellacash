@@ -75,7 +75,7 @@ class TestPositionSizeGate:
 class TestMaxPositionsGate:
     def test_too_many_positions(self):
         engine = RiskEngine(_make_settings())
-        decision = engine.approve(**_approve_defaults(open_position_count=5))
+        decision = engine.approve(**_approve_defaults(open_position_count=10))
         assert decision.approved is False
         assert decision.gate_details["max_positions"]["passed"] is False
 
@@ -109,3 +109,34 @@ class TestRingBuffer:
         assert len(decisions) == 2
         assert decisions[0]["approved"] is False  # most recent first
         assert decisions[1]["approved"] is True
+
+
+class TestCorrelationGuard:
+    def test_reduces_size_at_3_correlated_positions(self):
+        from bot.risk.engine import check_correlation_guard
+        open_positions = [
+            {"symbol": "BTC-EUR", "direction": "LONG"},
+            {"symbol": "ETH-EUR", "direction": "LONG"},
+            {"symbol": "SOL-EUR", "direction": "LONG"},
+        ]
+        multiplier = check_correlation_guard(new_direction="LONG", open_positions=open_positions)
+        assert multiplier == 0.5
+
+    def test_no_reduction_below_3(self):
+        from bot.risk.engine import check_correlation_guard
+        open_positions = [
+            {"symbol": "BTC-EUR", "direction": "LONG"},
+            {"symbol": "ETH-EUR", "direction": "LONG"},
+        ]
+        multiplier = check_correlation_guard(new_direction="LONG", open_positions=open_positions)
+        assert multiplier == 1.0
+
+    def test_opposite_direction_no_reduction(self):
+        from bot.risk.engine import check_correlation_guard
+        open_positions = [
+            {"symbol": "BTC-EUR", "direction": "SHORT"},
+            {"symbol": "ETH-EUR", "direction": "SHORT"},
+            {"symbol": "SOL-EUR", "direction": "SHORT"},
+        ]
+        multiplier = check_correlation_guard(new_direction="LONG", open_positions=open_positions)
+        assert multiplier == 1.0

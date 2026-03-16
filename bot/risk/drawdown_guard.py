@@ -27,7 +27,7 @@ class DrawdownGuard:
         self,
         max_drawdown_pct: float = 8.0,
         soft_drawdown_pct: float = 3.0,
-        daily_loss_limit_eur: float = 200.0,
+        daily_loss_limit_eur: float = 50.0,
         paper_mode: bool = False,
     ) -> None:
         self.max_drawdown_pct = max_drawdown_pct
