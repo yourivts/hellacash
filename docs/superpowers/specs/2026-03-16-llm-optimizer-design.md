@@ -2,7 +2,7 @@
 
 ## Goal
 
-Replace Optuna's blind Bayesian optimization with a local LLM agent (Ollama + Llama 3 8B) that reasons about market conditions and backtest results to propose better trading parameters in fewer trials.
+Replace Optuna's blind Bayesian optimization with a local LLM agent (Ollama + Qwen 3 8B) that reasons about market conditions and backtest results to propose better trading parameters in fewer trials.
 
 ## Motivation
 
@@ -47,11 +47,12 @@ def refine_params(
 
 Configuration:
 - Ollama endpoint: `http://localhost:11434` (configurable via `OLLAMA_URL` env var)
-- Model: `llama3` (configurable via `OLLAMA_MODEL` env var)
+- Model: `qwen3:8b` (configurable via `OLLAMA_MODEL` env var)
 - Quantization: Q4_K_M recommended (fits in ~4.5 GB VRAM on RTX 2060 Super 8 GB)
 - Timeout: 120s per call
 - Temperature: 0.7 (enough creativity to explore, not so high it hallucinates)
 - `num_predict`: 1024 (sufficient for JSON array of 6 param sets)
+- Use non-thinking mode (`/no_think` prefix or `enable_thinking: false`) — we want fast structured JSON output, not chain-of-thought reasoning
 
 Response parsing:
 - Extract JSON array from response (handle markdown code fences via regex `\[.*\]` with `re.DOTALL`)
@@ -102,7 +103,7 @@ Includes RSI and ADX columns for regime context.
 
 ### Context Budget
 
-Llama 3 8B has an 8,192-token context window. Budget breakdown:
+Qwen 3 8B has a 32,768-token context window (128K with YaRN). Our prompts use ~5,100 tokens — well within budget with no truncation needed.
 
 | Component | Estimated tokens |
 |-----------|-----------------|
@@ -114,11 +115,9 @@ Llama 3 8B has an 8,192-token context window. Budget breakdown:
 | Round 2 results table (if refine) | ~300 |
 | **Total input** | **~5,100** |
 | Reserved for output (6 JSON objects) | ~800 |
-| **Safety margin** | **~2,300** |
+| **Remaining context** | **~26,000** |
 
-**Token estimation:** Use `len(prompt) // 3` as a conservative character-to-token estimate. CSV data with numbers tokenizes less efficiently than English prose (~3 chars/token vs ~4), so the conservative divisor prevents underestimation.
-
-**Fallback if over budget:** If the estimated token count exceeds 6,000 tokens, truncate daily candles to the most recent 60 days. This is expected to trigger for some symbols with longer price strings. The truncated version still provides sufficient trend context while fitting comfortably within the 8K window.
+With 32K context, truncation is unnecessary. The full 90-day daily candle table and 7-day 4h candle table fit comfortably. No fallback truncation logic is needed.
 
 ### Modified Component
 
@@ -398,7 +397,7 @@ On Windows with Docker Desktop, `host.docker.internal` resolves automatically, b
 | GPU usage | None | ~4-5 GB VRAM during LLM calls |
 | API cost | Free | Free (local) |
 
-Note: LLM calls are ~20-30s each on RTX 2060 Super with Q4_K_M quantization. The trade-off is slower wall time for smarter, market-aware parameter selection. The total trial count drops from 40 to 12-18, meaning fewer backtests overall.
+Note: LLM calls are ~20-30s each on RTX 2060 Super with Q4_K_M quantization (~40 tokens/sec). Using non-thinking mode keeps responses fast and focused on JSON output. The trade-off is slower wall time for smarter, market-aware parameter selection. The total trial count drops from 40 to 12-18, meaning fewer backtests overall.
 
 Threading: `_run_llm_window` runs in the default `ThreadPoolExecutor` via `run_in_executor(None, ...)`. LLM HTTP calls block one thread for 20-30s each. This is fine because walk-forward runs symbols sequentially (one at a time). If parallel symbol optimization is added later, a dedicated thread pool or async HTTP client would be needed.
 
@@ -412,7 +411,7 @@ Threading: `_run_llm_window` runs in the default `ThreadPoolExecutor` via `run_i
 ## Dependencies
 
 - **Ollama** installed and running on host (not in Docker)
-- **Llama 3 8B** Q4_K_M quantization pulled via `ollama pull llama3`
+- **Qwen 3 8B** Q4_K_M quantization pulled via `ollama pull qwen3:8b`
 - **`requests`** library (already in requirements.txt) for Ollama HTTP calls
 - Bot connects to Ollama via `OLLAMA_URL` env var (default `http://localhost:11434`)
 - For Docker: bot container needs `extra_hosts` mapping and `OLLAMA_URL` env var (see Docker Networking section)
