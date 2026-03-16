@@ -12,14 +12,22 @@ import pandas as pd
 import numpy as np
 
 from bot.exchange.bitvavo_client import CandleData
-from bot.risk.fees import compute_trade_fees, get_taker_fee
+from bot.risk.fees import compute_trade_fees, get_taker_fee, get_maker_fee  # noqa: F401
 from bot.indicators.volatility import atr as compute_atr
 from bot.risk.position_sizer import fixed_fractional_size
 from bot.risk.stop_loss import initial_stops, trail_stop, check_stop_triggered
+from bot.risk.fee_gate import check_fee_gate
 from bot.strategy.base import MarketContext, Signal
-from bot.strategy.router import StrategyRouter, detect_regime
+from bot.strategy.confluence import check_confluence
+from bot.strategy.router import StrategyRouter, detect_regime, Regime
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Fee model constants
+# ---------------------------------------------------------------------------
+MAKER_FEE_PCT = 0.0015   # 0.15% maker fee (limit order)
+TAKER_FEE_PCT = 0.0025   # 0.25% taker fee (market order)
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -38,6 +46,7 @@ class TradeRecord:
     pnl_pct: float
     exit_reason: str
     strategy: str
+    regime: str = "neutral"
 
 
 @dataclass
@@ -53,6 +62,15 @@ class BacktestResult:
     avg_win_pct: float = 0.0
     avg_loss_pct: float = 0.0
     trade_log: List[TradeRecord] = field(default_factory=list)
+    # New metrics from engine overhaul
+    profit_factor: float = 0.0
+    total_fees_paid: float = 0.0
+    profit_per_fee: float = 0.0
+    signals_generated: int = 0
+    signals_filled: int = 0
+    fill_rate: float = 0.0
+    quiet_hours_skipped: int = 0
+    regime_pnl: Dict[str, float] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +112,7 @@ class BacktestEngine:
         self,
         candles: List[CandleData | Dict[str, Any]],
         initial_capital: float = 10_000.0,
-        max_open_positions: int = 3,
+        max_open_positions: int = 10,
         slippage_pct: float = 0.001,
         strategy_params: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -132,16 +150,18 @@ class BacktestEngine:
 
         # Range strategy: bounce counter per symbol
         self._range_bounces: Dict[str, int] = {}
-        # Range strategy: max hold = 24h = 288 5m bars (hardcoded, not walk-forward)
-        self._range_max_hold_bars = 288
+        # Range strategy: max hold = 72h = 864 5m bars (hardcoded, not walk-forward)
+        self._range_max_hold_bars = 864
+
+        # Tracking counters for new metrics
+        self._total_fees_paid: float = 0.0
+        self._signals_generated: int = 0
+        self._signals_filled: int = 0
+        self._quiet_hours_skipped: int = 0
+        self._regime_pnl: Dict[str, float] = {}
+        self._trade_regime: Dict[int, str] = {}  # pos id -> regime at entry
 
         self._router = StrategyRouter()
-        if strategy_params:
-            self._router.update_hybrid_params(
-                sentiment_weight=params.get("sentiment_weight", 0.25),
-                entry_threshold=params.get("entry_threshold", 0.40),
-                indicator_weights=self._indicator_weights,
-            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -149,7 +169,7 @@ class BacktestEngine:
 
     # How often (in 5m candles) to run signal generation.
     # Stops are still checked every candle for safety.
-    SIGNAL_EVERY = 4  # every 4 x 5m = 20 min (more entry opportunities)
+    SIGNAL_EVERY = 12  # every 12 x 5m = 1h (matches 1h strategy evaluation)
 
     def run(self) -> BacktestResult:
         """Execute the full backtest and return the result summary."""
@@ -163,6 +183,8 @@ class BacktestEngine:
         df_4h = self._resample_4h(df)
         df_1d = self._resample_1d(df)
         symbol = df.attrs.get("symbol", "BTC-EUR")
+
+        n = len(df)
 
         # Pre-extract numpy arrays for fast per-candle access
         closes = df["close"].values
@@ -180,11 +202,15 @@ class BacktestEngine:
         precomp_4h = self._precompute_signals(df_4h, symbol)
         precomp_1d = self._precompute_signals(df_1d, symbol)
 
-        # Pre-compute regime for each 1h bar
+        # Pre-compute 4h regime arrays (regime detection uses 4h data)
         from bot.indicators.trend import adx as compute_adx
-        regime_adx = compute_adx(df_1h["high"], df_1h["low"], df_1h["close"]).values
-        regime_atr = compute_atr(df_1h["high"], df_1h["low"], df_1h["close"]).values
-        regime_close = df_1h["close"].values
+        regime_adx_4h = compute_adx(df_4h["high"], df_4h["low"], df_4h["close"]).values
+        regime_atr_4h = compute_atr(df_4h["high"], df_4h["low"], df_4h["close"]).values
+        regime_close_4h = df_4h["close"].values
+        # Also keep 1h arrays for ATR% (used in position sizing)
+        regime_atr_1h = compute_atr(df_1h["high"], df_1h["low"], df_1h["close"]).values
+        regime_close_1h = df_1h["close"].values
+
         h1_timestamps = df_1h.index
         h4_timestamps = df_4h.index
         h1d_timestamps = df_1d.index
@@ -195,7 +221,7 @@ class BacktestEngine:
         _prev_signal_dir: Optional[str] = None
         _signal_streak: int = 0
 
-        for i in range(self.WARMUP, len(df)):
+        for i in range(self.WARMUP, n):
             current_price = closes[i]
             current_time = str(timestamps[i])
 
@@ -232,31 +258,42 @@ class BacktestEngine:
                 equity_curve.append(current_equity)
                 continue
 
-            # Find corresponding 1h bar index
+            # Find corresponding 1h, 4h, 1d bar indices
             current_ts = timestamps[i]
             h1_idx = h1_timestamps.searchsorted(current_ts, side="right") - 1
             if h1_idx < 30:
                 equity_curve.append(current_equity)
                 continue
+            h4_idx = h4_timestamps.searchsorted(current_ts, side="right") - 1
+            h1d_idx = h1d_timestamps.searchsorted(current_ts, side="right") - 1
 
-            # Fast regime detection from pre-computed arrays
-            adx_val = regime_adx[h1_idx]
-            atr_val_h = regime_atr[h1_idx]
-            price_h = regime_close[h1_idx]
-            atr_pct = (atr_val_h / price_h) * 100.0 if price_h > 0 else 0.0
-            if atr_pct > 3.0:
-                regime = "volatile"
-            elif adx_val > 25:
-                regime = "trending"
-            elif adx_val < 20:
-                regime = "ranging"
+            # --- 4h regime detection (matches detect_regime() priority order) ---
+            atr_val_4h = regime_atr_4h[h4_idx] if 0 <= h4_idx < len(regime_atr_4h) else 0
+            price_4h = regime_close_4h[h4_idx] if 0 <= h4_idx < len(regime_close_4h) else current_price
+            adx_4h = regime_adx_4h[h4_idx] if 0 <= h4_idx < len(regime_adx_4h) else 20
+            atr_pct_4h = (atr_val_4h / price_4h * 100.0) if price_4h > 0 else 0.0
+
+            if atr_pct_4h < 1.0:
+                regime = Regime.QUIET
+            elif atr_pct_4h > 4.0:
+                regime = Regime.VOLATILE
+            elif adx_4h > 25:
+                regime = Regime.TRENDING
+            elif adx_4h < 20:
+                regime = Regime.RANGING
             else:
-                regime = "unknown"
+                regime = Regime.NEUTRAL
 
-            # Gate: skip entries when ADX is too low (no clear trend)
-            if adx_val < self._min_adx:
+            # Skip entries during QUIET regime
+            if regime == Regime.QUIET:
+                self._quiet_hours_skipped += 1
                 equity_curve.append(current_equity)
                 continue
+
+            # Compute 1h ATR% for position sizing
+            atr_val_1h = regime_atr_1h[h1_idx] if 0 <= h1_idx < len(regime_atr_1h) else 0
+            price_1h = regime_close_1h[h1_idx] if 0 <= h1_idx < len(regime_close_1h) else current_price
+            atr_pct = (atr_val_1h / price_1h) * 100.0 if price_1h > 0 else 0.0
 
             # Gate: skip entries when volatility is too low to cover fees
             if atr_pct < self._min_atr_pct:
@@ -264,13 +301,8 @@ class BacktestEngine:
                 continue
 
             strategies = self._router.get_strategies(regime)
-            size_modifier = self._router.position_size_modifier(regime)
 
-            # Find corresponding 4h and 1d bar indices
-            h4_idx = h4_timestamps.searchsorted(current_ts, side="right") - 1
-            h1d_idx = h1d_timestamps.searchsorted(current_ts, side="right") - 1
-
-            # Look up pre-computed signal scores instead of recomputing
+            # Look up pre-computed signal scores and run strategy evaluate_1h()
             best_signal = self._evaluate_precomputed(
                 strategies, symbol, current_price, i, h1_idx,
                 precomp_5m, precomp_1h, regime,
@@ -294,12 +326,47 @@ class BacktestEngine:
                 best_signal is not None
                 and best_signal.direction in ("LONG", "SHORT")
                 and best_signal.strength > 0
-                and best_signal.indicator_snapshot.get("confirming_count", 0) >= self._min_confirmations
                 and _signal_streak >= self._consecutive_confirms
                 and len(self.positions) < self.max_open
             ):
+                self._signals_generated += 1
+                direction = best_signal.direction
+
+                # --- Fill rate model: check if limit order would fill ---
+                limit_price = current_price
+                if i + 1 < n:
+                    if direction == "LONG" and lows[i + 1] > limit_price:
+                        equity_curve.append(current_equity)
+                        continue  # limit not filled
+                    elif direction == "SHORT" and highs[i + 1] < limit_price:
+                        equity_curve.append(current_equity)
+                        continue  # limit not filled
+
+                self._signals_filled += 1
+
                 # Use 1h candles for ATR-based stop calculation (5m ATR is too tight)
                 window_1h = df_1h.iloc[max(0, h1_idx - 100): h1_idx + 1]
+
+                # Compute stops early for fee gate check
+                sl, tp = initial_stops(
+                    current_price, window_1h, direction=direction,
+                    atr_multiplier=self._atr_multiplier,
+                    rr_ratio=self._rr_ratio,
+                    total_fee_pct=(MAKER_FEE_PCT + TAKER_FEE_PCT) * 100.0,
+                )
+
+                # --- Fee gate: reject trades where fees eat the profit ---
+                tp_distance_pct = abs(tp - current_price) / current_price * 100.0 if current_price > 0 else 0.0
+                size_eur_est = self._compute_position_size(1.0, current_price, atr_pct=atr_pct)
+                fee_result = check_fee_gate(
+                    position_size=size_eur_est,
+                    tp_distance_pct=tp_distance_pct,
+                    is_short=(direction == "SHORT"),
+                )
+                if not fee_result.approved:
+                    equity_curve.append(current_equity)
+                    continue
+
                 # Track rolling ATR% for median computation in position sizer
                 if atr_pct > 0:
                     self._atr_pct_history.append(atr_pct)
@@ -307,14 +374,15 @@ class BacktestEngine:
                         self._atr_pct_history = self._atr_pct_history[-200:]
                 self._open_position(
                     best_signal, current_price, current_time,
-                    window_1h, size_modifier, bar_index=i,
+                    window_1h, 1.0, bar_index=i,
                     atr_pct=atr_pct,
+                    regime=regime,
                 )
 
             equity_curve.append(current_equity)
 
         # Close any remaining positions at last price
-        if len(df) > 0:
+        if n > 0:
             last_price = closes[-1]
             last_time = str(timestamps[-1])
             for pos in list(self.positions):
@@ -428,474 +496,141 @@ class BacktestEngine:
 
         return result
 
-    def _score_from_precomputed(self, p: Dict[str, Any], idx: int) -> float:
-        """Compute composite technical score from pre-computed indicator arrays."""
-        if idx < 0 or idx >= len(p["close"]):
-            return 0.0
-
-        scores = {}
-        # RSI
-        r = p["rsi"][idx]
-        if r < 30:
-            scores["rsi"] = 1.0
-        elif r < 40:
-            scores["rsi"] = 0.5
-        elif r > 70:
-            scores["rsi"] = -1.0
-        elif r > 60:
-            scores["rsi"] = -0.5
-        else:
-            scores["rsi"] = 0.0
-
-        # MACD
-        hist = p["macd_hist"][idx]
-        prev_hist = p["macd_hist"][idx - 1] if idx > 0 else 0.0
-        if hist > 0 and hist > prev_hist:
-            scores["macd"] = 1.0
-        elif hist > 0:
-            scores["macd"] = 0.4
-        elif hist < 0 and hist < prev_hist:
-            scores["macd"] = -1.0
-        elif hist < 0:
-            scores["macd"] = -0.4
-        else:
-            scores["macd"] = 0.0
-
-        # Bollinger
-        pct_b = p["bb_pct_b"][idx]
-        if pct_b < 0.05:
-            scores["bollinger"] = 1.0
-        elif pct_b < 0.2:
-            scores["bollinger"] = 0.5
-        elif pct_b > 0.95:
-            scores["bollinger"] = -1.0
-        elif pct_b > 0.8:
-            scores["bollinger"] = -0.5
-        else:
-            scores["bollinger"] = 0.0
-
-        # EMA trend (4 conditions to match composite.py)
-        price = p["close"][idx]
-        e20 = p["ema20"][idx]
-        e50 = p["ema50"][idx]
-        e200 = p["ema200"][idx]
-        bullish = sum([price > e20, price > e50, price > e200, e20 > e50])
-        scores["ema_trend"] = (bullish - 2) / 2  # maps 0-4 to -1..+1
-
-        # Supertrend
-        scores["supertrend"] = float(p["supertrend"][idx])
-
-        # Volume
-        vsr = p["vsr"][idx]
-        if idx > 0:
-            price_change = (p["close"][idx] - p["close"][idx - 1]) / p["close"][idx - 1] if p["close"][idx - 1] > 0 else 0
-        else:
-            price_change = 0.0
-        if vsr > 1.5:
-            scores["volume"] = 1.0 if price_change > 0 else -1.0
-        elif vsr > 1.2:
-            scores["volume"] = 0.5 if price_change > 0 else -0.5
-        else:
-            scores["volume"] = 0.0
-
-        # CCI
-        c = p["cci"][idx]
-        if c < -100:
-            scores["cci"] = 1.0
-        elif c < -50:
-            scores["cci"] = 0.4
-        elif c > 100:
-            scores["cci"] = -1.0
-        elif c > 50:
-            scores["cci"] = -0.4
-        else:
-            scores["cci"] = 0.0
-
-        # Leading: RSI divergence
-        rsi_div = p["rsi_div"][idx] if "rsi_div" in p else 0.0
-        scores["rsi_divergence"] = float(rsi_div)
-
-        # Leading: Volume divergence
-        vol_div = p["vol_div"][idx] if "vol_div" in p else 0.0
-        scores["volume_divergence"] = float(vol_div)
-
-        # ADX modifier
-        a = p["adx"][idx]
-        adx_multiplier = min(a / 25.0, 2.0) if a > 20 else 0.5
-
-        # Weighted composite (use params or defaults matching composite.py)
-        w = self._indicator_weights or {
-            "rsi": 0.15, "macd": 0.15, "bollinger": 0.10, "ema_trend": 0.10,
-            "supertrend": 0.10, "volume": 0.05, "cci": 0.05,
-            "rsi_divergence": 0.15, "volume_divergence": 0.10,
-        }
-        raw = sum(scores.get(k, 0) * w[k] for k in w)
-        total_w = sum(w.values())
-        if total_w > 0:
-            raw /= total_w
-        raw = max(-1.0, min(1.0, raw * adx_multiplier))
-        return raw
-
     def _evaluate_precomputed(
         self, strategies, symbol, current_price, idx_5m, idx_1h,
         precomp_5m, precomp_1h, regime,
         h4_idx=0, h1d_idx=0, precomp_4h=None, precomp_1d=None,
     ) -> Optional[Signal]:
-        """Evaluate strategies using pre-computed indicator values."""
-        from bot.strategy.mtf_voter import REGIME_WEIGHTS, BASE_WEIGHTS
-
-        best_signal: Optional[Signal] = None
-
-        # Higher-timeframe trend filters
-        h1_ema20 = precomp_1h["ema20"][idx_1h] if idx_1h < len(precomp_1h["ema20"]) else 0
-        h1_ema50 = precomp_1h["ema50"][idx_1h] if idx_1h < len(precomp_1h["ema50"]) else 0
-        h1_ema200 = precomp_1h["ema200"][idx_1h] if idx_1h < len(precomp_1h["ema200"]) else 0
-        h1_trend_bull = h1_ema20 > h1_ema50
-        h1_trend_bear = h1_ema20 < h1_ema50
-        # EMA200 regime: determines allowed trade direction for directional strategies
-        price_above_ema200 = current_price > h1_ema200 if h1_ema200 > 0 else True
-        price_below_ema200 = current_price < h1_ema200 if h1_ema200 > 0 else True
-        # Strong trend filter: both EMA20/50 alignment + EMA200
-        strong_bull = h1_trend_bull and price_above_ema200
-        strong_bear = h1_trend_bear and price_below_ema200
+        """Evaluate strategies using their evaluate_1h() methods and confluence gate."""
+        collected_signals: List[Dict[str, Any]] = []
 
         for strat in strategies:
             try:
-                if strat.name == "hybrid":
-                    # Replicate MTF voter logic with pre-computed scores
-                    score_5m = self._score_from_precomputed(precomp_5m, idx_5m)
-                    score_1h = self._score_from_precomputed(precomp_1h, idx_1h)
+                direction = "NEUTRAL"
+                strength = 0.0
 
-                    score_4h = self._score_from_precomputed(precomp_4h, h4_idx) if precomp_4h and h4_idx >= 0 else score_1h
-                    score_1d = self._score_from_precomputed(precomp_1d, h1d_idx) if precomp_1d and h1d_idx >= 0 else score_1h
-                    tf_scores = {"15m": score_5m, "1h": score_1h, "4h": score_4h, "1d": score_1d}
-                    weights = REGIME_WEIGHTS.get(regime, BASE_WEIGHTS)
-                    total_w = sum(weights.values())
-                    mtf_score = sum(tf_scores[tf] * weights[tf] for tf in tf_scores) / total_w if total_w > 0 else 0.0
-                    mtf_score = max(-1.0, min(1.0, mtf_score))
-
-                    # Agreement check
-                    non_neutral = {tf: s for tf, s in tf_scores.items() if abs(s) >= 0.15}
-                    if len(non_neutral) >= 2:
-                        bullish = sum(1 for s in non_neutral.values() if s > 0)
-                        agreement = max(bullish, len(non_neutral) - bullish) / len(non_neutral)
-                        if agreement < 0.5:
-                            mtf_score *= 0.5
-
-                    # Tech weight dominates in backtest (no sentiment/onchain/orderbook)
-                    final_score = mtf_score
-                    strength = min(abs(final_score), 1.0)
-                    threshold = strat.entry_threshold
-                    if final_score > threshold:
-                        direction = "LONG"
-                    elif final_score < -threshold:
-                        direction = "SHORT"
-                    else:
-                        direction = "NEUTRAL"
-
-                    confirming = sum(1 for s in tf_scores.values() if s * final_score > 0)
-                    sig = Signal(
-                        symbol=symbol, direction=direction, strength=strength,
-                        strategy_name="hybrid", technical_score=final_score,
-                        indicator_snapshot={"confirming_count": confirming},
-                    )
-
-                elif strat.name == "breakout":
-                    # Breakout: price exceeds recent 5m range with volume confirmation
-                    lookback = 20
-                    if idx_5m < lookback + 5:
+                if strat.name == "orderflow":
+                    if idx_1h < 2:
                         continue
-                    h = precomp_5m["high"]
-                    l = precomp_5m["low"]
-                    recent_high = np.max(h[idx_5m - lookback:idx_5m])
-                    recent_low = np.min(l[idx_5m - lookback:idx_5m])
-                    price = current_price
-                    vsr = precomp_5m["vsr"][idx_5m]
-
-                    direction = "NEUTRAL"
-                    strength = 0.0
-                    if price > recent_high and vsr >= 1.3:
-                        direction = "LONG"
-                        strength = min(vsr / 3.0, 1.0)
-                    elif price < recent_low and vsr >= 1.3:
-                        direction = "SHORT"
-                        strength = min(vsr / 3.0, 1.0)
-
-                    # EMA200 trend filter: block counter-trend breakouts
-                    if direction == "LONG" and not price_above_ema200:
-                        direction = "NEUTRAL"
-                        strength = 0.0
-                    elif direction == "SHORT" and not price_below_ema200:
-                        direction = "NEUTRAL"
-                        strength = 0.0
-
-                    confirming = 0
-                    if direction != "NEUTRAL":
-                        confirming = 1  # volume confirmed
-                        if precomp_5m["adx"][idx_5m] > 20:
-                            confirming += 1
-                        macd_agrees = (precomp_5m["macd_hist"][idx_5m] > 0) == (direction == "LONG")
-                        if macd_agrees:
-                            confirming += 1
-
-                    sig = Signal(symbol=symbol, direction=direction, strength=strength,
-                                 strategy_name="breakout", technical_score=strength if direction == "LONG" else -strength,
-                                 indicator_snapshot={"confirming_count": confirming})
-
-                elif strat.name == "range":
-                    # Range trading: BB + RSI + volume profile at 5m, BB bandwidth + ADX at 1h
-                    if idx_5m < 200:
-                        continue
-
-                    # 1h range confirmation
-                    bw_1h = precomp_1h["bb_bandwidth"][idx_1h] if idx_1h < len(precomp_1h.get("bb_bandwidth", [])) else 1.0
-                    adx_1h = precomp_1h["adx"][idx_1h] if idx_1h < len(precomp_1h["adx"]) else 50.0
-
-                    # Check bounce counter reset
-                    if bw_1h > 0.15 or adx_1h > 25:
-                        self._range_bounces[symbol] = 0
-
-                    # Range not confirmed
-                    if bw_1h >= 0.10 or bw_1h < 0.02 or adx_1h >= 20:
-                        continue
-
-                    # Bounce limit
-                    if self._range_bounces.get(symbol, 0) >= 3:
-                        continue
-
-                    # 5m entry trigger
-                    price = current_price
-                    bb_upper = precomp_5m["bb_upper"][idx_5m]
-                    bb_lower = precomp_5m["bb_lower"][idx_5m]
-                    bb_mid = precomp_5m["bb_mid"][idx_5m]
-                    rsi_val = precomp_5m["rsi"][idx_5m]
-                    vol_score = precomp_5m["vol_profile"][idx_5m]
-
-                    direction = "NEUTRAL"
-                    confirming = 0
-
-                    # LONG: price within 1% of lower BB + RSI < 40 + volume support
-                    if bb_lower > 0 and abs(price - bb_lower) / bb_lower <= 0.01 and rsi_val < 40:
-                        if vol_score > 0.10:
-                            direction = "LONG"
-                            confirming = 1
-                            if abs(price - bb_lower) / bb_lower <= 0.005:
-                                confirming += 1
-                            if vol_score > 0.3:
-                                confirming += 1
-                    # SHORT: price within 1% of upper BB + RSI > 60 + volume resistance
-                    elif bb_upper > 0 and abs(price - bb_upper) / bb_upper <= 0.01 and rsi_val > 60:
-                        if vol_score < -0.10:
-                            direction = "SHORT"
-                            confirming = 1
-                            if abs(price - bb_upper) / bb_upper <= 0.005:
-                                confirming += 1
-                            if vol_score < -0.3:
-                                confirming += 1
-
-                    strength = 0.0
-                    if direction != "NEUTRAL":
-                        strength = min(abs(vol_score) + (1.0 - bw_1h / 0.10) * 0.5, 1.0)
-
-                    sig = Signal(
-                        symbol=symbol, direction=direction, strength=strength,
-                        strategy_name="range",
-                        technical_score=strength if direction == "LONG" else -strength,
-                        indicator_snapshot={
-                            "confirming_count": confirming,
-                            "range_mid": float(bb_mid),
-                            "range_upper": float(bb_upper),
-                            "range_lower": float(bb_lower),
-                            "bounce_count": self._range_bounces.get(symbol, 0),
-                        },
-                    )
-
-                elif strat.name == "trend_following":
-                    # Trend following: EMA alignment + ADX strength + MACD
-                    if idx_5m < 52:
-                        continue
-                    e20 = precomp_5m["ema20"]
-                    e50 = precomp_5m["ema50"]
-                    a = precomp_5m["adx"][idx_5m]
-                    trending = a > 20
-                    macd_bull = precomp_5m["macd_hist"][idx_5m] > 0
-                    macd_bear = precomp_5m["macd_hist"][idx_5m] < 0
-
-                    ema_bull = e20[idx_5m] > e50[idx_5m]
-                    ema_bear = e20[idx_5m] < e50[idx_5m]
-                    spread_pct = abs(e20[idx_5m] - e50[idx_5m]) / e50[idx_5m] * 100 if e50[idx_5m] > 0 else 0
-                    aligned = spread_pct > 0.1
-
-                    direction = "NEUTRAL"
-                    strength = 0.0
-                    # Require 1h EMA200 agreement: only trade with the macro trend
-                    if ema_bull and macd_bull and trending and aligned and price_above_ema200:
-                        direction = "LONG"
-                        strength = min(a / 50.0, 1.0)
-                    elif ema_bear and macd_bear and trending and aligned and price_below_ema200:
-                        direction = "SHORT"
-                        strength = min(a / 50.0, 1.0)
-
-                    confirming = 0
-                    if direction != "NEUTRAL":
-                        confirming = 1  # EMA aligned
-                        if trending:
-                            confirming += 1
-                        if (macd_bull and direction == "LONG") or (macd_bear and direction == "SHORT"):
-                            confirming += 1
-
-                    sig = Signal(symbol=symbol, direction=direction, strength=strength,
-                                 strategy_name="trend_following",
-                                 technical_score=strength if direction == "LONG" else -strength,
-                                 indicator_snapshot={"confirming_count": confirming})
-                elif strat.name == "funding_contrarian":
-                    # Funding Rate Contrarian: use RSI + momentum extremes as
-                    # proxy for extreme funding rates (crowded leverage).
-                    # Extreme RSI + declining momentum = overleveraged crowd
-                    if idx_5m < 30:
-                        continue
-
-                    rsi_val = precomp_5m["rsi"][idx_5m]
-                    rsi_prev = precomp_5m["rsi"][idx_5m - 6] if idx_5m >= 6 else 50.0
-                    macd_h = precomp_5m["macd_hist"][idx_5m]
-                    macd_h_prev = precomp_5m["macd_hist"][idx_5m - 1] if idx_5m > 0 else 0.0
-
-                    # 1h confirmation: needs higher TF exhaustion too
-                    rsi_1h = precomp_1h["rsi"][idx_1h] if idx_1h < len(precomp_1h["rsi"]) else 50.0
-
-                    direction = "NEUTRAL"
-                    strength = 0.0
-                    confirming = 0
-
-                    # Volume confirmation: need above-average volume for conviction
-                    vsr = precomp_5m["vsr"][idx_5m]
-
-                    # Crowded longs (extreme overbought) → SHORT
-                    # RSI > 78 on 5m AND RSI > 60 on 1h AND MACD fading AND volume
-                    if rsi_val > 78 and rsi_1h > 60 and macd_h < macd_h_prev and vsr >= 1.2:
-                        direction = "SHORT"
-                        strength = min((rsi_val - 70) / 30.0 + 0.3, 1.0)
-                        confirming = 1
-                        if rsi_val > 82:
-                            confirming += 1
-                        if rsi_prev > 72:  # sustained overbought
-                            confirming += 1
-
-                    # Crowded shorts (extreme oversold) → LONG
-                    # RSI < 22 on 5m AND RSI < 40 on 1h AND MACD recovering AND volume
-                    elif rsi_val < 22 and rsi_1h < 40 and macd_h > macd_h_prev and vsr >= 1.2:
-                        direction = "LONG"
-                        strength = min((30 - rsi_val) / 30.0 + 0.3, 1.0)
-                        confirming = 1
-                        if rsi_val < 18:
-                            confirming += 1
-                        if rsi_prev < 28:  # sustained oversold
-                            confirming += 1
-
-                    sig = Signal(
-                        symbol=symbol, direction=direction, strength=strength,
-                        strategy_name="funding_contrarian",
-                        technical_score=strength if direction == "LONG" else -strength,
-                        indicator_snapshot={"confirming_count": confirming},
-                    )
-
-                elif strat.name == "orderflow":
-                    # Order Flow / Absorption: detect hidden buying/selling pressure
-                    # via candle structure + volume analysis
-                    if idx_5m < 30:
-                        continue
-
-                    price = current_price
-                    o = precomp_5m["open"][idx_5m]
-                    h = precomp_5m["high"][idx_5m]
-                    l = precomp_5m["low"][idx_5m]
-                    c = precomp_5m["close"][idx_5m]
-                    vol = precomp_5m["volume"][idx_5m]
-                    vsr = precomp_5m["vsr"][idx_5m]
-
+                    # Compute candle structure from 1h OHLC
+                    o = precomp_1h["open"][idx_1h]
+                    h = precomp_1h["high"][idx_1h]
+                    l = precomp_1h["low"][idx_1h]
+                    c = precomp_1h["close"][idx_1h]
                     candle_range = h - l
                     if candle_range <= 0:
                         continue
+                    body_ratio = abs(c - o) / candle_range
+                    wick_lower_ratio = (min(o, c) - l) / candle_range
+                    wick_upper_ratio = (h - max(o, c)) / candle_range
+                    volume_surge = precomp_1h["vsr"][idx_1h] if idx_1h < len(precomp_1h["vsr"]) else 1.0
+                    rsi_1h = precomp_1h["rsi"][idx_1h] if idx_1h < len(precomp_1h["rsi"]) else 50.0
+                    cmf_val = precomp_1h["cmf"][idx_1h] if idx_1h < len(precomp_1h["cmf"]) else 0.0
+                    # OBV divergence: compare current vs 12 bars back
+                    obv_now = precomp_1h["obv"][idx_1h] if idx_1h < len(precomp_1h["obv"]) else 0.0
+                    obv_prev = precomp_1h["obv"][idx_1h - 12] if idx_1h >= 12 and idx_1h < len(precomp_1h["obv"]) else obv_now
+                    price_prev = precomp_1h["close"][idx_1h - 12] if idx_1h >= 12 else current_price
+                    if current_price < price_prev and obv_now > obv_prev:
+                        obv_div = 1.0  # bullish divergence
+                    elif current_price > price_prev and obv_now < obv_prev:
+                        obv_div = -1.0  # bearish divergence
+                    else:
+                        obv_div = 0.0
 
-                    body = abs(c - o)
-                    body_ratio = body / candle_range  # small body = absorption
-                    upper_wick = h - max(o, c)
-                    lower_wick = min(o, c) - l
-                    upper_wick_ratio = upper_wick / candle_range
-                    lower_wick_ratio = lower_wick / candle_range
+                    direction, strength = strat.evaluate_1h(
+                        body_ratio, wick_lower_ratio, wick_upper_ratio,
+                        volume_surge, rsi_1h, cmf_val, obv_div,
+                    )
 
-                    # OBV divergence: price making new low but OBV not (bullish)
-                    # or price making new high but OBV not (bearish)
-                    obv_now = precomp_5m["obv"][idx_5m]
-                    obv_prev = precomp_5m["obv"][idx_5m - 12] if idx_5m >= 12 else obv_now
-                    price_prev = precomp_5m["close"][idx_5m - 12] if idx_5m >= 12 else price
+                elif strat.name == "funding_contrarian":
+                    if idx_1h < 2:
+                        continue
+                    rsi_1h = precomp_1h["rsi"][idx_1h] if idx_1h < len(precomp_1h["rsi"]) else 50.0
+                    rsi_4h = precomp_4h["rsi"][h4_idx] if precomp_4h and 0 <= h4_idx < len(precomp_4h["rsi"]) else 50.0
+                    macd_hist = precomp_1h["macd_hist"][idx_1h] if idx_1h < len(precomp_1h["macd_hist"]) else 0.0
+                    macd_hist_prev = precomp_1h["macd_hist"][idx_1h - 1] if idx_1h > 0 and idx_1h < len(precomp_1h["macd_hist"]) else 0.0
 
-                    # CMF for money flow direction
-                    cmf_val = precomp_5m["cmf"][idx_5m]
+                    direction, strength = strat.evaluate_1h(
+                        rsi_1h, rsi_4h, macd_hist, macd_hist_prev,
+                    )
 
-                    direction = "NEUTRAL"
-                    strength = 0.0
-                    confirming = 0
+                elif strat.name == "range":
+                    if idx_1h < 2:
+                        continue
+                    price = current_price
+                    bb_lower = precomp_1h["bb_lower"][idx_1h] if idx_1h < len(precomp_1h["bb_lower"]) else price
+                    bb_upper = precomp_1h["bb_upper"][idx_1h] if idx_1h < len(precomp_1h["bb_upper"]) else price
+                    bb_mid = precomp_1h["bb_mid"][idx_1h] if idx_1h < len(precomp_1h["bb_mid"]) else price
+                    bb_bandwidth = precomp_1h["bb_bandwidth"][idx_1h] if idx_1h < len(precomp_1h["bb_bandwidth"]) else 0.0
+                    adx_4h_val = precomp_4h["adx"][h4_idx] if precomp_4h and 0 <= h4_idx < len(precomp_4h["adx"]) else 25.0
+                    rsi_1h = precomp_1h["rsi"][idx_1h] if idx_1h < len(precomp_1h["rsi"]) else 50.0
 
-                    # RSI for trend context (avoid absorptions against strong trends)
-                    rsi_val = precomp_5m["rsi"][idx_5m]
+                    direction, strength = strat.evaluate_1h(
+                        price, bb_lower, bb_upper, bb_mid, bb_bandwidth,
+                        adx_4h_val, rsi_1h,
+                    )
 
-                    # Buying absorption: high volume + small body + long lower wick
-                    # = sellers tried to push down but buyers absorbed all selling
-                    # Require RSI < 45 (not overbought — room to run up)
-                    if (vsr >= 2.0 and body_ratio < 0.25 and lower_wick_ratio > 0.55
-                            and rsi_val < 45):
-                        direction = "LONG"
-                        strength = min(vsr / 5.0 + 0.3, 1.0)
-                        confirming = 1
-                        if cmf_val > 0.1:  # money flowing in
-                            confirming += 1
-                        # OBV bullish divergence: price lower but OBV higher
-                        if price < price_prev and obv_now > obv_prev:
-                            confirming += 1
+                elif strat.name == "squeeze":
+                    if idx_1h < 2:
+                        continue
+                    bb_bw = precomp_1h["bb_bandwidth"][idx_1h] if idx_1h < len(precomp_1h["bb_bandwidth"]) else 0.0
+                    bb_bw_prev = precomp_1h["bb_bandwidth"][idx_1h - 1] if idx_1h > 0 and idx_1h < len(precomp_1h["bb_bandwidth"]) else 0.0
+                    price = current_price
+                    bb_upper = precomp_1h["bb_upper"][idx_1h] if idx_1h < len(precomp_1h["bb_upper"]) else price
+                    bb_lower = precomp_1h["bb_lower"][idx_1h] if idx_1h < len(precomp_1h["bb_lower"]) else price
+                    volume_surge = precomp_1h["vsr"][idx_1h] if idx_1h < len(precomp_1h["vsr"]) else 1.0
+                    # EMA50 slope from 4h data
+                    if precomp_4h and 0 <= h4_idx < len(precomp_4h["ema50"]):
+                        ema50_now = precomp_4h["ema50"][h4_idx]
+                        ema50_prev = precomp_4h["ema50"][h4_idx - 1] if h4_idx > 0 else ema50_now
+                        ema50_slope = ema50_now - ema50_prev
+                    else:
+                        ema50_slope = 0.0
 
-                    # Selling absorption: high volume + small body + long upper wick
-                    # = buyers tried to push up but sellers absorbed all buying
-                    # Require RSI > 55 (not oversold — room to run down)
-                    elif (vsr >= 2.0 and body_ratio < 0.25 and upper_wick_ratio > 0.55
-                            and rsi_val > 55):
-                        direction = "SHORT"
-                        strength = min(vsr / 5.0 + 0.3, 1.0)
-                        confirming = 1
-                        if cmf_val < -0.1:  # money flowing out
-                            confirming += 1
-                        # OBV bearish divergence: price higher but OBV lower
-                        if price > price_prev and obv_now < obv_prev:
-                            confirming += 1
-
-                    sig = Signal(
-                        symbol=symbol, direction=direction, strength=strength,
-                        strategy_name="orderflow",
-                        technical_score=strength if direction == "LONG" else -strength,
-                        indicator_snapshot={"confirming_count": confirming},
+                    direction, strength = strat.evaluate_1h(
+                        bb_bw_prev, bb_bw, price, bb_upper, bb_lower,
+                        volume_surge, ema50_slope,
                     )
 
                 else:
                     continue
 
-                if sig.direction in ("LONG", "SHORT") and sig.strength > 0:
-                    # Penalize counter-trend signals based on EMA200
-                    # Skip penalty for range strategy — range trades are mean-reversion
-                    # within bands, not trend-following, so EMA200 filter is harmful
-                    effective_strength = sig.strength
-                    if sig.strategy_name not in ("range", "funding_contrarian", "orderflow"):
-                        if sig.direction == "LONG" and price_below_ema200:
-                            effective_strength *= 0.3  # heavily penalize counter-trend longs
-                        elif sig.direction == "SHORT" and price_above_ema200:
-                            effective_strength *= 0.3  # heavily penalize counter-trend shorts
+                if direction in ("LONG", "SHORT") and strength > 0:
+                    collected_signals.append({
+                        "direction": direction,
+                        "strength": strength,
+                        "strategy": strat.name,
+                    })
 
-                    if best_signal is None or effective_strength > best_signal.strength:
-                        sig.strength = effective_strength
-                        best_signal = sig
             except Exception:
                 continue
 
-        return best_signal
+        if not collected_signals:
+            return None
+
+        # --- Confluence gate ---
+        confluence = check_confluence(collected_signals)
+        if confluence.triggered:
+            # Confluence gives a boost — use best strength from agreeing strategies
+            return Signal(
+                symbol=symbol,
+                direction=confluence.direction,
+                strength=min(confluence.strength * 1.2, 1.0),  # 20% boost
+                strategy_name="confluence:" + "+".join(confluence.agreeing_strategies),
+                technical_score=confluence.strength if confluence.direction == "LONG" else -confluence.strength,
+                indicator_snapshot={"confirming_count": len(confluence.agreeing_strategies)},
+            )
+
+        # No confluence — return the single best signal
+        best = max(collected_signals, key=lambda s: s["strength"])
+        return Signal(
+            symbol=symbol,
+            direction=best["direction"],
+            strength=best["strength"],
+            strategy_name=best["strategy"],
+            technical_score=best["strength"] if best["direction"] == "LONG" else -best["strength"],
+            indicator_snapshot={"confirming_count": 1},
+        )
 
     # ------------------------------------------------------------------
     # Position management helpers
@@ -946,24 +681,28 @@ class BacktestEngine:
         size_modifier: float,
         bar_index: int = 0,
         atr_pct: float = 1.5,
+        regime: Regime = Regime.NEUTRAL,
     ) -> None:
         size_eur = self._compute_position_size(size_modifier, current_price=price, atr_pct=atr_pct)
         if size_eur < 10.0 or size_eur > self.balance:
             return  # skip tiny or over-sized trades
 
-        # Deduct cost (including entry fee)
+        # Deduct cost (including entry fee — maker fee for limit orders)
         symbol = signal.symbol
-        taker_fee = get_taker_fee(symbol)
-        cost = size_eur * (1 + taker_fee)
+        entry_fee = size_eur * MAKER_FEE_PCT
+        cost = size_eur + entry_fee
         if cost > self.balance:
             return
         self.balance -= cost
+        self._total_fees_paid += entry_fee
 
-        # Stops (direction-aware)
+        # Stops (direction-aware, fee-compensated)
         direction = signal.direction
+        total_fee_pct = (MAKER_FEE_PCT + TAKER_FEE_PCT) * 100.0  # entry maker + exit taker
         sl, tp = initial_stops(price, df_window, direction=direction,
                                atr_multiplier=self._atr_multiplier,
-                               rr_ratio=self._rr_ratio)
+                               rr_ratio=self._rr_ratio,
+                               total_fee_pct=total_fee_pct)
 
         # Apply slippage to entry price (worse entry simulates real-world fill)
         if direction == "SHORT":
@@ -983,6 +722,8 @@ class BacktestEngine:
             strategy=signal.strategy_name,
             entry_bar=bar_index,
         ))
+        # Track entry regime for regime P&L breakdown
+        self._trade_regime[id(self.positions[-1])] = regime.value if isinstance(regime, Regime) else str(regime)
 
         # Store range levels for range strategy positions
         if signal.strategy_name == "range":
@@ -1068,18 +809,13 @@ class BacktestEngine:
             elif atr_val is not None:
                 # Standard ATR trailing stop for non-range positions
                 trail_dist = atr_val * self._atr_multiplier
-                if direction == "SHORT":
-                    in_profit = pos.entry_price - price
-                else:
-                    in_profit = price - pos.entry_price
-                risk = abs(pos.entry_price - pos.stop_loss) if abs(pos.entry_price - pos.stop_loss) > 0 else trail_dist
-
-                if in_profit >= risk:
-                    pos.stop_loss = trail_stop(
-                        price, pos.highest_price, pos.stop_loss,
-                        trail_dist,
-                        direction=direction,
-                    )
+                pos.stop_loss = trail_stop(
+                    price, pos.highest_price, pos.stop_loss,
+                    trail_dist,
+                    direction=direction,
+                    activation_threshold=1.5,
+                    entry_price=pos.entry_price,
+                )
 
             # Direction-aware stop checks
             triggered = None
@@ -1116,6 +852,9 @@ class BacktestEngine:
         if pos.strategy == "range":
             self._range_bounces[pos.symbol] = self._range_bounces.get(pos.symbol, 0) + 1
 
+        # Look up regime at entry for regime P&L tracking
+        entry_regime = self._trade_regime.pop(id(pos), "neutral")
+
         quantity = pos.size_eur / pos.entry_price
         direction = pos.direction
 
@@ -1133,13 +872,22 @@ class BacktestEngine:
 
         gross_pnl = pos.size_eur * price_change_pct
 
-        # Use actual per-market fees (exit fee only — entry fee already deducted)
-        exit_fee = slipped_exit * quantity * get_taker_fee(pos.symbol)
+        # Maker/taker fee differentiation:
+        # TP exits use maker fee (limit orders), all other exits use taker fee
+        if reason == "take_profit":
+            exit_fee_rate = MAKER_FEE_PCT
+        else:
+            exit_fee_rate = TAKER_FEE_PCT
+        exit_fee = slipped_exit * quantity * exit_fee_rate
+        self._total_fees_paid += exit_fee
         pnl = gross_pnl - exit_fee
         pnl_pct = price_change_pct * 100.0
 
         # Return capital + P&L
         self.balance += pos.size_eur + pnl
+
+        # Track regime P&L
+        self._regime_pnl[entry_regime] = self._regime_pnl.get(entry_regime, 0.0) + pnl
 
         self.closed_trades.append(TradeRecord(
             symbol=pos.symbol,
@@ -1153,6 +901,7 @@ class BacktestEngine:
             pnl_pct=round(pnl_pct, 4),
             exit_reason=reason,
             strategy=pos.strategy,
+            regime=entry_regime,
         ))
 
     # ------------------------------------------------------------------
@@ -1196,6 +945,17 @@ class BacktestEngine:
         avg_win = (sum(t.pnl_pct for t in wins) / len(wins)) if wins else 0.0
         avg_loss = (sum(t.pnl_pct for t in losses) / len(losses)) if losses else 0.0
 
+        # Profit factor
+        gross_wins = sum(t.pnl_eur for t in wins)
+        gross_losses = abs(sum(t.pnl_eur for t in losses))
+        profit_factor = (gross_wins / gross_losses) if gross_losses > 0 else 0.0
+
+        # Profit per fee
+        profit_per_fee = (total_pnl / self._total_fees_paid) if self._total_fees_paid > 0 else 0.0
+
+        # Fill rate
+        fill_rate = (self._signals_filled / self._signals_generated * 100.0) if self._signals_generated > 0 else 0.0
+
         # Sharpe ratio (annualised, from per-bar equity returns)
         sharpe = 0.0
         if len(equity_curve) > 1:
@@ -1232,6 +992,14 @@ class BacktestEngine:
             avg_win_pct=round(avg_win, 2),
             avg_loss_pct=round(avg_loss, 2),
             trade_log=trades,
+            profit_factor=round(profit_factor, 2),
+            total_fees_paid=round(self._total_fees_paid, 4),
+            profit_per_fee=round(profit_per_fee, 2),
+            signals_generated=self._signals_generated,
+            signals_filled=self._signals_filled,
+            fill_rate=round(fill_rate, 2),
+            quiet_hours_skipped=self._quiet_hours_skipped,
+            regime_pnl={k: round(v, 2) for k, v in self._regime_pnl.items()},
         )
 
     @staticmethod
@@ -1311,7 +1079,7 @@ async def run_backtest(
     interval: str = "5m",
     days: int = 30,
     initial_capital: float = 10_000.0,
-    max_open_positions: int = 3,
+    max_open_positions: int = 10,
     slippage_pct: float = 0.001,
 ) -> BacktestResult:
     """
