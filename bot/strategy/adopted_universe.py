@@ -84,7 +84,7 @@ class AdoptedUniverse:
             }
 
             for strat_name, result in strat_results.items():
-                if result.adopted and result.recommended_params:
+                if result.adopted and result.recommended_params is not None:
                     adopted_strats[strat_name] = StrategyConfig(
                         params=dict(result.recommended_params),
                         avg_sharpe=result.avg_oos_sharpe,

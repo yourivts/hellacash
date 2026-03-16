@@ -1,6 +1,7 @@
 """Tests for bot.strategy.adopted_universe."""
 from __future__ import annotations
 
+import unittest.mock
 import pytest
 from unittest.mock import MagicMock
 from dataclasses import dataclass, field
@@ -136,6 +137,36 @@ class TestUpdate:
         }
         u.update(results)
         assert u.is_adopted("BTC-EUR") is False
+
+
+class TestDiffLogging:
+    def test_update_logs_added_removed(self):
+        import logging
+        u = AdoptedUniverse()
+        # First: adopt BTC
+        results1 = {
+            "BTC-EUR": {
+                "orderflow": _mock_wf_result(adopted=True),
+                "range": _mock_wf_result(adopted=False),
+                "squeeze": _mock_wf_result(adopted=False),
+                "funding_contrarian": _mock_wf_result(adopted=False),
+            },
+        }
+        u.update(results1)
+        # Second: drop BTC, add ETH
+        results2 = {
+            "ETH-EUR": {
+                "orderflow": _mock_wf_result(adopted=True),
+                "range": _mock_wf_result(adopted=False),
+                "squeeze": _mock_wf_result(adopted=False),
+                "funding_contrarian": _mock_wf_result(adopted=False),
+            },
+        }
+        with unittest.mock.patch("bot.strategy.adopted_universe.logger") as mock_logger:
+            u.update(results2)
+            log_msg = mock_logger.info.call_args[0][0] % mock_logger.info.call_args[0][1:]
+            assert "+ETH-EUR" in log_msg
+            assert "-BTC-EUR" in log_msg
 
 
 class TestAdoptedSymbols:
