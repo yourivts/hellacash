@@ -27,6 +27,8 @@ class BotScheduler:
         settings: Any,
         discord_run: Optional[Callable] = None,
         walk_forward_run: Optional[Callable] = None,
+        market_data_snapshot: Optional[Callable] = None,
+        rl_retrain_run: Optional[Callable] = None,
     ) -> None:
         self._run_cycle = run_cycle
         self._sentiment_cycle = sentiment_cycle
@@ -37,6 +39,8 @@ class BotScheduler:
         self._settings = settings
         self._discord_run = discord_run
         self._walk_forward_run = walk_forward_run
+        self._market_data_snapshot = market_data_snapshot
+        self._rl_retrain_run = rl_retrain_run
         self._tasks: List[asyncio.Task] = []
 
     async def run_all(self) -> None:
@@ -52,6 +56,10 @@ class BotScheduler:
             coros.append(self._discord_run())
         if self._walk_forward_run is not None:
             coros.append(self._walk_forward_loop(168))  # weekly
+        if self._market_data_snapshot is not None:
+            coros.append(self._market_data_snapshot_loop(300))  # every 5 minutes
+        if self._rl_retrain_run is not None:
+            coros.append(self._rl_retrain_loop(168))
         self._tasks = [asyncio.create_task(c) for c in coros]
         await asyncio.gather(*self._tasks)
 
@@ -106,4 +114,25 @@ class BotScheduler:
                 await self._walk_forward_run()
             except Exception as e:
                 logger.error("Walk-forward error: %s", e)
+            await asyncio.sleep(interval_hours * 3600)
+
+    async def _market_data_snapshot_loop(self, interval_secs: int) -> None:
+        """Periodically save funding rate and orderbook snapshots for future backtesting."""
+        await asyncio.sleep(120)  # let providers warm up
+        while True:
+            if self._is_running():
+                try:
+                    await self._market_data_snapshot()
+                except Exception as e:
+                    logger.error("Market data snapshot error: %s", e)
+            await asyncio.sleep(interval_secs)
+
+    async def _rl_retrain_loop(self, interval_hours: int) -> None:
+        await asyncio.sleep(600)  # let walk-forward complete first
+        while True:
+            try:
+                logger.info("RL retrain starting...")
+                await self._rl_retrain_run()
+            except Exception as e:
+                logger.error("RL retrain error: %s", e)
             await asyncio.sleep(interval_hours * 3600)

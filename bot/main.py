@@ -35,6 +35,9 @@ from bot.learning.param_optimizer import ParamOptimizer
 from bot.learning.regime_classifier import RegimeClassifier
 from bot.learning.signal_evaluator import SignalEvaluator
 from bot.learning.trade_analyzer import TradeAnalyzer
+from bot.data.candle_store import CandleStore
+from bot.learning.rl_optimizer import RLOptimizer
+from bot.learning.rl_trainer import RLTrainer
 from bot.learning.walk_forward import WalkForwardOptimizer, TRAIN_DAYS, TEST_DAYS, MIN_WINDOWS
 from bot.execution.limit_order_manager import LimitOrderManager
 from bot.portfolio.tracker import PortfolioTracker
@@ -44,7 +47,7 @@ from bot.scheduler import BotScheduler
 from bot.sentiment.aggregator import SentimentAggregator
 from bot.strategy.router import StrategyRouter
 from bot.notifications.discord import DiscordNotifier
-from bot.strategy.adopted_universe import AdoptedUniverse
+from bot.strategy.adopted_universe import AdoptedUniverse, ALL_STRATEGIES
 from bot.trading_loop import TradingLoop
 
 _LOG_DIR = os.path.join(os.path.dirname(__file__), "..", "logs")
@@ -148,6 +151,8 @@ _param_optimizer: Optional[ParamOptimizer] = None
 _onchain_provider: Optional[OnchainProvider] = None
 _orderbook_provider: Optional[OrderBookProvider] = None
 _walk_forward: Optional[WalkForwardOptimizer] = None
+_candle_store: Optional[Any] = None
+_rl_optimizer: Optional[Any] = None
 _trading_loop: Optional[TradingLoop] = None
 _scheduler: Optional[BotScheduler] = None
 _limit_mgr: Optional[LimitOrderManager] = None
@@ -247,10 +252,28 @@ def _get_orderbook() -> OrderBookProvider:
     return _orderbook_provider
 
 
+def _get_candle_store():
+    global _candle_store
+    if _candle_store is None:
+        _candle_store = CandleStore(db_url=get_settings().database_url)
+    return _candle_store
+
+
+def _get_rl_optimizer():
+    global _rl_optimizer
+    if _rl_optimizer is None:
+        _rl_optimizer = RLOptimizer()
+        _rl_optimizer.load_models()
+    return _rl_optimizer
+
+
 def _get_walk_forward() -> WalkForwardOptimizer:
     global _walk_forward
     if _walk_forward is None:
-        _walk_forward = WalkForwardOptimizer()
+        _walk_forward = WalkForwardOptimizer(
+            rl_optimizer=_get_rl_optimizer(),
+            candle_store=_get_candle_store(),
+        )
     return _walk_forward
 
 
@@ -446,6 +469,16 @@ async def _main() -> None:
         if orderbook_prov and hasattr(orderbook_prov, 'save_snapshots'):
             await orderbook_prov.save_snapshots()
 
+    async def _retrain_rl():
+        candle_store = _get_candle_store()
+        trainer = RLTrainer(candle_store, ALL_STRATEGIES)
+        symbols = get_tradeable_symbols() or ["BTC-EUR"]
+        await candle_store.incremental_update(symbols)
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(None, trainer.retrain)
+        _get_rl_optimizer().load_models()
+        logger.info("RL retrain complete: %s", results)
+
     scheduler = BotScheduler(
         run_cycle=lambda: trading_loop.run_cycle(_tradeable_symbols, _running),
         sentiment_cycle=sentiment.run_cycle,
@@ -459,6 +492,7 @@ async def _main() -> None:
         discord_run=discord.run,
         walk_forward_run=_run_walk_forward,
         market_data_snapshot=_save_market_data_snapshots,
+        rl_retrain_run=_retrain_rl,
     )
     _scheduler = scheduler
 
