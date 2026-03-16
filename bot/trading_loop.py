@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 import pandas as pd
@@ -17,11 +18,16 @@ from bot.events.bus import (
     TOPIC_TRADE_OPENED,
     get_bus,
 )
-from bot.indicators.volatility import atr as compute_atr
+from bot.indicators.momentum import rsi as compute_rsi
+from bot.indicators.trend import adx as compute_adx, ema as compute_ema, macd as compute_macd
+from bot.indicators.volatility import atr as compute_atr, bollinger_bands
+from bot.indicators.volume import cmf as compute_cmf, obv as compute_obv, volume_surge_ratio
+from bot.risk.fee_gate import check_fee_gate
 from bot.risk.fees import get_trading_fees
 from bot.risk.position_sizer import fixed_fractional_size
 from bot.risk.stop_loss import check_stop_triggered, initial_stops, trail_stop
-from bot.strategy.base import MarketContext
+from bot.strategy.confluence import check_confluence
+from bot.strategy.router import Regime, StrategyRouter, detect_regime
 
 logger = logging.getLogger(__name__)
 
@@ -58,14 +64,13 @@ class TradingLoop:
         self.orderbook = orderbook
 
         self._pending_orders: set[str] = set()
+        self._limit_mgr = None  # Will be set by main.py (Task 17)
+        self._last_evaluated_hour = None
 
         # Per-symbol cooldown: tracks last trade close time (monotonic)
         self._last_trade_closed: Dict[str, float] = {}
         self._cooldown_seconds: float = settings.trade_cooldown_hours * 3600 if hasattr(settings, "trade_cooldown_hours") else 96 * 3600
 
-        # Trade stats cache (instance-level)
-        self._trade_stats_cache: Dict[str, Any] = {}
-        self._trade_stats_ts: float = 0
         self._last_halt_log: float = 0  # throttle halt log messages
         self._last_portfolio_publish: float = 0  # throttle portfolio update events
 
@@ -88,9 +93,30 @@ class TradingLoop:
         self.candle_cache.cache_candle(data["symbol"], data["interval"], data)
         self.portfolio.update_price(data["symbol"], data["close"])
 
-        # Check stop-loss / take-profit on every candle
-        if data["interval"] == "1m":
+        # Check stop-loss / take-profit on 5m candles
+        if data["interval"] == "5m":
             await self._check_stops(data["symbol"], data["close"])
+
+            # Check limit order timeouts and price deviations
+            if hasattr(self, '_limit_mgr') and self._limit_mgr is not None:
+                self._limit_mgr.check_timeouts()
+                self._limit_mgr.check_price_deviation(data["symbol"], data["close"])
+
+            # 1h candle detection with hour-crossing logic
+            ts = data["timestamp"]
+            if isinstance(ts, str):
+                try:
+                    ts = datetime.fromisoformat(ts)
+                except (ValueError, TypeError):
+                    ts = None
+            current_hour = ts.replace(minute=0, second=0, microsecond=0) if hasattr(ts, "replace") and ts is not None else None
+            if current_hour and current_hour != self._last_evaluated_hour:
+                h1_candle = self.candle_cache.build_1h_candle(
+                    data["symbol"], current_hour - timedelta(hours=1)
+                )
+                if h1_candle is not None:
+                    await self._evaluate_1h_signals(data["symbol"], h1_candle)
+                self._last_evaluated_hour = current_hour
 
     async def on_ticker(self, data: Dict[str, Any]) -> None:
         symbol = data.get("symbol", "")
@@ -110,6 +136,322 @@ class TradingLoop:
 
     async def on_fill(self, data: Dict[str, Any]) -> None:
         await self.order_mgr.on_fill_notification(data)
+
+    # ── 1h signal evaluation ─────────────────────────────────────────────────
+
+    async def _evaluate_1h_signals(self, symbol: str, h1_candle: Dict[str, Any]) -> None:
+        """Evaluate 1h signals using regime detection and strategy confluence."""
+        portfolio = self.portfolio
+        settings = self.settings
+
+        # Skip if position already open or order pending
+        if portfolio.has_position(symbol):
+            return
+        if symbol in self._pending_orders:
+            return
+
+        # Per-symbol cooldown
+        last_closed = self._last_trade_closed.get(symbol)
+        if last_closed is not None:
+            elapsed = time.monotonic() - last_closed
+            if elapsed < self._cooldown_seconds:
+                return
+
+        equity = portfolio.get_equity_eur()
+
+        # Check if trading is allowed
+        allowed, halt_reason = self.drawdown.is_trading_allowed(equity)
+        if not allowed:
+            return
+
+        # Detect regime using 4h data
+        df_5m = self.candle_cache.get_df(symbol, "5m")
+        if len(df_5m) < 200:
+            df_4h = None
+        else:
+            df_4h = self._resample(df_5m, "4h")
+
+        if df_4h is not None and len(df_4h) >= 14:
+            adx_val = float(compute_adx(df_4h["high"], df_4h["low"], df_4h["close"]).iloc[-1])
+            atr_val = float(compute_atr(df_4h["high"], df_4h["low"], df_4h["close"]).iloc[-1])
+            price_4h = float(df_4h["close"].iloc[-1])
+            atr_pct = (atr_val / price_4h * 100.0) if price_4h > 0 else 0
+
+            if atr_pct < 1.0:
+                regime = Regime.QUIET
+            elif atr_pct > 4.0:
+                regime = Regime.VOLATILE
+            elif adx_val > 25:
+                regime = Regime.TRENDING
+            elif adx_val < 20:
+                regime = Regime.RANGING
+            else:
+                regime = Regime.NEUTRAL
+        else:
+            regime = Regime.NEUTRAL
+
+        # Skip QUIET regime
+        if regime == Regime.QUIET:
+            logger.debug("Skipping %s — QUIET regime detected", symbol)
+            return
+
+        # Get applicable strategies
+        strategies = self.router.get_strategies(regime)
+        if not strategies:
+            return
+
+        # Get cached 1h dataframe for indicator computation
+        df_1h = self.candle_cache.get_df(symbol, "1h")
+        if len(df_1h) < 30:
+            return
+
+        # Precompute indicators from the 1h dataframe
+        close_1h = df_1h["close"]
+        high_1h = df_1h["high"]
+        low_1h = df_1h["low"]
+        volume_1h = df_1h["volume"]
+
+        rsi_series = compute_rsi(close_1h)
+        rsi_1h = float(rsi_series.iloc[-1])
+
+        macd_df = compute_macd(close_1h)
+        macd_hist = float(macd_df["histogram"].iloc[-1])
+        macd_hist_prev = float(macd_df["histogram"].iloc[-2]) if len(macd_df) >= 2 else macd_hist
+
+        bb = bollinger_bands(close_1h)
+        bb_upper = float(bb["upper"].iloc[-1])
+        bb_lower = float(bb["lower"].iloc[-1])
+        bb_mid = float(bb["mid"].iloc[-1])
+        bb_bandwidth = float(bb["bandwidth"].iloc[-1])
+        bb_bandwidth_prev = float(bb["bandwidth"].iloc[-2]) if len(bb) >= 2 else bb_bandwidth
+
+        price = float(close_1h.iloc[-1])
+        vol_surge_series = volume_surge_ratio(volume_1h)
+        vol_surge = float(vol_surge_series.iloc[-1])
+
+        cmf_series = compute_cmf(high_1h, low_1h, close_1h, volume_1h)
+        cmf_val = float(cmf_series.iloc[-1])
+
+        obv_series = compute_obv(close_1h, volume_1h)
+        # OBV divergence: compare OBV slope vs price slope over last 5 bars
+        if len(obv_series) >= 5:
+            obv_slope = float(obv_series.iloc[-1] - obv_series.iloc[-5])
+            price_slope = float(close_1h.iloc[-1] - close_1h.iloc[-5])
+            # Divergence: OBV rising while price falling (or vice versa)
+            if price_slope != 0:
+                obv_divergence = -1.0 if (obv_slope > 0 and price_slope < 0) else (1.0 if (obv_slope < 0 and price_slope > 0) else 0.0)
+            else:
+                obv_divergence = 0.0
+        else:
+            obv_divergence = 0.0
+
+        # Candle body/wick ratios from the 1h candle
+        h1_open = h1_candle["open"]
+        h1_high = h1_candle["high"]
+        h1_low = h1_candle["low"]
+        h1_close = h1_candle["close"]
+        candle_range = h1_high - h1_low
+        if candle_range > 0:
+            body_ratio = abs(h1_close - h1_open) / candle_range
+            wick_lower_ratio = (min(h1_open, h1_close) - h1_low) / candle_range
+            wick_upper_ratio = (h1_high - max(h1_open, h1_close)) / candle_range
+        else:
+            body_ratio = 0.0
+            wick_lower_ratio = 0.0
+            wick_upper_ratio = 0.0
+
+        # EMA50 slope for squeeze strategy
+        ema50 = compute_ema(close_1h, 50)
+        if len(ema50) >= 2:
+            ema50_slope = float(ema50.iloc[-1] - ema50.iloc[-2])
+        else:
+            ema50_slope = 0.0
+
+        # 4h RSI for funding_contrarian
+        if df_4h is not None and len(df_4h) >= 14:
+            rsi_4h_series = compute_rsi(df_4h["close"])
+            rsi_4h = float(rsi_4h_series.iloc[-1])
+            adx_4h_val = float(compute_adx(df_4h["high"], df_4h["low"], df_4h["close"]).iloc[-1])
+        else:
+            rsi_4h = 50.0
+            adx_4h_val = 20.0
+
+        # Collect signals from all strategies
+        signals = []
+        for strategy in strategies:
+            try:
+                if strategy.name == "orderflow":
+                    direction, strength = strategy.evaluate_1h(
+                        body_ratio, wick_lower_ratio, wick_upper_ratio,
+                        vol_surge, rsi_1h, cmf_val, obv_divergence,
+                    )
+                elif strategy.name == "funding_contrarian":
+                    direction, strength = strategy.evaluate_1h(
+                        rsi_1h, rsi_4h, macd_hist, macd_hist_prev,
+                    )
+                elif strategy.name == "range":
+                    direction, strength = strategy.evaluate_1h(
+                        price, bb_lower, bb_upper, bb_mid, bb_bandwidth,
+                        adx_4h_val, rsi_1h,
+                    )
+                elif strategy.name == "squeeze":
+                    direction, strength = strategy.evaluate_1h(
+                        bb_bandwidth_prev, bb_bandwidth, price, bb_upper,
+                        bb_lower, vol_surge, ema50_slope,
+                    )
+                else:
+                    continue
+
+                if direction != "NEUTRAL" and strength > 0:
+                    signals.append({
+                        "direction": direction,
+                        "strength": strength,
+                        "strategy": strategy.name,
+                    })
+            except Exception as e:
+                logger.warning("Strategy %s evaluate_1h failed: %s", strategy.name, e)
+
+        if not signals:
+            return
+
+        # Run confluence check
+        confluence = check_confluence(signals)
+        if not confluence.triggered:
+            logger.debug("No confluence for %s — signals: %s", symbol, signals)
+            return
+
+        direction = confluence.direction
+        strength = confluence.strength
+
+        # Compute position size
+        entry_price = price
+        if entry_price <= 0:
+            return
+
+        # Compute stops
+        stop_loss, take_profit = initial_stops(entry_price, df_1h, direction=direction)
+        stop_distance_pct = max(0.1, abs(entry_price - stop_loss) / entry_price * 100.0)
+        tp_distance_pct = max(0.1, abs(take_profit - entry_price) / entry_price * 100.0)
+
+        # Fee-aware gate
+        atr_series_1h = compute_atr(high_1h, low_1h, close_1h)
+        current_atr = float(atr_series_1h.iloc[-1]) if len(atr_series_1h) > 0 else 0.0
+        atr_pct_1h = (current_atr / entry_price * 100.0) if entry_price > 0 else 1.5
+        atr_pct_1h = max(atr_pct_1h, 0.1)
+        atr_50 = atr_series_1h.iloc[-50:] if len(atr_series_1h) >= 50 else atr_series_1h
+        median_atr = float(atr_50.median()) if len(atr_50) > 0 else current_atr
+        median_atr_pct = max((median_atr / entry_price * 100.0) if entry_price > 0 else atr_pct_1h, 0.1)
+
+        size_eur = fixed_fractional_size(
+            equity=equity,
+            base_risk_pct=settings.base_risk_pct,
+            stop_distance_pct=stop_distance_pct,
+            atr_pct=atr_pct_1h,
+            median_atr_pct=median_atr_pct,
+        )
+        size_eur *= self.drawdown.position_size_multiplier(equity)
+
+        # Fee gate check
+        _, taker_pct = get_trading_fees(symbol)
+        fee_result = check_fee_gate(
+            position_size=size_eur,
+            tp_distance_pct=tp_distance_pct,
+            taker_fee_pct=taker_pct,
+            is_short=(direction == "SHORT"),
+        )
+        if not fee_result.approved:
+            logger.debug("Fee gate rejected %s %s: %s", direction, symbol, fee_result.reason)
+            return
+
+        amount_base = size_eur / entry_price
+
+        # Risk gate
+        risk = stop_distance_pct
+        expected_roi = risk * 2.0
+        side = "buy" if direction == "LONG" else "sell"
+        decision = self.risk_engine.approve(
+            symbol=symbol,
+            side=side,
+            position_size_eur=size_eur,
+            signal_confidence=strength,
+            expected_roi_pct=expected_roi,
+            portfolio_equity_eur=equity,
+            open_position_count=portfolio.open_position_count(),
+            daily_loss_eur=self.drawdown.daily_realized_loss_eur(),
+            current_drawdown_pct=self.drawdown.current_drawdown_pct(equity),
+            taker_fee_pct=taker_pct,
+        )
+
+        if not decision.approved:
+            return
+
+        strategy_name = confluence.agreeing_strategies[0] if confluence.agreeing_strategies else "confluence"
+
+        logger.info(
+            "1h Signal ACCEPTED %s %s [%s] — size EUR%.2f, strength=%.2f, confluence=%s",
+            direction, symbol, strategy_name, size_eur, strength,
+            confluence.agreeing_strategies,
+        )
+
+        # Place order
+        self._pending_orders.add(symbol)
+        try:
+            journal_data = {
+                "confluence": confluence.agreeing_strategies,
+                "market_regime": regime.value if hasattr(regime, 'value') else str(regime),
+                "strength": strength,
+            }
+
+            if direction == "SHORT":
+                order_id = await self.order_mgr.submit_sell(
+                    symbol, amount_base, strategy_name,
+                    extra_data=journal_data,
+                )
+            else:
+                order_id = await self.order_mgr.submit_buy(
+                    symbol, amount_base, strategy_name,
+                    extra_data=journal_data,
+                )
+
+            if order_id:
+                await portfolio.add_position(
+                    symbol=symbol,
+                    strategy_name=strategy_name,
+                    entry_price=entry_price,
+                    quantity=amount_base,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    entry_order_id=order_id,
+                    paper_trade=settings.paper_trading,
+                    direction=direction,
+                )
+
+                # Store range levels for range strategy
+                pos = portfolio.get_position(symbol)
+                if pos and strategy_name == "range":
+                    pos["range_mid"] = bb_mid
+                    pos["range_upper"] = bb_upper
+                    pos["range_lower"] = bb_lower
+                    pos["tp_shifted"] = False
+
+                    bandwidth_price = bb_upper - bb_lower
+                    if direction == "LONG":
+                        pos["stop_loss_price"] = bb_lower - 0.5 * bandwidth_price
+                        pos["take_profit_price"] = bb_mid
+                    else:
+                        pos["stop_loss_price"] = bb_upper + 0.5 * bandwidth_price
+                        pos["take_profit_price"] = bb_mid
+
+                await get_bus().publish(TOPIC_TRADE_OPENED, {
+                    "symbol": symbol,
+                    "direction": direction,
+                    "strategy_name": strategy_name,
+                    "entry_price": entry_price,
+                    "size_eur": size_eur,
+                    "confluence": confluence.agreeing_strategies,
+                })
+        finally:
+            self._pending_orders.discard(symbol)
 
     # ── Stop-loss monitoring ──────────────────────────────────────────────────
 
@@ -131,6 +473,8 @@ class TradingLoop:
                 pos["stop_loss_price"] or default_stop,
                 atr_val,
                 direction=direction,
+                activation_threshold=1.5,
+                entry_price=pos.get("entry_price", 0),
             )
             if direction == "SHORT":
                 if new_stop < (pos["stop_loss_price"] or float("inf")):
@@ -139,18 +483,17 @@ class TradingLoop:
                 if new_stop > (pos["stop_loss_price"] or 0):
                     pos["stop_loss_price"] = new_stop
 
-        # Range 24h max hold time
+        # Range 72h max hold time
         if pos.get("strategy_name") == "range":
             entry_time = pos.get("entry_time")
             if entry_time is not None:
-                from datetime import datetime, timezone
                 try:
                     if isinstance(entry_time, str):
                         entry_dt = datetime.fromisoformat(entry_time)
                     else:
                         entry_dt = entry_time
                     now = datetime.now(timezone.utc)
-                    if (now - entry_dt).total_seconds() >= 86400:  # 24 hours
+                    if (now - entry_dt).total_seconds() >= 259200:  # 72 hours
                         await self._close_position(symbol, current_price, "range_time_exit")
                         return
                 except (ValueError, TypeError):
@@ -163,7 +506,6 @@ class TradingLoop:
                 (direction == "SHORT" and current_price <= pos.get("range_mid", float("inf")))
             )
             if crossed_mid and pos.get("range_mid", 0) > 0:
-                from bot.indicators.momentum import rsi as compute_rsi
                 if len(df_5m) >= 20:
                     rsi_series = compute_rsi(df_5m["close"])
                     current_rsi = rsi_series.iloc[-1]
@@ -265,46 +607,6 @@ class TradingLoop:
         finally:
             self._pending_orders.discard(symbol)
 
-    # ── Trade stats for position sizing ───────────────────────────────────────
-
-    async def _get_trade_stats(self, strategy_name: str) -> tuple:
-        """Return (win_rate, avg_win_pct, avg_loss_pct) from trade history."""
-        import time as _time
-        now = _time.time()
-        # Refresh cache every 5 minutes
-        if now - self._trade_stats_ts > 300:
-            self._trade_stats_cache.clear()
-            self._trade_stats_ts = now
-            try:
-                from bot.data.database import get_session as _get_sess
-                from bot.data.repositories import get_trades
-                async with _get_sess() as session:
-                    trades = await get_trades(session, limit=500)
-                for t in trades:
-                    name = t.strategy_name or "unknown"
-                    self._trade_stats_cache.setdefault(name, {"wins": 0, "losses": 0, "win_pcts": [], "loss_pcts": []})
-                    if t.net_pnl > 0:
-                        self._trade_stats_cache[name]["wins"] += 1
-                        if t.roi_pct:
-                            self._trade_stats_cache[name]["win_pcts"].append(abs(t.roi_pct) / 100.0)
-                    else:
-                        self._trade_stats_cache[name]["losses"] += 1
-                        if t.roi_pct:
-                            self._trade_stats_cache[name]["loss_pcts"].append(abs(t.roi_pct) / 100.0)
-            except Exception as e:
-                logger.debug("Trade stats fetch failed: %s", e)
-
-        stats = self._trade_stats_cache.get(strategy_name)
-        if not stats or (stats["wins"] + stats["losses"]) < 10:
-            # Not enough history — use conservative defaults
-            return 0.5, 0.02, 0.01
-
-        total = stats["wins"] + stats["losses"]
-        win_rate = stats["wins"] / total
-        avg_win = sum(stats["win_pcts"]) / len(stats["win_pcts"]) if stats["win_pcts"] else 0.02
-        avg_loss = sum(stats["loss_pcts"]) / len(stats["loss_pcts"]) if stats["loss_pcts"] else 0.01
-        return win_rate, avg_win, avg_loss
-
     # ── Main strategy cycle ───────────────────────────────────────────────────
 
     async def run_cycle(self, tradeable_symbols: List[str], is_running: bool) -> None:
@@ -361,9 +663,26 @@ class TradingLoop:
                     return
 
                 # Detect regime and select strategies
-                regime = router._hybrid.__class__.__name__  # placeholder
-                from bot.strategy.router import detect_regime
-                regime = detect_regime(df_1h)
+                df_4h = self._resample(df_5m, "4h") if len(df_5m) >= 200 else None
+                if df_4h is not None and len(df_4h) >= 14:
+                    adx_val = float(compute_adx(df_4h["high"], df_4h["low"], df_4h["close"]).iloc[-1])
+                    atr_val = float(compute_atr(df_4h["high"], df_4h["low"], df_4h["close"]).iloc[-1])
+                    price_4h = float(df_4h["close"].iloc[-1])
+                    atr_pct_4h = (atr_val / price_4h * 100.0) if price_4h > 0 else 0
+
+                    if atr_pct_4h < 1.0:
+                        regime = Regime.QUIET
+                    elif atr_pct_4h > 4.0:
+                        regime = Regime.VOLATILE
+                    elif adx_val > 25:
+                        regime = Regime.TRENDING
+                    elif adx_val < 20:
+                        regime = Regime.RANGING
+                    else:
+                        regime = Regime.NEUTRAL
+                else:
+                    regime = Regime.NEUTRAL
+
                 strategies = router.get_strategies(regime)
 
                 # Get sentiment
@@ -372,19 +691,20 @@ class TradingLoop:
                 # Build market context
                 # Resample for MTF
                 df_15m = self._resample(df_5m, "15min") if len(df_5m) >= 10 else df_5m
-                df_4h = self._resample(df_5m, "4h") if len(df_5m) >= 200 else df_1h
+                df_4h_ctx = df_4h if df_4h is not None else df_1h
                 df_1d = self._resample(df_5m, "1D") if len(df_5m) >= 500 else df_1h
 
                 # Get provider scores
                 onchain_score = self.onchain.score(symbol) if self.onchain and self.onchain.is_available() else 0.0
                 orderbook_imb = self.orderbook.score(symbol) if self.orderbook and self.orderbook.is_available() else 0.0
 
+                from bot.strategy.base import MarketContext
                 ctx = MarketContext(
                     symbol=symbol,
                     candles_5m=df_5m,
                     candles_1h=df_1h,
                     candles_15m=df_15m,
-                    candles_4h=df_4h,
+                    candles_4h=df_4h_ctx,
                     candles_1d=df_1d,
                     current_price=df_5m["close"].iloc[-1],
                     sentiment_score=sentiment_score,
@@ -458,8 +778,6 @@ class TradingLoop:
                     atr_pct=atr_pct,
                     median_atr_pct=median_atr_pct,
                 )
-                # Apply regime modifier and drawdown scaling
-                size_eur *= router.position_size_modifier(regime)
                 size_eur *= drawdown.position_size_multiplier(equity)
 
                 amount_base = size_eur / entry_price
@@ -485,7 +803,7 @@ class TradingLoop:
                     continue
 
                 logger.info(
-                    "Signal ACCEPTED %s %s %s — size €%.2f, confidence=%.2f",
+                    "Signal ACCEPTED %s %s %s — size EUR%.2f, confidence=%.2f",
                     direction, symbol, best_signal.strategy_name,
                     size_eur, best_signal.strength,
                 )
