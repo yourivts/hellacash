@@ -226,6 +226,9 @@ Expected: FAIL — `ImportError: cannot import name '_parse_response'`
 Append to `bot/learning/llm_optimizer.py`:
 
 ```python
+_INT_PARAM_KEYS = {"max_hold_hours", "regime_adx_threshold", "ranging_adx_threshold"}
+
+
 def _clamp_params(params: Dict[str, Any]) -> Dict[str, Any]:
     """Clamp values to valid ranges and round to nearest step."""
     clamped = {}
@@ -236,8 +239,7 @@ def _clamp_params(params: Dict[str, Any]) -> Dict[str, Any]:
         val = round(round((val - lo) / step) * step + lo, 4)
         # Ensure still in range after rounding
         val = max(lo, min(hi, val))
-        int_keys = {"max_hold_hours", "regime_adx_threshold", "ranging_adx_threshold"}
-        clamped[key] = int(val) if key in int_keys else round(val, 2)
+        clamped[key] = int(val) if key in _INT_PARAM_KEYS else round(val, 2)
     return clamped
 
 
@@ -357,6 +359,15 @@ class TestRefineParams:
         with patch("bot.learning.llm_optimizer.requests.post", return_value=mock_resp):
             result = refine_params("market summary", [{"params": VALID_DEFAULTS, "pnl": 100}], VALID_DEFAULTS, "orderflow")
             assert len(result) == 6
+
+    def test_refine_fallback_on_bad_json(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"response": "I don't understand"}
+        with patch("bot.learning.llm_optimizer.requests.post", return_value=mock_resp):
+            result = refine_params("market summary", [{"params": VALID_DEFAULTS, "pnl": 100}], VALID_DEFAULTS, "orderflow")
+            assert len(result) == 1
+            assert result[0] == VALID_DEFAULTS
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -426,7 +437,7 @@ def _build_propose_prompt(
     if prev_windows:
         lines = []
         for w in prev_windows:
-            lines.append(f"Window {w['window']}: pnl=€{w['pnl']:.2f}, sharpe={w['sharpe']:.2f}, pf={w['profit_factor']:.2f}")
+            lines.append(f"Window {w['window']}: pnl=€{w['pnl']:.2f}, sharpe={w['sharpe']:.2f}, ppf={w['profit_per_fee']:.2f}")
         prev_section = "\nPREVIOUS WINDOW RESULTS:\n" + "\n".join(lines)
 
     return f"""You are a quantitative trading parameter optimizer for cryptocurrency markets.
@@ -1001,24 +1012,27 @@ class TestRunLlmWindow:
 
         valid_params = {"atr_multiplier": 3.5, "rr_ratio": 2.5, "base_risk_pct": 3.0, "min_profit_multiple": 3.0, "max_hold_hours": 120, "quiet_atr_threshold": 1.0, "regime_adx_threshold": 24, "ranging_adx_threshold": 20}
 
-        mock_result = MagicMock()
-        mock_result.total_pnl = 100.0
-        mock_result.sharpe_ratio = 0.8
-        mock_result.profit_factor = 1.3
-        mock_result.profit_per_fee = 2.0
-        mock_result.winning_trades = 5
-        mock_result.losing_trades = 3
-        mock_result.avg_win_pct = 1.2
-        mock_result.avg_loss_pct = 0.8
-        mock_result.trade_log = []
+        mock_bt_tuple = (valid_params, 100.0, 0.8, 1.3, 2.0, 5, 3, 1.2, 0.8, 18.5)
+        mock_oos_result = MagicMock()
+        mock_oos_result.sharpe_ratio = 0.8
+        mock_oos_result.total_pnl = 100.0
+        mock_oos_engine = MagicMock()
+        mock_oos_engine.run.return_value = mock_oos_result
 
-        mock_engine = MagicMock()
-        mock_engine.run.return_value = mock_result
-
-        with patch("bot.learning.walk_forward.BacktestEngine", return_value=mock_engine), \
+        with patch("bot.learning.walk_forward._run_single_backtest", return_value=mock_bt_tuple), \
+             patch("bot.learning.walk_forward.BacktestEngine", return_value=mock_oos_engine), \
+             patch("bot.learning.walk_forward.ProcessPoolExecutor") as mock_pool_cls, \
              patch("bot.learning.walk_forward.propose_params", return_value=[valid_params] * 6), \
              patch("bot.learning.walk_forward.refine_params", return_value=[valid_params] * 6), \
              patch("bot.learning.walk_forward.summarize", return_value="market summary"):
+            # Make ProcessPoolExecutor run synchronously
+            mock_pool = MagicMock()
+            mock_pool_cls.return_value.__enter__ = MagicMock(return_value=mock_pool)
+            mock_pool_cls.return_value.__exit__ = MagicMock(return_value=False)
+            mock_future = MagicMock()
+            mock_future.result.return_value = mock_bt_tuple
+            mock_pool.submit.return_value = mock_future
+
             best_params, test_result = _run_llm_window([], [], 4, "orderflow")
             assert best_params is not None
             assert test_result is not None
@@ -1035,48 +1049,41 @@ class TestRunLlmWindow:
 
     def test_round_3_triggers_when_round_2_worse(self):
         """Round 3 should fire when round 2 best score < round 1 best score."""
-        from bot.learning.walk_forward import _run_llm_window
+        from bot.learning.walk_forward import _run_llm_window, _score_result
 
         valid_params = {"atr_multiplier": 3.5, "rr_ratio": 2.5, "base_risk_pct": 3.0, "min_profit_multiple": 3.0, "max_hold_hours": 120, "quiet_atr_threshold": 1.0, "regime_adx_threshold": 24, "ranging_adx_threshold": 20}
 
-        good_result = MagicMock()
-        good_result.total_pnl = 200.0
-        good_result.sharpe_ratio = 1.2
-        good_result.profit_factor = 1.8
-        good_result.profit_per_fee = 3.0
-        good_result.winning_trades = 8
-        good_result.losing_trades = 2
-        good_result.avg_win_pct = 1.5
-        good_result.avg_loss_pct = 0.6
-        good_result.trade_log = []
+        # Good backtest tuple (high score)
+        good_bt = (valid_params, 200.0, 1.2, 1.8, 3.0, 8, 2, 1.5, 0.6, 12.0)
+        # Bad backtest tuple (low score)
+        bad_bt = (valid_params, -50.0, -0.3, 0.7, 0.5, 2, 5, 0.8, 1.2, 48.0)
 
-        bad_result = MagicMock()
-        bad_result.total_pnl = -50.0
-        bad_result.sharpe_ratio = -0.3
-        bad_result.profit_factor = 0.7
-        bad_result.profit_per_fee = 0.5
-        bad_result.winning_trades = 2
-        bad_result.losing_trades = 5
-        bad_result.avg_win_pct = 0.8
-        bad_result.avg_loss_pct = 1.2
-        bad_result.trade_log = []
+        call_count = {"refine": 0, "backtest_round": 0}
 
-        call_count = {"refine": 0}
         def mock_refine(*args, **kwargs):
             call_count["refine"] += 1
             return [valid_params] * 6
 
-        # Round 1 gets good results, Round 2 gets bad results → Round 3 should trigger
-        results_cycle = [good_result, bad_result, good_result]
-        result_idx = {"i": 0}
-        def engine_factory(*args, **kwargs):
-            mock_eng = MagicMock()
-            r = results_cycle[result_idx["i"] % len(results_cycle)]
-            result_idx["i"] += 1
-            mock_eng.run.return_value = r
-            return mock_eng
+        def mock_backtest(candles, params, target_strategy=None):
+            call_count["backtest_round"] += 1
+            # First 6 calls (round 1) return good results
+            # Next 6 calls (round 2) return bad results
+            # Final 6 calls (round 3) return good results
+            if call_count["backtest_round"] <= 6:
+                return good_bt
+            elif call_count["backtest_round"] <= 12:
+                return bad_bt
+            else:
+                return good_bt
 
-        with patch("bot.learning.walk_forward.BacktestEngine", side_effect=engine_factory), \
+        mock_oos_result = MagicMock()
+        mock_oos_result.sharpe_ratio = 0.8
+        mock_oos_result.total_pnl = 100.0
+        mock_oos_engine = MagicMock()
+        mock_oos_engine.run.return_value = mock_oos_result
+
+        with patch("bot.learning.walk_forward._run_single_backtest", side_effect=mock_backtest), \
+             patch("bot.learning.walk_forward.BacktestEngine", return_value=mock_oos_engine), \
              patch("bot.learning.walk_forward.propose_params", return_value=[valid_params] * 6), \
              patch("bot.learning.walk_forward.refine_params", side_effect=mock_refine), \
              patch("bot.learning.walk_forward.summarize", return_value="market summary"):
@@ -1260,7 +1267,7 @@ In `_execute` method, replace the `_run_optuna_window` call with:
 ```python
 prev_windows_data = [
     {"window": i + 1, "best_params": w.params, "pnl": w.pnl,
-     "sharpe": w.sharpe, "profit_factor": w.profit_per_fee}
+     "sharpe": w.sharpe, "profit_per_fee": w.profit_per_fee}
     for i, w in enumerate(wf_windows)
 ] or None
 best_params, test_result = await loop.run_in_executor(
@@ -1280,7 +1287,7 @@ In `_execute_from_candles` method, replace the `_run_optuna_window` call with:
 ```python
 prev_windows_data = [
     {"window": i + 1, "best_params": w.params, "pnl": w.pnl,
-     "sharpe": w.sharpe, "profit_factor": w.profit_per_fee}
+     "sharpe": w.sharpe, "profit_per_fee": w.profit_per_fee}
     for i, w in enumerate(wf_windows)
 ] or None
 best_params, test_result = await loop.run_in_executor(
