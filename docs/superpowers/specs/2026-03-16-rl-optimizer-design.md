@@ -2,7 +2,7 @@
 
 ## Goal
 
-Replace Optuna's blind Bayesian optimization with a PPO reinforcement learning agent that learns optimal trading parameters from 8 years of historical 1m candle data. One model per strategy, 15 wide-range parameters, 27 market observation features.
+Replace Optuna's blind Bayesian optimization with a PPO reinforcement learning agent that learns optimal trading parameters from 8 years of historical 1m candle data. One model per strategy, 16 wide-range parameters, 27 market observation features.
 
 ## Motivation
 
@@ -142,7 +142,7 @@ class TradingParamEnv(gymnasium.Env):
     """RL environment for trading parameter optimization.
 
     Observation: 27 market features (float32)
-    Action: 15 parameters normalized to [-1, 1] (float32)
+    Action: 16 parameters normalized to [-1, 1] (float32)
     Reward: composite score with guardrails
     """
 
@@ -150,7 +150,7 @@ class TradingParamEnv(gymnasium.Env):
         self.observation_space = spaces.Box(
             low=-1.0, high=1.0, shape=(27,), dtype=np.float32
         )  # All features hard-clipped to [-1, 1] by feature_extractor
-        self.action_space = spaces.Box(low=-1, high=1, shape=(15,), dtype=np.float32)
+        self.action_space = spaces.Box(low=-1, high=1, shape=(16,), dtype=np.float32)
 
     def reset(self, seed=None, options=None):
         """Pick a random symbol and 90-day window. Compute features. Return observation."""
@@ -179,6 +179,7 @@ Action-to-parameter mapping:
 | 12 | tf_weight_1d | 0.0-1.0 | (a+1)/2 |
 | 13 | max_concurrent_positions | 1-10 | int((a+1)/2 * 9 + 1) |
 | 14 | confidence_size_scaling | 0.0-2.0 | (a+1)/2 * 2.0 |
+| 15 | ema200_filter_pct | 0.0-10.0 | (a+1)/2 * 10.0 |
 
 Each episode is one 90-day window on one symbol. The environment picks a random window on `reset()`, the agent takes a single action (parameter set), the backtest runs, reward is computed, episode ends (single-step episode).
 
@@ -287,7 +288,7 @@ class RLOptimizer:
 
 Inference flow:
 1. `feature_extractor.extract_features(candles_1m, btc_candles_1m)` → 27-element array
-2. `model.predict(features, deterministic=True)` → 15-element action
+2. `model.predict(features, deterministic=True)` → 16-element action
 3. Map action to parameter dict (same mapping table as environment)
 4. Return parameter dict
 
@@ -378,6 +379,23 @@ New `strategy_params` keys and exact integration points:
   # Example: strength=0.8, scaling=2.0 → 1.6x. strength=0.3, scaling=2.0 → 0.6x.
   if self._confidence_size_scaling > 0:
       size_eur *= max(0.2, 1.0 + (signal.strength - 0.5) * self._confidence_size_scaling)
+  ```
+
+**6. `ema200_filter_pct`** (float, default 2.0) — EMA200 trend filter strictness.
+- Extract in `__init__`: `self._ema200_filter_pct = params.get("ema200_filter_pct", 2.0)`
+- **Replaces** the hardcoded `2.0` in the EMA200 trend filter at lines 338-341:
+  ```python
+  # Current hardcoded logic (REPLACE):
+  if ema200_dist_pct < -2.0 and best_signal.direction == "LONG": ...
+  elif ema200_dist_pct > 2.0 and best_signal.direction == "SHORT": ...
+
+  # New RL-controllable logic:
+  if self._ema200_filter_pct > 0:
+      if ema200_dist_pct < -self._ema200_filter_pct and best_signal.direction == "LONG":
+          best_signal = None
+      elif ema200_dist_pct > self._ema200_filter_pct and best_signal.direction == "SHORT":
+          best_signal = None
+  # ema200_filter_pct == 0.0 → filter disabled, agent has full freedom
   ```
 
 **`bot/main.py`** — Load RL models on startup, wire retrain to scheduler.
