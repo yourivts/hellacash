@@ -285,6 +285,40 @@ class StrategyParams(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
+class FundingRateSnapshot(Base):
+    """Historical funding rate data (from Binance) for backtesting."""
+    __tablename__ = "funding_rate_snapshots"
+    __table_args__ = (
+        Index("ix_funding_symbol_ts", "symbol", "recorded_at"),
+        UniqueConstraint("symbol", "recorded_at", name="uq_funding_snapshot"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    funding_rate: Mapped[float] = mapped_column(Float, nullable=False)
+    funding_score: Mapped[float] = mapped_column(Float, nullable=False)  # -1 to +1 contrarian signal
+    open_interest: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    oi_change_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class OrderbookSnapshot(Base):
+    """Historical orderbook imbalance data for backtesting."""
+    __tablename__ = "orderbook_snapshots"
+    __table_args__ = (
+        Index("ix_orderbook_symbol_ts", "symbol", "recorded_at"),
+        UniqueConstraint("symbol", "recorded_at", name="uq_orderbook_snapshot"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    imbalance: Mapped[float] = mapped_column(Float, nullable=False)  # -1 to +1
+    spread_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    bid_depth_eur: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    ask_depth_eur: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
 class LearningEvent(Base):
     """Labeled training data for the adaptive learning system."""
 
@@ -300,3 +334,19 @@ class LearningEvent(Base):
     predicted_outcome: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     model_version: Mapped[int] = mapped_column(Integer, default=1)
     recorded_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
+class Candle1m(Base):
+    """1-minute candle data for RL training. Bulk-downloaded from Bitvavo."""
+    __tablename__ = "candle_1m"
+    __table_args__ = (
+        Index("ix_candle_1m_symbol_ts", "symbol", "timestamp"),
+    )
+
+    symbol: Mapped[str] = mapped_column(String(20), primary_key=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, primary_key=True)
+    open: Mapped[float] = mapped_column(Float, nullable=False)
+    high: Mapped[float] = mapped_column(Float, nullable=False)
+    low: Mapped[float] = mapped_column(Float, nullable=False)
+    close: Mapped[float] = mapped_column(Float, nullable=False)
+    volume: Mapped[float] = mapped_column(Float, nullable=False)
