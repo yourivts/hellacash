@@ -721,6 +721,9 @@ class BacktestEngine:
         regime: Regime = Regime.NEUTRAL,
     ) -> None:
         size_eur = self._compute_position_size(size_modifier, current_price=price, atr_pct=atr_pct)
+        # Cap position at 30% of initial capital to prevent compounding explosions
+        max_position = self.initial_capital * 0.30
+        size_eur = min(size_eur, max_position)
         if size_eur < 10.0 or size_eur > self.balance:
             return  # skip tiny or over-sized trades
 
