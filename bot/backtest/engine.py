@@ -986,7 +986,7 @@ class BacktestEngine:
         # Profit factor
         gross_wins = sum(t.pnl_eur for t in wins)
         gross_losses = abs(sum(t.pnl_eur for t in losses))
-        profit_factor = (gross_wins / gross_losses) if gross_losses > 0 else 999.0
+        profit_factor = (gross_wins / gross_losses) if gross_losses > 0 else (0.0 if gross_wins == 0 else 5.0)
 
         # Profit per fee
         profit_per_fee = (total_pnl / self._total_fees_paid) if self._total_fees_paid > 0 else 0.0
