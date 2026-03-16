@@ -54,7 +54,7 @@ def _run_optuna_window(train_candles, test_candles, max_workers, target_strategy
 
     study = optuna.create_study(
         direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=15),
+        sampler=optuna.samplers.TPESampler(n_startup_trials=15),
     )
 
     # Seed with champion params
