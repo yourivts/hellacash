@@ -29,6 +29,7 @@ class BotScheduler:
         walk_forward_run: Optional[Callable] = None,
         market_data_snapshot: Optional[Callable] = None,
         rl_retrain_run: Optional[Callable] = None,
+        rl_models_ready: Optional[Callable[[], bool]] = None,
     ) -> None:
         self._run_cycle = run_cycle
         self._sentiment_cycle = sentiment_cycle
@@ -41,6 +42,7 @@ class BotScheduler:
         self._walk_forward_run = walk_forward_run
         self._market_data_snapshot = market_data_snapshot
         self._rl_retrain_run = rl_retrain_run
+        self._rl_models_ready = rl_models_ready
         self._tasks: List[asyncio.Task] = []
 
     async def run_all(self) -> None:
@@ -106,8 +108,13 @@ class BotScheduler:
                     logger.error("Optimizer error: %s", e)
 
     async def _walk_forward_loop(self, interval_hours: int) -> None:
-        # Run once on startup (after 60s warmup for candles to load), then weekly
+        # Wait for RL models to be trained before running walk-forward
         await asyncio.sleep(60)
+        if self._rl_models_ready is not None:
+            while not self._rl_models_ready():
+                logger.info("Walk-forward: waiting for RL models to be trained...")
+                await asyncio.sleep(120)
+            logger.info("Walk-forward: RL models ready, starting optimization")
         while True:
             try:
                 logger.info("Walk-forward optimization starting...")

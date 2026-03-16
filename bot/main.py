@@ -479,6 +479,15 @@ async def _main() -> None:
         _get_rl_optimizer().load_models()
         logger.info("RL retrain complete: %s", results)
 
+    def _rl_models_ready() -> bool:
+        """Check if RL models have been trained (on disk), reload if newly available."""
+        rl_opt = _get_rl_optimizer()
+        if rl_opt.has_model("orderflow"):
+            return True
+        # Models might have been trained by bootstrap — try reloading from disk
+        rl_opt.load_models()
+        return rl_opt.has_model("orderflow")
+
     scheduler = BotScheduler(
         run_cycle=lambda: trading_loop.run_cycle(_tradeable_symbols, _running),
         sentiment_cycle=sentiment.run_cycle,
@@ -493,6 +502,7 @@ async def _main() -> None:
         walk_forward_run=_run_walk_forward,
         market_data_snapshot=_save_market_data_snapshots,
         rl_retrain_run=_retrain_rl,
+        rl_models_ready=_rl_models_ready,
     )
     _scheduler = scheduler
 
