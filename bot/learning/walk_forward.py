@@ -11,10 +11,10 @@ from bot.strategy.adopted_universe import CHAMPION_DEFAULTS
 
 logger = logging.getLogger(__name__)
 
-TRAIN_DAYS = 180  # was 90
-TEST_DAYS = 30    # was 14
-STEP_DAYS = 30    # was 14
-MIN_WINDOWS = 4   # was 3
+TRAIN_DAYS = 90
+TEST_DAYS = 14
+STEP_DAYS = 14
+MIN_WINDOWS = 4
 OPTUNA_TRIALS = 40  # Bayesian trials per window
 
 
