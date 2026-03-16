@@ -2,7 +2,7 @@
 
 ## Goal
 
-Replace Optuna's blind Bayesian optimization with a PPO reinforcement learning agent that learns optimal trading parameters from 8 years of historical 1m candle data. One model per strategy, 16 wide-range parameters, 27 market observation features.
+Replace Optuna's blind Bayesian optimization with a PPO reinforcement learning agent that learns optimal trading parameters from 8 years of historical 1m candle data. One model per strategy, 22 wide-range parameters (23 for range model), 27 market observation features.
 
 ## Motivation
 
@@ -142,7 +142,7 @@ class TradingParamEnv(gymnasium.Env):
     """RL environment for trading parameter optimization.
 
     Observation: 27 market features (float32)
-    Action: 16 parameters normalized to [-1, 1] (float32)
+    Action: 22 parameters normalized to [-1, 1] (23 for range model)
     Reward: composite score with guardrails
     """
 
@@ -150,7 +150,8 @@ class TradingParamEnv(gymnasium.Env):
         self.observation_space = spaces.Box(
             low=-1.0, high=1.0, shape=(27,), dtype=np.float32
         )  # All features hard-clipped to [-1, 1] by feature_extractor
-        self.action_space = spaces.Box(low=-1, high=1, shape=(16,), dtype=np.float32)
+        n_actions = 23 if strategy == "range" else 22
+        self.action_space = spaces.Box(low=-1, high=1, shape=(n_actions,), dtype=np.float32)
 
     def reset(self, seed=None, options=None):
         """Pick a random symbol and 90-day window. Compute features. Return observation."""
@@ -180,6 +181,16 @@ Action-to-parameter mapping:
 | 13 | max_concurrent_positions | 1-10 | int((a+1)/2 * 9 + 1) |
 | 14 | confidence_size_scaling | 0.0-2.0 | (a+1)/2 * 2.0 |
 | 15 | ema200_filter_pct | 0.0-10.0 | (a+1)/2 * 10.0 |
+| 16 | volatile_atr_threshold | 1.0-10.0 | (a+1)/2 * 9.0 + 1.0 |
+| 17 | consecutive_confirms | 1-5 | int((a+1)/2 * 4 + 1) |
+| 18 | confluence_boost | 1.0-2.0 | (a+1)/2 * 1.0 + 1.0 |
+| 19 | drawdown_scale_pct | 1.0-15.0 | (a+1)/2 * 14.0 + 1.0 |
+| 20 | max_position_pct | 0.1-0.5 | (a+1)/2 * 0.4 + 0.1 |
+| 21 | trail_activation_mult | 0.5-3.0 | (a+1)/2 * 2.5 + 0.5 |
+| 22 | range_max_hold_hours | 6-168 | int((a+1)/2 * 162 + 6) |
+
+Parameters 0-21 are used by all 4 strategy models (action space shape 22).
+Parameter 22 (`range_max_hold_hours`) is only used by the range model (action space shape 23). Non-range models ignore index 22.
 
 Each episode is one 90-day window on one symbol. The environment picks a random window on `reset()`, the agent takes a single action (parameter set), the backtest runs, reward is computed, episode ends (single-step episode).
 
@@ -288,7 +299,7 @@ class RLOptimizer:
 
 Inference flow:
 1. `feature_extractor.extract_features(candles_1m, btc_candles_1m)` → 27-element array
-2. `model.predict(features, deterministic=True)` → 16-element action
+2. `model.predict(features, deterministic=True)` → 22-element action (23 for range)
 3. Map action to parameter dict (same mapping table as environment)
 4. Return parameter dict
 
@@ -397,6 +408,70 @@ New `strategy_params` keys and exact integration points:
           best_signal = None
   # ema200_filter_pct == 0.0 → filter disabled, agent has full freedom
   ```
+
+**7. `volatile_atr_threshold`** (float, default 4.0) — ATR% above which regime becomes VOLATILE.
+- Extract in `__init__`: `self._volatile_atr_threshold = params.get("volatile_atr_threshold", 4.0)`
+- **Replaces** the hardcoded `4.0` at line 282:
+  ```python
+  # Current: elif atr_pct_4h > 4.0: regime = Regime.VOLATILE
+  # New:
+  elif atr_pct_4h > self._volatile_atr_threshold:
+      regime = Regime.VOLATILE
+  ```
+
+**8. `consecutive_confirms`** (int, default 1) — require signal to persist N consecutive bars.
+- Already extracted at line 150: `self._consecutive_confirms = params.get("consecutive_confirms", 1)`
+- Already used at line 348: `_signal_streak >= self._consecutive_confirms`
+- The RL agent optimizes this existing parameter — no new code needed.
+
+**9. `confluence_boost`** (float, default 1.2) — strength multiplier when strategies agree.
+- Extract in `__init__`: `self._confluence_boost = params.get("confluence_boost", 1.2)`
+- **Replaces** the hardcoded `1.2` at line 655 in `_evaluate_precomputed()`:
+  ```python
+  # Current: strength=min(confluence.strength * 1.2, 1.0)
+  # New:
+  strength=min(confluence.strength * self._confluence_boost, 1.0)
+  ```
+
+**10. `drawdown_scale_pct`** (float, default 3.0) — drawdown % threshold to halve position size.
+- Extract in `__init__`: `self._drawdown_scale_pct = params.get("drawdown_scale_pct", 3.0)`
+- **Replaces** the hardcoded `3.0` at line 707 in `_compute_position_size()`:
+  ```python
+  # Current: if drawdown_pct >= 3.0: size_eur *= 0.5
+  # New:
+  if drawdown_pct >= self._drawdown_scale_pct:
+      size_eur *= 0.5
+  ```
+
+**11. `max_position_pct`** (float, default 0.30) — max single position as fraction of initial capital.
+- Extract in `__init__`: `self._max_position_pct = params.get("max_position_pct", 0.30)`
+- **Replaces** the hardcoded `0.30` at line 725 in `_open_position()`:
+  ```python
+  # Current: max_position = self.initial_capital * 0.30
+  # New:
+  max_position = self.initial_capital * self._max_position_pct
+  ```
+
+**12. `trail_activation_mult`** (float, default 1.5) — trailing stop activation threshold multiplier.
+- Extract in `__init__`: `self._trail_activation_mult = params.get("trail_activation_mult", 1.5)`
+- **Replaces** the hardcoded `1.5` at line 857 in `_check_exits_fast()`:
+  ```python
+  # Current: activation_threshold=1.5,
+  # New:
+  pos.stop_loss = trail_stop(
+      price, pos.highest_price, pos.stop_loss,
+      trail_dist,
+      direction=direction,
+      activation_threshold=self._trail_activation_mult,
+      entry_price=pos.entry_price,
+  )
+  ```
+
+**13. `range_max_hold_hours`** (int, default 72) — max hold time for range strategy positions. **Range model only.**
+- Extract in `__init__`: `self._range_max_hold_bars = int(params.get("range_max_hold_hours", 72) * 12)`
+- **Replaces** the hardcoded `864` (72h × 12) at line 155.
+- Used at line 803: `if pos.strategy == "range": max_hold = self._range_max_hold_bars`
+- Non-range models never output this parameter; the default 72h applies when absent.
 
 **`bot/main.py`** — Load RL models on startup, wire retrain to scheduler.
 
