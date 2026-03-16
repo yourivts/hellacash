@@ -426,6 +426,10 @@ class TestRangeExitLogic:
         engine._base_risk_pct = 3.0
         engine._atr_multiplier = 2.0
         engine._rr_ratio = 2.0
+        engine._drawdown_scale_pct = 3.0
+        engine._max_position_pct = 0.30
+        engine._confidence_size_scaling = 0.0
+        engine.initial_capital = 10000.0
 
         # Create a signal with range indicator_snapshot
         signal = Signal(
