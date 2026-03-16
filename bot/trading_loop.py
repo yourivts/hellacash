@@ -273,12 +273,19 @@ class TradingLoop:
             wick_lower_ratio = 0.0
             wick_upper_ratio = 0.0
 
-        # EMA50 slope for squeeze strategy
+        # EMA50 slope for squeeze strategy (10-bar smoothed)
         ema50 = compute_ema(close_1h, 50)
-        if len(ema50) >= 2:
+        if len(ema50) >= 10:
+            ema50_slope = float(ema50.iloc[-1] - ema50.iloc[-10])
+        elif len(ema50) >= 2:
             ema50_slope = float(ema50.iloc[-1] - ema50.iloc[-2])
         else:
             ema50_slope = 0.0
+
+        # EMA200 for trend filter
+        ema200 = compute_ema(close_1h, 200)
+        ema200_val = float(ema200.iloc[-1]) if len(ema200) > 0 else price
+        ema200_dist_pct = (price - ema200_val) / ema200_val * 100.0 if ema200_val > 0 else 0.0
 
         # 4h RSI for funding_contrarian
         if df_4h is not None and len(df_4h) >= 14:
@@ -326,6 +333,14 @@ class TradingLoop:
 
         if not signals:
             return
+
+        # --- EMA200 trend filter: block signals against the daily trend ---
+        if abs(ema200_dist_pct) > 2.0:
+            blocked_dir = "LONG" if ema200_dist_pct < -2.0 else "SHORT"
+            signals = [s for s in signals if s["direction"] != blocked_dir]
+            if not signals:
+                logger.debug("EMA200 filter blocked all signals for %s (dist=%.1f%%)", symbol, ema200_dist_pct)
+                return
 
         # Run confluence check — relax when only 1 strategy enabled
         confluence = None  # may remain None in single-strategy path

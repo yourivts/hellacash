@@ -330,6 +330,16 @@ class BacktestEngine:
                 _prev_signal_dir = None
                 _signal_streak = 0
 
+            # --- EMA200 trend filter: block signals against the daily trend ---
+            if best_signal is not None and best_signal.direction in ("LONG", "SHORT"):
+                ema200_1d = precomp_1d["ema200"][h1d_idx] if precomp_1d and 0 <= h1d_idx < len(precomp_1d["ema200"]) else current_price
+                ema200_dist_pct = (current_price - ema200_1d) / ema200_1d * 100.0 if ema200_1d > 0 else 0.0
+                # Outside 2% transition zone: enforce trend alignment
+                if ema200_dist_pct < -2.0 and best_signal.direction == "LONG":
+                    best_signal = None  # price well below EMA200 → block longs
+                elif ema200_dist_pct > 2.0 and best_signal.direction == "SHORT":
+                    best_signal = None  # price well above EMA200 → block shorts
+
             # --- entry logic ---
             if (
                 best_signal is not None
@@ -593,10 +603,11 @@ class BacktestEngine:
                     bb_upper = precomp_1h["bb_upper"][idx_1h] if idx_1h < len(precomp_1h["bb_upper"]) else price
                     bb_lower = precomp_1h["bb_lower"][idx_1h] if idx_1h < len(precomp_1h["bb_lower"]) else price
                     volume_surge = precomp_1h["vsr"][idx_1h] if idx_1h < len(precomp_1h["vsr"]) else 1.0
-                    # EMA50 slope from 4h data
+                    # EMA50 slope from 4h data (10-bar smoothed, not 1-bar noise)
                     if precomp_4h and 0 <= h4_idx < len(precomp_4h["ema50"]):
                         ema50_now = precomp_4h["ema50"][h4_idx]
-                        ema50_prev = precomp_4h["ema50"][h4_idx - 1] if h4_idx > 0 else ema50_now
+                        lookback = min(10, h4_idx)
+                        ema50_prev = precomp_4h["ema50"][h4_idx - lookback] if lookback > 0 else ema50_now
                         ema50_slope = ema50_now - ema50_prev
                     else:
                         ema50_slope = 0.0
