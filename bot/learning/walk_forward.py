@@ -77,6 +77,7 @@ def _run_optuna_window(train_candles, test_candles, max_workers, target_strategy
                     "max_hold_hours": trial.suggest_int("max_hold_hours", 48, 240, step=24),
                     "quiet_atr_threshold": trial.suggest_float("quiet_atr_threshold", 0.8, 1.5, step=0.1),
                     "regime_adx_threshold": trial.suggest_float("regime_adx_threshold", 20, 30, step=2),
+                    "ranging_adx_threshold": trial.suggest_float("ranging_adx_threshold", 15, 25, step=2),
                 }
                 trials_and_params.append((trial, params))
 

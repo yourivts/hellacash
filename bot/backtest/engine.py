@@ -276,13 +276,14 @@ class BacktestEngine:
 
             _quiet_thresh = self._strategy_params.get("quiet_atr_threshold", 1.0)
             _regime_adx = self._strategy_params.get("regime_adx_threshold", 24)
+            _ranging_adx = self._strategy_params.get("ranging_adx_threshold", 20)
             if atr_pct_4h < _quiet_thresh:
                 regime = Regime.QUIET
             elif atr_pct_4h > 4.0:
                 regime = Regime.VOLATILE
             elif adx_4h > _regime_adx:
                 regime = Regime.TRENDING
-            elif adx_4h < 20:
+            elif adx_4h < _ranging_adx:
                 regime = Regime.RANGING
             else:
                 regime = Regime.NEUTRAL

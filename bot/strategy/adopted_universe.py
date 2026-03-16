@@ -15,6 +15,7 @@ CHAMPION_DEFAULTS: Dict[str, Any] = {
     "max_hold_hours": 120,
     "quiet_atr_threshold": 1.0,
     "regime_adx_threshold": 24,
+    "ranging_adx_threshold": 20,
 }
 
 ALL_STRATEGIES = ["orderflow", "range", "squeeze", "funding_contrarian"]

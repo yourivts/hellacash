@@ -178,9 +178,11 @@ class TradingLoop:
                 rp = self._universe.get_regime_params(symbol)
                 _quiet_thresh = rp["quiet_atr_threshold"]
                 _regime_adx = rp["regime_adx_threshold"]
+                _ranging_adx = rp.get("ranging_adx_threshold", 20)
             else:
                 _quiet_thresh = CHAMPION_DEFAULTS["quiet_atr_threshold"]
                 _regime_adx = CHAMPION_DEFAULTS["regime_adx_threshold"]
+                _ranging_adx = CHAMPION_DEFAULTS["ranging_adx_threshold"]
 
             if atr_pct < _quiet_thresh:
                 regime = Regime.QUIET
@@ -188,7 +190,7 @@ class TradingLoop:
                 regime = Regime.VOLATILE
             elif adx_val > _regime_adx:
                 regime = Regime.TRENDING
-            elif adx_val < 20:
+            elif adx_val < _ranging_adx:
                 regime = Regime.RANGING
             else:
                 regime = Regime.NEUTRAL
@@ -703,9 +705,11 @@ class TradingLoop:
                         rp = self._universe.get_regime_params(symbol)
                         _quiet_thresh = rp["quiet_atr_threshold"]
                         _regime_adx = rp["regime_adx_threshold"]
+                        _ranging_adx = rp.get("ranging_adx_threshold", 20)
                     else:
                         _quiet_thresh = CHAMPION_DEFAULTS["quiet_atr_threshold"]
                         _regime_adx = CHAMPION_DEFAULTS["regime_adx_threshold"]
+                        _ranging_adx = CHAMPION_DEFAULTS["ranging_adx_threshold"]
 
                     if atr_pct_4h < _quiet_thresh:
                         regime = Regime.QUIET
@@ -713,7 +717,7 @@ class TradingLoop:
                         regime = Regime.VOLATILE
                     elif adx_val > _regime_adx:
                         regime = Regime.TRENDING
-                    elif adx_val < 20:
+                    elif adx_val < _ranging_adx:
                         regime = Regime.RANGING
                     else:
                         regime = Regime.NEUTRAL
