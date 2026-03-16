@@ -29,8 +29,8 @@ def _run_single_backtest(candles, params, target_strategy=None):
     pf = result.profit_factor if hasattr(result, 'profit_factor') else 1.0
     ppf = result.profit_per_fee if hasattr(result, 'profit_per_fee') else 0.0
     logging.getLogger(__name__).info(
-        "Backtest done: %d candles, pnl=€%.2f, sharpe=%.2f, %.1fs",
-        len(candles), result.total_pnl, result.sharpe_ratio, elapsed
+        "Backtest done: %d candles, pnl=€%.2f, sharpe=%.2f, pf=%.2f, ppf=%.2f, %.1fs",
+        len(candles), result.total_pnl, result.sharpe_ratio, pf, ppf, elapsed
     )
     return params, result.total_pnl, result.sharpe_ratio, pf, ppf
 
@@ -54,7 +54,7 @@ def _run_optuna_window(train_candles, test_candles, max_workers, target_strategy
 
     study = optuna.create_study(
         direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=10),
+        sampler=optuna.samplers.TPESampler(seed=42, n_startup_trials=15),
     )
 
     # Seed with champion params
@@ -95,13 +95,24 @@ def _run_optuna_window(train_candles, test_candles, max_workers, target_strategy
                         sharpe = -10.0
                         pf = 0.0
                         ppf = 0.0
-                    score = sharpe * 0.4 + pf * 0.3 + ppf * 0.3
+                    # Normalize P&L to ~[-1, 1] range (€1000 = 1.0)
+                    pnl_norm = max(min(pnl / 1000.0, 3.0), -3.0)
+                    score = sharpe * 0.30 + pnl_norm * 0.30 + pf * 0.20 + ppf * 0.20
                     study.tell(trial, score)
                 except Exception:
                     study.tell(trial, float("-inf"))
 
-            logger.info("Optuna phase %d/%d done — best so far: score=%.2f",
-                         phase + 1, 2, study.best_value if study.best_trial else 0)
+            if study.best_trial:
+                bp = study.best_params
+                logger.info(
+                    "Optuna phase %d/%d done — best score=%.2f | "
+                    "atr=%.1f rr=%.1f risk=%.1f cooldown=%dh",
+                    phase + 1, 2, study.best_value,
+                    bp.get("atr_multiplier", 0), bp.get("rr_ratio", 0),
+                    bp.get("base_risk_pct", 0), bp.get("cooldown_hours", 0),
+                )
+            else:
+                logger.info("Optuna phase %d/%d done — no valid trial", phase + 1, 2)
 
     best_params = study.best_params
     logger.info("Optuna best in-sample: score=%.2f, params=%s", study.best_value, best_params)
