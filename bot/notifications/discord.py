@@ -130,6 +130,32 @@ class DiscordNotifier:
         except Exception as e:
             logger.debug("Discord send failed: %s", e)
 
+    async def send_walk_forward_report(self, results: dict) -> None:
+        """Send walk-forward analysis summary to Discord."""
+        lines = ["**Walk-Forward Analysis Complete**\n"]
+
+        for symbol, strat_results in results.items():
+            # Handle both old flat format and new nested format
+            if hasattr(strat_results, "adopted"):
+                # Old flat format: strat_results is a WFResult
+                status = "ADOPTED" if strat_results.adopted else "NOT ADOPTED"
+                lines.append(f"**{symbol}**: {status} (sharpe={strat_results.avg_oos_sharpe:.2f})")
+            else:
+                # New nested format: strat_results is Dict[str, WFResult]
+                parts = []
+                for strat_name, result in strat_results.items():
+                    if result.adopted:
+                        parts.append(f"{strat_name} ✓")
+                    else:
+                        parts.append(f"{strat_name} ✗")
+                lines.append(f"**{symbol}**: {' | '.join(parts)}")
+
+        await self._send_embed(
+            title="Walk-Forward Report",
+            description="\n".join(lines),
+            color=COLOR_INFO,
+        )
+
     async def shutdown(self) -> None:
         if self._session:
             await self._session.close()
