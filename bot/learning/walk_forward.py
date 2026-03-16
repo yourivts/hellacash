@@ -134,7 +134,7 @@ class WalkForwardOptimizer:
         """RL-driven parameter optimization for a single window."""
         from bot.learning.feature_extractor import extract_features
 
-        if self._rl_optimizer is None or not self._rl_optimizer.has_model(target_strategy or ""):
+        if self._rl_optimizer is None or not self._rl_optimizer.has_model(target_strategy or "orderflow"):
             return dict(CHAMPION_DEFAULTS), BacktestResult()
 
         # Get 1m candles for feature extraction from CandleStore

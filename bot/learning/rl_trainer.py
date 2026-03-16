@@ -143,7 +143,8 @@ class RLTrainer:
         """Run model on validation episodes, return average reward."""
         from bot.learning.rl_environment import TradingParamEnv
 
-        env = TradingParamEnv(self._candle_store, symbols, strategy)
+        env = TradingParamEnv(self._candle_store, symbols, strategy,
+                              validation_mode=True)
         total_reward = 0.0
         for _ in range(n_episodes):
             obs, _ = env.reset()

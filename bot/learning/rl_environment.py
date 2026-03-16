@@ -72,12 +72,13 @@ class TradingParamEnv(gymnasium.Env):
     metadata = {"render_modes": []}
 
     def __init__(self, candle_store, symbols: List[str], strategy: str,
-                 window_days: int = 90):
+                 window_days: int = 90, validation_mode: bool = False):
         super().__init__()
         self._candle_store = candle_store
         self._symbols = symbols
         self._strategy = strategy
         self._window_days = window_days
+        self._validation_mode = validation_mode
 
         self.observation_space = spaces.Box(
             low=-1.0, high=1.0, shape=(27,), dtype=np.float32,
@@ -110,12 +111,18 @@ class TradingParamEnv(gymnasium.Env):
             total_days = (max_ts - min_ts).days
             if total_days < self._window_days:
                 continue
-            # Hold out last 10% for validation
-            usable_end = min_ts + timedelta(days=int(total_days * 0.9))
-            start = min_ts
-            while start + window <= usable_end:
-                self._windows.append((sym, start, start + window))
-                start += step
+            # Split: first 90% for training, last 10% for validation
+            split_point = min_ts + timedelta(days=int(total_days * 0.9))
+            if self._validation_mode:
+                start = split_point
+                while start + window <= max_ts:
+                    self._windows.append((sym, start, start + window))
+                    start += step
+            else:
+                start = min_ts
+                while start + window <= split_point:
+                    self._windows.append((sym, start, start + window))
+                    start += step
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
