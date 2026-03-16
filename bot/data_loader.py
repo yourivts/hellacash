@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -104,6 +105,37 @@ class CandleCache:
                     })
             except Exception as e:
                 logger.error("Lazy load candles %s %s: %s", symbol, interval, e)
+
+    def build_1h_candle(self, symbol: str, hour_start) -> Optional[Dict[str, Any]]:
+        """Aggregate 5m candles within a given hour into a single 1h candle.
+
+        Args:
+            symbol: Trading pair (e.g., "BTC-EUR").
+            hour_start: Start of the hour (datetime).
+
+        Returns:
+            Dict with OHLCV data for the hour, or None if insufficient data.
+        """
+        candles_5m = self._cache.get(symbol, {}).get("5m", [])
+        hour_end = hour_start + timedelta(hours=1)
+
+        candles_in_hour = [
+            c for c in candles_5m
+            if hour_start <= c["timestamp"] < hour_end
+        ]
+        if len(candles_in_hour) < 10:  # allow 2 missing (out of 12)
+            return None
+
+        return {
+            "symbol": symbol,
+            "interval": "1h",
+            "timestamp": hour_start,
+            "open": candles_in_hour[0]["open"],
+            "high": max(c["high"] for c in candles_in_hour),
+            "low": min(c["low"] for c in candles_in_hour),
+            "close": candles_in_hour[-1]["close"],
+            "volume": sum(c["volume"] for c in candles_in_hour),
+        }
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
