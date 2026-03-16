@@ -36,6 +36,13 @@ class RangeStrategy(BaseStrategy):
 
     name = "range"
 
+    MIN_BANDWIDTH = 0.015   # 1.5%
+    MAX_BANDWIDTH = 0.08    # 8%
+    MAX_ADX_4H = 22.0
+    BAND_PROXIMITY_PCT = 1.0
+    RSI_OVERSOLD = 35.0
+    RSI_OVERBOUGHT = 65.0
+
     def __init__(self) -> None:
         self._bounce_counts: Dict[str, int] = {}
 
@@ -143,6 +150,33 @@ class RangeStrategy(BaseStrategy):
                 "vol_profile_score": float(vol_score),
             },
         )
+
+    def evaluate_1h(self, price, bb_lower, bb_upper, bb_mid, bb_bandwidth,
+                    adx_4h, rsi_1h) -> tuple[str, float]:
+        """Evaluate range conditions on the 1h timeframe and return (direction, strength)."""
+        if bb_bandwidth < self.MIN_BANDWIDTH or bb_bandwidth > self.MAX_BANDWIDTH:
+            return "NEUTRAL", 0.0
+        if adx_4h > self.MAX_ADX_4H:
+            return "NEUTRAL", 0.0
+
+        band_range = bb_upper - bb_lower
+        if band_range <= 0:
+            return "NEUTRAL", 0.0
+
+        proximity_threshold = price * (self.BAND_PROXIMITY_PCT / 100.0)
+
+        near_lower = (price - bb_lower) <= proximity_threshold
+        near_upper = (bb_upper - price) <= proximity_threshold
+
+        if near_lower and rsi_1h < self.RSI_OVERSOLD:
+            strength = min(0.5 + (self.RSI_OVERSOLD - rsi_1h) / 30.0, 1.0)
+            return "LONG", strength
+
+        if near_upper and rsi_1h > self.RSI_OVERBOUGHT:
+            strength = min(0.5 + (rsi_1h - self.RSI_OVERBOUGHT) / 30.0, 1.0)
+            return "SHORT", strength
+
+        return "NEUTRAL", 0.0
 
     @staticmethod
     def _empty_snapshot() -> Dict[str, Any]:
