@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     base_currency: str = "EUR"
     primary_interval: str = "5m"     # candle interval for strategy decisions
     strategy_cycle_secs: int = 30    # how often the strategy loop runs
-    candle_batch_size: int = 5       # concurrent candle fetches per batch
+    candle_batch_size: int = 15      # concurrent candle fetches per batch
     min_volume_eur: float = 10000.0  # skip markets with < this 24h volume for trading
 
     # ── Database ──────────────────────────────────────────────────────────────

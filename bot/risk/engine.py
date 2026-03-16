@@ -51,6 +51,18 @@ class RiskEngine:
         reasons: List[str] = []
         gate_details: Dict[str, Dict[str, Any]] = {}
 
+        # 0. Zero/negative equity guard
+        if portfolio_equity_eur <= 0:
+            reasons.append(f"Portfolio equity €{portfolio_equity_eur:.2f} <= 0")
+            decision = RiskDecision(approved=False, reasons=reasons, gate_details={})
+            logger.info("RiskEngine REJECTED %s %s: %s", side, symbol, "; ".join(reasons))
+            self._recent_decisions.appendleft({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "symbol": symbol, "side": side,
+                "approved": False, "reasons": reasons, "gate_details": {},
+            })
+            return decision
+
         # 1. Signal confidence
         conf_threshold = self.settings.min_signal_confidence
         conf_passed = signal_confidence >= conf_threshold

@@ -55,7 +55,8 @@ class EventBus:
 
     async def publish(self, topic: str, payload: Dict[str, Any]) -> None:
         event = Event(topic=topic, payload=payload)
-        queues = self._subscribers.get(topic, [])
+        # Snapshot the list to avoid race with concurrent subscribe()
+        queues = list(self._subscribers.get(topic, []))
         for q in queues:
             try:
                 q.put_nowait(event)

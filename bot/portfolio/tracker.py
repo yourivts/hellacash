@@ -46,12 +46,26 @@ class PortfolioTracker:
 
     async def refresh(self) -> None:
         """Reload positions from DB and update prices from exchange."""
+        import asyncio
+
         async with get_session() as session:
             positions = await get_all_open_positions(session)
 
+        # Batch-fetch all tickers in parallel via executor (avoids N+1 blocking calls)
+        loop = asyncio.get_running_loop()
+        symbols = [p.symbol for p in positions]
+        if symbols:
+            tickers = await asyncio.gather(*(
+                loop.run_in_executor(None, self.client.get_ticker, sym)
+                for sym in symbols
+            ))
+            ticker_map = {sym: t for sym, t in zip(symbols, tickers)}
+        else:
+            ticker_map = {}
+
         self._positions = {}
         for p in positions:
-            ticker = self.client.get_ticker(p.symbol)
+            ticker = ticker_map.get(p.symbol)
             current_price = ticker.price if ticker else p.current_price
             direction = getattr(p, "direction", "LONG") or "LONG"
             pos_dict = {
@@ -196,7 +210,7 @@ class PortfolioTracker:
         exit_reason: str,
         sentiment_score: float = 0.0,
     ) -> Optional[Dict[str, Any]]:
-        pos = self._positions.pop(symbol, None)
+        pos = self._positions.get(symbol)
         if pos is None:
             return None
 
@@ -238,11 +252,9 @@ class PortfolioTracker:
         if net_pnl < 0:
             self._daily_realized_loss += abs(net_pnl)
 
+        # Persist to DB first — only remove from memory after success
         async with get_session() as session:
-            # Remove from positions table
             await delete_position(session, symbol)
-
-            # Save closed trade
             trade = await save_trade(
                 session,
                 symbol=symbol,
@@ -262,6 +274,9 @@ class PortfolioTracker:
                 paper_trade=pos["paper_trade"],
                 borrow_fee=borrow_fee,
             )
+
+        # DB succeeded — now safe to remove from in-memory state
+        self._positions.pop(symbol, None)
 
         logger.info(
             "Position closed: %s %s @ €%.4f | P&L: €%.2f (%.2f%%) | Fee: €%.2f | Reason: %s",

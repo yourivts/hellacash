@@ -44,7 +44,7 @@ def _run_optuna_window(train_candles, test_candles, max_workers, target_strategy
                          feed results back to Optuna.
       Phase 2 (exploit): generate 20 more candidates informed by Phase 1,
                          run all in parallel.
-    This gives true multi-core parallelism while keeping Optuna's smart sampling.
+    Single persistent process pool across both phases to avoid spawn overhead.
     """
     import optuna
     from concurrent.futures import ProcessPoolExecutor
@@ -62,25 +62,26 @@ def _run_optuna_window(train_candles, test_candles, max_workers, target_strategy
 
     half = OPTUNA_TRIALS // 2
 
-    for phase in range(2):
-        # Ask Optuna for a batch of candidates
-        trials_and_params = []
-        for _ in range(half):
-            trial = study.ask()
-            params = {
-                "atr_multiplier": trial.suggest_float("atr_multiplier", 2.5, 5.0, step=0.5),
-                "rr_ratio": trial.suggest_float("rr_ratio", 2.0, 4.0, step=0.5),
-                "base_risk_pct": trial.suggest_float("base_risk_pct", 2.0, 5.0, step=0.5),
-                "min_profit_multiple": trial.suggest_float("min_profit_multiple", 2.0, 4.0, step=0.5),
-                "cooldown_hours": trial.suggest_int("cooldown_hours", 12, 72, step=12),
-                "max_hold_hours": trial.suggest_int("max_hold_hours", 48, 240, step=24),
-                "quiet_atr_threshold": trial.suggest_float("quiet_atr_threshold", 0.8, 1.5, step=0.1),
-                "regime_adx_threshold": trial.suggest_float("regime_adx_threshold", 20, 30, step=2),
-            }
-            trials_and_params.append((trial, params))
+    # Single pool for both phases — avoids spawning 2 * max_workers processes
+    with ProcessPoolExecutor(max_workers=max_workers) as pool:
+        for phase in range(2):
+            # Ask Optuna for a batch of candidates
+            trials_and_params = []
+            for _ in range(half):
+                trial = study.ask()
+                params = {
+                    "atr_multiplier": trial.suggest_float("atr_multiplier", 2.5, 5.0, step=0.5),
+                    "rr_ratio": trial.suggest_float("rr_ratio", 2.0, 4.0, step=0.5),
+                    "base_risk_pct": trial.suggest_float("base_risk_pct", 2.0, 5.0, step=0.5),
+                    "min_profit_multiple": trial.suggest_float("min_profit_multiple", 2.0, 4.0, step=0.5),
+                    "cooldown_hours": trial.suggest_int("cooldown_hours", 12, 72, step=12),
+                    "max_hold_hours": trial.suggest_int("max_hold_hours", 48, 240, step=24),
+                    "quiet_atr_threshold": trial.suggest_float("quiet_atr_threshold", 0.8, 1.5, step=0.1),
+                    "regime_adx_threshold": trial.suggest_float("regime_adx_threshold", 20, 30, step=2),
+                }
+                trials_and_params.append((trial, params))
 
-        # Run all candidates in parallel across CPU cores
-        with ProcessPoolExecutor(max_workers=max_workers) as pool:
+            # Run all candidates in parallel across CPU cores
             futures = {
                 pool.submit(_run_single_backtest, train_candles, params, target_strategy): (trial, params)
                 for trial, params in trials_and_params
@@ -99,8 +100,8 @@ def _run_optuna_window(train_candles, test_candles, max_workers, target_strategy
                 except Exception:
                     study.tell(trial, float("-inf"))
 
-        logger.info("Optuna phase %d/%d done — best so far: score=%.2f",
-                     phase + 1, 2, study.best_value if study.best_trial else 0)
+            logger.info("Optuna phase %d/%d done — best so far: score=%.2f",
+                         phase + 1, 2, study.best_value if study.best_trial else 0)
 
     best_params = study.best_params
     logger.info("Optuna best in-sample: score=%.2f, params=%s", study.best_value, best_params)
@@ -299,7 +300,7 @@ class WalkForwardOptimizer:
         wf_windows: List[WFWindow] = []
 
         import os
-        max_workers = os.cpu_count() or 4
+        max_workers = min((os.cpu_count() or 4) // 2, 8) or 2
 
         for i, ws in enumerate(windows_spec):
             if candle_fetcher is None:
@@ -365,7 +366,7 @@ class WalkForwardOptimizer:
 
         loop = asyncio.get_running_loop()
         wf_windows: List[WFWindow] = []
-        max_workers = os.cpu_count() or 4
+        max_workers = min((os.cpu_count() or 4) // 2, 8) or 2
 
         for i, ws in enumerate(windows_spec):
             train_start = int(ws["train_start_day"] * candles_per_day)

@@ -41,12 +41,13 @@ def _update_rate_limits(resp) -> None:
         remaining = resp.headers.get("bitvavo-ratelimit-remaining")
         reset_at = resp.headers.get("bitvavo-ratelimit-resetat")
         limit = resp.headers.get("bitvavo-ratelimit-limit")
-        if remaining is not None:
-            _rate_remaining = int(remaining)
-        if reset_at is not None:
-            _rate_reset_at = int(reset_at) / 1000.0  # ms → seconds
-        if limit is not None:
-            _rate_limit = int(limit)
+        with _rate_lock:
+            if remaining is not None:
+                _rate_remaining = int(remaining)
+            if reset_at is not None:
+                _rate_reset_at = int(reset_at) / 1000.0  # ms → seconds
+            if limit is not None:
+                _rate_limit = int(limit)
     except (ValueError, TypeError):
         pass
 
@@ -186,6 +187,7 @@ class BitvavoClient:
 
     def __init__(self, api_key: str, api_secret: str, paper_trading: bool = True) -> None:
         self.paper_trading = paper_trading
+        self._paper_lock = threading.Lock()
         self._paper_balance: Dict[str, float] = self._load_paper_state()
 
         if api_key and api_secret:
@@ -437,16 +439,16 @@ class BitvavoClient:
         order_id = str(uuid.uuid4())
 
         base = symbol.split("-")[0]
-        if side == "buy":
-            cost = amount * fill_price + fee
-            self._paper_balance["EUR"] = max(0.0, self._paper_balance.get("EUR", 0) - cost)
-            self._paper_balance[base] = self._paper_balance.get(base, 0.0) + amount
-        else:
-            proceeds = amount * fill_price - fee
-            self._paper_balance["EUR"] = self._paper_balance.get("EUR", 0.0) + proceeds
-            self._paper_balance[base] = max(0.0, self._paper_balance.get(base, 0.0) - amount)
-
-        self._save_paper_state()
+        with self._paper_lock:
+            if side == "buy":
+                cost = amount * fill_price + fee
+                self._paper_balance["EUR"] = max(0.0, self._paper_balance.get("EUR", 0) - cost)
+                self._paper_balance[base] = self._paper_balance.get(base, 0.0) + amount
+            else:
+                proceeds = amount * fill_price - fee
+                self._paper_balance["EUR"] = self._paper_balance.get("EUR", 0.0) + proceeds
+                self._paper_balance[base] = max(0.0, self._paper_balance.get(base, 0.0) - amount)
+            self._save_paper_state()
 
         return {
             "orderId": order_id,

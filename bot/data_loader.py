@@ -19,6 +19,8 @@ class CandleCache:
     def __init__(self) -> None:
         # symbol -> interval -> list of dicts (chronological)
         self._cache: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+        # symbol -> interval -> cached DataFrame (invalidated on new candles)
+        self._df_cache: Dict[str, Dict[str, pd.DataFrame]] = {}
         self._is_ready: bool = False
         self._progress: Dict[str, Any] = {"loaded": 0, "total": 0, "done": False}
 
@@ -45,14 +47,22 @@ class CandleCache:
             cache.append(candle)
             if len(cache) > MAX_CANDLES:
                 cache.pop(0)
+        # Invalidate cached DataFrame
+        if symbol in self._df_cache and interval in self._df_cache.get(symbol, {}):
+            del self._df_cache[symbol][interval]
 
     def get_df(self, symbol: str, interval: str) -> pd.DataFrame:
+        # Return cached DataFrame if available
+        cached_df = self._df_cache.get(symbol, {}).get(interval)
+        if cached_df is not None:
+            return cached_df
         rows = self._cache.get(symbol, {}).get(interval, [])
         if not rows:
             return pd.DataFrame()
         df = pd.DataFrame(rows)
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         df = df.set_index("timestamp").sort_index()
+        self._df_cache.setdefault(symbol, {})[interval] = df
         return df
 
     def has_enough(self, symbol: str, interval: str = "5m", minimum: int = 30) -> bool:
