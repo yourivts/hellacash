@@ -343,6 +343,7 @@ class TradingLoop:
             return
 
         # Run confluence check — relax when only 1 strategy enabled
+        confluence = None  # may remain None in single-strategy path
         if hasattr(self, '_universe') and self._universe is not None:
             enabled = self._universe.get_enabled_strategies(symbol)
             if len(enabled) <= 1 and signals:
@@ -411,6 +412,7 @@ class TradingLoop:
             tp_distance_pct=tp_distance_pct,
             taker_fee_pct=taker_pct,
             is_short=(direction == "SHORT"),
+            min_profit_multiple=strat_params["min_profit_multiple"],
         )
         if not fee_result.approved:
             logger.debug("Fee gate rejected %s %s: %s", direction, symbol, fee_result.reason)
@@ -438,19 +440,20 @@ class TradingLoop:
         if not decision.approved:
             return
 
-        strategy_name = confluence.agreeing_strategies[0] if confluence.agreeing_strategies else "confluence"
+        agreeing = confluence.agreeing_strategies if confluence else []
+        strategy_name = agreeing[0] if agreeing else (max(signals, key=lambda s: s["strength"])["strategy"] if signals else "unknown")
 
         logger.info(
             "1h Signal ACCEPTED %s %s [%s] — size EUR%.2f, strength=%.2f, confluence=%s",
             direction, symbol, strategy_name, size_eur, strength,
-            confluence.agreeing_strategies,
+            agreeing,
         )
 
         # Place order
         self._pending_orders.add(symbol)
         try:
             journal_data = {
-                "confluence": confluence.agreeing_strategies,
+                "confluence": agreeing,
                 "market_regime": regime.value if hasattr(regime, 'value') else str(regime),
                 "strength": strength,
             }
