@@ -300,7 +300,7 @@ class WalkForwardOptimizer:
         wf_windows: List[WFWindow] = []
 
         import os
-        max_workers = min((os.cpu_count() or 4) // 2, 8) or 2
+        max_workers = os.cpu_count() or 4
 
         for i, ws in enumerate(windows_spec):
             if candle_fetcher is None:
@@ -366,7 +366,7 @@ class WalkForwardOptimizer:
 
         loop = asyncio.get_running_loop()
         wf_windows: List[WFWindow] = []
-        max_workers = min((os.cpu_count() or 4) // 2, 8) or 2
+        max_workers = os.cpu_count() or 4
 
         for i, ws in enumerate(windows_spec):
             train_start = int(ws["train_start_day"] * candles_per_day)
