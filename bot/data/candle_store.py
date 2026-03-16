@@ -1,10 +1,11 @@
 """CandleStore — bulk 1m candle download and storage for RL training."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -12,6 +13,9 @@ import psycopg2
 import psycopg2.extras
 
 logger = logging.getLogger(__name__)
+
+# Max entries in the candle DataFrame cache (LRU eviction)
+_CACHE_MAX_ENTRIES = 200
 
 
 class CandleStore:
@@ -26,6 +30,10 @@ class CandleStore:
         self._sync_url = db_url.replace("+asyncpg", "").replace("postgresql+psycopg2", "postgresql")
         if self._sync_url.startswith("postgresql+"):
             self._sync_url = "postgresql" + self._sync_url[self._sync_url.index("://"):]
+        # In-memory caches to avoid repeated DB reads during training
+        self._candle_cache: Dict[str, pd.DataFrame] = {}
+        self._candle_cache_order: List[str] = []  # LRU order
+        self._date_range_cache: Dict[str, Optional[Tuple[datetime, datetime]]] = {}
 
     async def bulk_download(self, symbols: List[str],
                             min_days: int = 90) -> None:
@@ -43,6 +51,7 @@ class CandleStore:
                 await self._download_symbol(symbol)
             except Exception as e:
                 logger.error("CandleStore: failed to download %s: %s", symbol, e)
+        self.clear_cache()  # invalidate stale cached data after download
 
     async def incremental_update(self, symbols: List[str]) -> None:
         """Pull new 1m candles since last download."""
@@ -146,12 +155,42 @@ class CandleStore:
         # Replace trailing 'm' (minute) that is NOT followed by other letters (avoids 'ME', 'MS')
         return re.sub(r"^(\d*)m$", lambda match: (match.group(1) or "") + "min", resample)
 
+    def _cache_key(self, symbol: str, start: datetime, end: datetime) -> str:
+        """Build a stable cache key for a (symbol, start, end) query."""
+        return f"{symbol}|{start.isoformat()}|{end.isoformat()}"
+
+    def _get_cached_1m(self, symbol: str, start: datetime,
+                       end: datetime) -> pd.DataFrame:
+        """Return cached 1m DataFrame, reading from DB on first access."""
+        key = self._cache_key(symbol, start, end)
+        if key in self._candle_cache:
+            # Move to end of LRU list
+            self._candle_cache_order.remove(key)
+            self._candle_cache_order.append(key)
+            return self._candle_cache[key]
+
+        df = self._read_candles_sync(symbol, start, end)
+        # Evict oldest if cache is full
+        while len(self._candle_cache_order) >= _CACHE_MAX_ENTRIES:
+            evict = self._candle_cache_order.pop(0)
+            self._candle_cache.pop(evict, None)
+        self._candle_cache[key] = df
+        self._candle_cache_order.append(key)
+        return df
+
+    def clear_cache(self) -> None:
+        """Clear in-memory caches (call after bulk_download)."""
+        self._candle_cache.clear()
+        self._candle_cache_order.clear()
+        self._date_range_cache.clear()
+
     def get_candles(self, symbol: str, start: datetime, end: datetime,
                     resample: str = "5m") -> pd.DataFrame:
         """Fetch candles for a date range, optionally resampled.
         SYNC — safe to call from SubprocVecEnv workers.
+        Results are cached in memory to avoid repeated DB reads during training.
         """
-        df = self._read_candles_sync(symbol, start, end)
+        df = self._get_cached_1m(symbol, start, end)
         if df.empty:
             return df
 
@@ -188,7 +227,9 @@ class CandleStore:
             conn.close()
 
     def get_date_range(self, symbol: str) -> Optional[tuple]:
-        """Return (min_ts, max_ts) for a symbol, or None if no data."""
+        """Return (min_ts, max_ts) for a symbol, or None if no data. Cached."""
+        if symbol in self._date_range_cache:
+            return self._date_range_cache[symbol]
         conn = psycopg2.connect(self._sync_url)
         try:
             with conn.cursor() as cur:
@@ -197,9 +238,9 @@ class CandleStore:
                     (symbol,),
                 )
                 row = cur.fetchone()
-                if row and row[0]:
-                    return (row[0], row[1])
-                return None
+                result = (row[0], row[1]) if row and row[0] else None
+                self._date_range_cache[symbol] = result
+                return result
         finally:
             conn.close()
 

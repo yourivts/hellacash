@@ -20,7 +20,7 @@ class RLTrainer:
         self._model_dir = model_dir
         os.makedirs(model_dir, exist_ok=True)
 
-    def train(self, total_timesteps: int = 25_000) -> Dict[str, float]:
+    def train(self, total_timesteps: int = 10_000) -> Dict[str, float]:
         """Full training run. Returns {strategy: avg_reward}."""
         from stable_baselines3 import PPO
         from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
@@ -53,7 +53,7 @@ class RLTrainer:
                 model = PPO(
                     "MlpPolicy", vec_env,
                     learning_rate=3e-4,
-                    n_steps=2048,
+                    n_steps=1024,
                     batch_size=64,
                     policy_kwargs={"net_arch": [256, 256, 256]},
                     verbose=0,
