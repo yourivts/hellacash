@@ -149,10 +149,25 @@ class BacktestEngine:
         # Consecutive confirmation: require signal to persist N cycles before entry
         self._consecutive_confirms = params.get("consecutive_confirms", 1)
 
+        # RL-tunable parameters (replacing hardcoded values)
+        self._signal_strength_min = params.get("signal_strength_min", 0.0)
+        self._tf_weight_1h = params.get("tf_weight_1h", 1.0)
+        self._tf_weight_4h = params.get("tf_weight_4h", 1.0)
+        self._tf_weight_1d = params.get("tf_weight_1d", 1.0)
+        self._confidence_size_scaling = params.get("confidence_size_scaling", 0.0)
+        self._ema200_filter_pct = params.get("ema200_filter_pct", 2.0)
+        self._volatile_atr_threshold = params.get("volatile_atr_threshold", 4.0)
+        self._confluence_boost = params.get("confluence_boost", 1.2)
+        self._drawdown_scale_pct = params.get("drawdown_scale_pct", 3.0)
+        self._max_position_pct = params.get("max_position_pct", 0.30)
+        self._trail_activation_mult = params.get("trail_activation_mult", 1.5)
+        if "max_concurrent_positions" in params:
+            self.max_open = params["max_concurrent_positions"]
+
         # Range strategy: bounce counter per symbol
         self._range_bounces: Dict[str, int] = {}
-        # Range strategy: max hold = 72h = 864 5m bars (hardcoded, not walk-forward)
-        self._range_max_hold_bars = 864
+        # Range strategy: max hold (default 72h = 864 5m bars)
+        self._range_max_hold_bars = int(params.get("range_max_hold_hours", 72) * 12)
 
         # Tracking counters for new metrics
         self._total_fees_paid: float = 0.0
@@ -279,7 +294,7 @@ class BacktestEngine:
             _ranging_adx = self._strategy_params.get("ranging_adx_threshold", 20)
             if atr_pct_4h < _quiet_thresh:
                 regime = Regime.QUIET
-            elif atr_pct_4h > 4.0:
+            elif atr_pct_4h > self._volatile_atr_threshold:
                 regime = Regime.VOLATILE
             elif adx_4h > _regime_adx:
                 regime = Regime.TRENDING
@@ -334,17 +349,17 @@ class BacktestEngine:
             if best_signal is not None and best_signal.direction in ("LONG", "SHORT"):
                 ema200_1d = precomp_1d["ema200"][h1d_idx] if precomp_1d and 0 <= h1d_idx < len(precomp_1d["ema200"]) else current_price
                 ema200_dist_pct = (current_price - ema200_1d) / ema200_1d * 100.0 if ema200_1d > 0 else 0.0
-                # Outside 2% transition zone: enforce trend alignment
-                if ema200_dist_pct < -2.0 and best_signal.direction == "LONG":
-                    best_signal = None  # price well below EMA200 → block longs
-                elif ema200_dist_pct > 2.0 and best_signal.direction == "SHORT":
-                    best_signal = None  # price well above EMA200 → block shorts
+                if self._ema200_filter_pct > 0:
+                    if ema200_dist_pct < -self._ema200_filter_pct and best_signal.direction == "LONG":
+                        best_signal = None
+                    elif ema200_dist_pct > self._ema200_filter_pct and best_signal.direction == "SHORT":
+                        best_signal = None
 
             # --- entry logic ---
             if (
                 best_signal is not None
                 and best_signal.direction in ("LONG", "SHORT")
-                and best_signal.strength > 0
+                and best_signal.strength >= self._signal_strength_min
                 and _signal_streak >= self._consecutive_confirms
                 and len(self.positions) < self.max_open
             ):
@@ -637,37 +652,67 @@ class BacktestEngine:
         if self._target_strategy:
             # Single strategy isolation — skip confluence
             best = max(collected_signals, key=lambda s: s["strength"])
+            adj_strength = self._apply_tf_weights(
+                best["direction"], best["strength"], precomp_4h, precomp_1d, h4_idx, h1d_idx,
+            )
             return Signal(
                 symbol=symbol,
                 direction=best["direction"],
-                strength=best["strength"],
+                strength=adj_strength,
                 strategy_name=best["strategy"],
-                technical_score=best["strength"] if best["direction"] == "LONG" else -best["strength"],
+                technical_score=adj_strength if best["direction"] == "LONG" else -adj_strength,
                 indicator_snapshot={"confirming_count": 1},
             )
 
         confluence = check_confluence(collected_signals)
         if confluence.triggered:
             # Confluence gives a boost — use best strength from agreeing strategies
+            boosted = min(confluence.strength * self._confluence_boost, 1.0)
+            adj_strength = self._apply_tf_weights(
+                confluence.direction, boosted, precomp_4h, precomp_1d, h4_idx, h1d_idx,
+            )
             return Signal(
                 symbol=symbol,
                 direction=confluence.direction,
-                strength=min(confluence.strength * 1.2, 1.0),  # 20% boost
+                strength=adj_strength,
                 strategy_name="confluence:" + "+".join(confluence.agreeing_strategies),
-                technical_score=confluence.strength if confluence.direction == "LONG" else -confluence.strength,
+                technical_score=adj_strength if confluence.direction == "LONG" else -adj_strength,
                 indicator_snapshot={"confirming_count": len(confluence.agreeing_strategies)},
             )
 
         # No confluence — return the single best signal
         best = max(collected_signals, key=lambda s: s["strength"])
+        adj_strength = self._apply_tf_weights(
+            best["direction"], best["strength"], precomp_4h, precomp_1d, h4_idx, h1d_idx,
+        )
         return Signal(
             symbol=symbol,
             direction=best["direction"],
-            strength=best["strength"],
+            strength=adj_strength,
             strategy_name=best["strategy"],
-            technical_score=best["strength"] if best["direction"] == "LONG" else -best["strength"],
+            technical_score=adj_strength if best["direction"] == "LONG" else -adj_strength,
             indicator_snapshot={"confirming_count": 1},
         )
+
+    def _apply_tf_weights(self, direction, strength, precomp_4h, precomp_1d, h4_idx, h1d_idx):
+        """Scale signal strength by timeframe trend agreement."""
+        tf_score = self._tf_weight_1h
+        if precomp_4h and 0 <= h4_idx < len(precomp_4h.get("ema50", [])):
+            lookback = min(3, h4_idx)
+            if lookback > 0:
+                slope = precomp_4h["ema50"][h4_idx] - precomp_4h["ema50"][h4_idx - lookback]
+                if (direction == "LONG" and slope > 0) or (direction == "SHORT" and slope < 0):
+                    tf_score += self._tf_weight_4h
+        if precomp_1d and 0 <= h1d_idx < len(precomp_1d.get("ema50", [])):
+            lookback = min(3, h1d_idx)
+            if lookback > 0:
+                slope = precomp_1d["ema50"][h1d_idx] - precomp_1d["ema50"][h1d_idx - lookback]
+                if (direction == "LONG" and slope > 0) or (direction == "SHORT" and slope < 0):
+                    tf_score += self._tf_weight_1d
+        total = self._tf_weight_1h + self._tf_weight_4h + self._tf_weight_1d
+        if total > 0:
+            strength *= tf_score / total
+        return strength
 
     # ------------------------------------------------------------------
     # Position management helpers
@@ -704,7 +749,7 @@ class BacktestEngine:
         # Drawdown scaling (matches live DrawdownGuard.position_size_multiplier)
         drawdown_pct = ((self.peak_balance - equity) / self.peak_balance * 100.0
                         if self.peak_balance > 0 else 0.0)
-        if drawdown_pct >= 3.0:
+        if drawdown_pct >= self._drawdown_scale_pct:
             size_eur *= 0.5
 
         return size_eur
@@ -721,9 +766,11 @@ class BacktestEngine:
         regime: Regime = Regime.NEUTRAL,
     ) -> None:
         size_eur = self._compute_position_size(size_modifier, current_price=price, atr_pct=atr_pct)
-        # Cap position at 30% of initial capital to prevent compounding explosions
-        max_position = self.initial_capital * 0.30
+        # Cap position at max_position_pct of initial capital to prevent compounding explosions
+        max_position = self.initial_capital * self._max_position_pct
         size_eur = min(size_eur, max_position)
+        if self._confidence_size_scaling > 0:
+            size_eur *= max(0.2, 1.0 + (signal.strength - 0.5) * self._confidence_size_scaling)
         if size_eur < 10.0 or size_eur > self.balance:
             return  # skip tiny or over-sized trades
 
@@ -854,7 +901,7 @@ class BacktestEngine:
                     price, pos.highest_price, pos.stop_loss,
                     trail_dist,
                     direction=direction,
-                    activation_threshold=1.5,
+                    activation_threshold=self._trail_activation_mult,
                     entry_price=pos.entry_price,
                 )
 
