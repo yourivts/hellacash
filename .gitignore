@@ -16,3 +16,6 @@ postgres_data/
 .vscode/
 node_modules/
 alembic/versions/*.pyc
+paper_state.json
+.superpowers/
+.worktrees/
