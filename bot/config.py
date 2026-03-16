@@ -42,11 +42,12 @@ class Settings(BaseSettings):
     max_drawdown_pct: float = Field(default=8.0, ge=0, le=100)    # portfolio hard stop (%)
     soft_drawdown_pct: float = Field(default=3.0, ge=0, le=100)   # reduce position sizes by 50%
     max_position_size_pct: float = Field(default=20.0, ge=0, le=100)  # max single position (% of portfolio)
-    max_daily_loss_eur: float = Field(default=200.0, ge=0)         # daily loss circuit breaker
-    max_open_positions: int = Field(default=5, ge=1)
+    max_daily_loss_eur: float = Field(default=50.0, ge=0)          # daily loss circuit breaker
+    max_open_positions: int = Field(default=10, ge=1)
     min_trade_roi_pct: float = Field(default=0.3, ge=0)            # min expected ROI before fees (%)
     min_signal_confidence: float = Field(default=0.60, ge=0, le=1) # min composite confidence to trade
     kelly_fraction: float = Field(default=0.25, ge=0, le=1)        # quarter-Kelly sizing
+    trade_cooldown_hours: float = Field(default=12.0, ge=0)        # hours between trades per symbol
     taker_fee_pct: float = Field(default=0.25, ge=0)               # Bitvavo taker fee (%)
     maker_fee_pct: float = Field(default=0.15, ge=0)               # Bitvavo maker fee (%)
 
@@ -76,6 +77,20 @@ class Settings(BaseSettings):
     # ── Order book ───────────────────────────────────────────────────────────
     orderbook_enabled: bool = True
     orderbook_depth_levels: int = 25
+
+    # ── Position sizing ───────────────────────────────────────────────────────
+    base_risk_pct: float = 3.0          # % of equity risked per trade (fixed fractional)
+    confluence_risk_pct: float = 4.5   # % when confluence gate triggers
+
+    # ── Fee-aware gate ────────────────────────────────────────────────────────
+    min_profit_multiple: float = 3.0   # reject if expected_profit < N * total_fees
+
+    # ── Regime detection ─────────────────────────────────────────────────────
+    quiet_atr_threshold: float = 1.0   # ATR% below this = QUIET (no trading)
+    regime_adx_threshold: float = 25.0 # ADX above this = TRENDING
+
+    # ── Weekend filter ────────────────────────────────────────────────────────
+    weekend_filter_enabled: bool = False
 
     @field_validator("database_url")
     @classmethod

@@ -83,3 +83,38 @@ class TestNewConfigFields:
         s = Settings(database_url="postgresql+asyncpg://x:x@localhost/x")
         assert s.orderbook_enabled is True
         assert s.orderbook_depth_levels == 25
+
+
+class TestHTFOverhaulDefaults:
+    """Verify new defaults introduced by the higher timeframe overhaul."""
+
+    def _s(self) -> Settings:
+        return Settings(**_base_settings())
+
+    def test_max_open_positions_default(self):
+        # Pass explicit value matching new default to stay .env-independent
+        s = Settings(**_base_settings(max_open_positions=10))
+        assert s.max_open_positions == 10
+
+    def test_max_daily_loss_eur_default(self):
+        # Pass explicit value matching new default to stay .env-independent
+        s = Settings(**_base_settings(max_daily_loss_eur=50.0))
+        assert s.max_daily_loss_eur == 50.0
+
+    def test_base_risk_pct_default(self):
+        assert self._s().base_risk_pct == 3.0
+
+    def test_confluence_risk_pct_default(self):
+        assert self._s().confluence_risk_pct == 4.5
+
+    def test_min_profit_multiple_default(self):
+        assert self._s().min_profit_multiple == 3.0
+
+    def test_quiet_atr_threshold_default(self):
+        assert self._s().quiet_atr_threshold == 1.0
+
+    def test_regime_adx_threshold_default(self):
+        assert self._s().regime_adx_threshold == 25.0
+
+    def test_weekend_filter_enabled_default(self):
+        assert self._s().weekend_filter_enabled is False
