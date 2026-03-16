@@ -57,6 +57,57 @@ class TestTrailStop:
         assert final_stop == 103.0  # stays at previous higher value
 
 
+class TestTrailStopActivation:
+    def test_no_trail_before_activation(self):
+        """Trail stop should NOT move until price moves 1.5x stop distance in profit."""
+        from bot.risk.stop_loss import trail_stop
+        new_stop = trail_stop(
+            current_price=103.0,
+            highest_price=103.0,
+            current_stop=97.0,
+            atr_value=1.0,
+            direction="LONG",
+            activation_multiplier=3.0,
+            activation_threshold=1.5,
+            entry_price=100.0,
+        )
+        assert new_stop == 97.0  # unchanged
+
+    def test_trail_after_activation(self):
+        """Trail stop SHOULD move after 1.5x stop distance in profit."""
+        from bot.risk.stop_loss import trail_stop
+        new_stop = trail_stop(
+            current_price=104.5,
+            highest_price=104.5,
+            current_stop=97.0,
+            atr_value=1.0,
+            direction="LONG",
+            activation_multiplier=2.0,
+            activation_threshold=1.5,
+            entry_price=100.0,
+        )
+        assert new_stop == 102.5
+
+
+class TestFeeAdjustedTP:
+    def test_tp_includes_fees(self):
+        """TP distance should include fee compensation."""
+        from bot.risk.stop_loss import initial_stops
+        entry = 100.0
+        atr = 2.0
+        sl, tp = initial_stops(
+            entry_price=entry,
+            atr_value=atr,
+            direction="LONG",
+            atr_multiplier=3.5,
+            rr_ratio=2.5,
+            total_fee_pct=0.40,
+        )
+        # stop = 100 - 3.5*2 = 93.0, risk = 7.0
+        # tp = 100 + 2.5*7.0 + 0.40/100*100 = 100 + 17.5 + 0.4 = 117.9
+        assert abs(tp - 117.9) < 0.01
+
+
 class TestCheckStopTriggered:
     def test_check_stop_triggered_stop_loss(self):
         result = check_stop_triggered(current_price=94.0, stop_loss=95.0, take_profit=110.0)
