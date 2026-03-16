@@ -197,37 +197,67 @@ async def get_walk_forward():
 @router.post("/walk-forward/run", status_code=202)
 async def trigger_walk_forward():
     import asyncio
-    from bot.main import _get_walk_forward, _get_client, _get_router
+    from bot.main import _get_walk_forward, _get_universe, get_tradeable_symbols, _get_client
+    from bot.learning.walk_forward import TRAIN_DAYS, TEST_DAYS, MIN_WINDOWS
 
     wf = _get_walk_forward()
     if wf.is_running:
         return {"status": "already_running", "message": "Walk-forward is already running"}
 
-    async def _candle_fetcher(start_day: int, end_day: int):
-        from datetime import datetime, timedelta, timezone
-        now = datetime.now(timezone.utc)
-        total_days = 120
-        start_dt = now - timedelta(days=total_days - start_day)
-        end_dt = now - timedelta(days=total_days - end_day)
-        loop = asyncio.get_running_loop()
-        client = _get_client()
-        return await loop.run_in_executor(
-            None, lambda: client.get_candles_range("BTC-EUR", "5m", start_dt, end_dt)
-        )
-
     async def _run():
         import logging
         logger = logging.getLogger(__name__)
-        result = await wf.run(_candle_fetcher)
-        if result.adopted and result.recommended_params:
-            router = _get_router()
-            params = result.recommended_params
-            router.update_hybrid_params(
-                sentiment_weight=params.get("sentiment_weight", 0.25),
-                entry_threshold=params.get("entry_threshold", 0.40),
-                indicator_weights=params.get("indicator_weights"),
-            )
-            logger.info("Walk-forward adopted params via API trigger")
+
+        def _candle_fetcher_factory(symbol):
+            async def _fetcher(start_day, end_day):
+                from datetime import datetime, timedelta, timezone
+                now = datetime.now(timezone.utc)
+                total_days = TRAIN_DAYS + TEST_DAYS * MIN_WINDOWS
+                start_dt = now - timedelta(days=total_days - start_day)
+                end_dt = now - timedelta(days=total_days - end_day)
+                loop = asyncio.get_running_loop()
+                client = _get_client()
+                return await loop.run_in_executor(
+                    None, lambda: client.get_candles_range(symbol, "5m", start_dt, end_dt)
+                )
+            return _fetcher
+
+        symbols = get_tradeable_symbols() or ["BTC-EUR"]
+        results = await wf.run_multi_per_strategy(
+            _candle_fetcher_factory, symbols,
+        )
+        universe = _get_universe()
+        universe.update(results)
+        logger.info("Walk-forward completed via API trigger — %d symbols adopted", universe.count())
 
     asyncio.create_task(_run())
     return {"status": "accepted", "message": "Walk-forward run started in background"}
+
+
+@router.get("/universe")
+async def get_universe():
+    """Return the current adopted universe."""
+    from bot.main import _get_universe
+    universe = _get_universe()
+    symbols = {}
+    total_combos = 0
+    for sym in universe.adopted_symbols():
+        strategies = {}
+        for strat in universe.get_enabled_strategies(sym):
+            sp = universe.get_strategy_params(sym, strat)
+            sc = universe._adopted[sym].strategies[strat]
+            strategies[strat] = {
+                "params": sp,
+                "avg_sharpe": sc.avg_sharpe,
+                "avg_pnl": sc.avg_pnl,
+            }
+            total_combos += 1
+        symbols[sym] = {
+            "regime_params": universe.get_regime_params(sym),
+            "strategies": strategies,
+        }
+    return {
+        "adopted_count": universe.count(),
+        "strategy_combo_count": total_combos,
+        "symbols": symbols,
+    }
