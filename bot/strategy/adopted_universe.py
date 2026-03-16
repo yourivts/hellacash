@@ -12,7 +12,6 @@ CHAMPION_DEFAULTS: Dict[str, Any] = {
     "rr_ratio": 2.5,
     "base_risk_pct": 3.0,
     "min_profit_multiple": 3.0,
-    "cooldown_hours": 24,
     "max_hold_hours": 120,
     "quiet_atr_threshold": 1.0,
     "regime_adx_threshold": 24,

@@ -68,8 +68,7 @@ class TradingLoop:
         self._limit_mgr = None  # Will be set by main.py (Task 17)
         self._last_evaluated_hour = None
 
-        # Per-symbol cooldown: tracks last trade close time (monotonic)
-        self._last_trade_closed: Dict[str, float] = {}
+        self._last_trade_closed: Dict[str, float] = {}  # unused, kept for compat
 
         self._last_halt_log: float = 0  # throttle halt log messages
         self._last_portfolio_publish: float = 0  # throttle portfolio update events
@@ -153,21 +152,6 @@ class TradingLoop:
         # Skip symbols not in adopted universe
         if hasattr(self, '_universe') and self._universe is not None:
             if not self._universe.is_adopted(symbol):
-                return
-
-        # Per-symbol cooldown with per-strategy values
-        if hasattr(self, '_universe') and self._universe is not None and self._universe.is_adopted(symbol):
-            enabled = self._universe.get_enabled_strategies(symbol)
-            cooldown_s = min(
-                self._universe.get_strategy_params(symbol, s).get("cooldown_hours", CHAMPION_DEFAULTS["cooldown_hours"]) * 3600
-                for s in enabled
-            ) if enabled else CHAMPION_DEFAULTS["cooldown_hours"] * 3600
-        else:
-            cooldown_s = CHAMPION_DEFAULTS["cooldown_hours"] * 3600
-        last_closed = self._last_trade_closed.get(symbol)
-        if last_closed is not None:
-            elapsed = time.monotonic() - last_closed
-            if elapsed < cooldown_s:
                 return
 
         equity = portfolio.get_equity_eur()
@@ -628,9 +612,6 @@ class TradingLoop:
             result = await portfolio.close_position(symbol, price, order_id, reason, sentiment_score)
 
             if result:
-                # Record cooldown start for this symbol
-                self._last_trade_closed[symbol] = time.monotonic()
-
                 # Increment range bounce counter
                 if pos.get("strategy_name") == "range":
                     if hasattr(self.router, '_range'):
@@ -698,22 +679,6 @@ class TradingLoop:
                 # Skip symbols not in adopted universe
                 if hasattr(self, '_universe') and self._universe is not None:
                     if not self._universe.is_adopted(symbol):
-                        continue
-
-                # Per-symbol cooldown with per-strategy values from universe
-                if hasattr(self, '_universe') and self._universe is not None and self._universe.is_adopted(symbol):
-                    enabled = self._universe.get_enabled_strategies(symbol)
-                    cooldown_s = min(
-                        self._universe.get_strategy_params(symbol, s).get("cooldown_hours", CHAMPION_DEFAULTS["cooldown_hours"]) * 3600
-                        for s in enabled
-                    ) if enabled else CHAMPION_DEFAULTS["cooldown_hours"] * 3600
-                else:
-                    cooldown_s = CHAMPION_DEFAULTS["cooldown_hours"] * 3600
-                last_closed = self._last_trade_closed.get(symbol)
-                if last_closed is not None:
-                    elapsed = time.monotonic() - last_closed
-                    if elapsed < cooldown_s:
-                        logger.debug("Cooldown active for %s — %.1fh remaining", symbol, (cooldown_s - elapsed) / 3600)
                         continue
 
                 # Check if trading is allowed

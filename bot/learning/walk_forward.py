@@ -74,7 +74,6 @@ def _run_optuna_window(train_candles, test_candles, max_workers, target_strategy
                     "rr_ratio": trial.suggest_float("rr_ratio", 2.0, 4.0, step=0.5),
                     "base_risk_pct": trial.suggest_float("base_risk_pct", 2.0, 5.0, step=0.5),
                     "min_profit_multiple": trial.suggest_float("min_profit_multiple", 2.0, 4.0, step=0.5),
-                    "cooldown_hours": trial.suggest_int("cooldown_hours", 12, 72, step=12),
                     "max_hold_hours": trial.suggest_int("max_hold_hours", 48, 240, step=24),
                     "quiet_atr_threshold": trial.suggest_float("quiet_atr_threshold", 0.8, 1.5, step=0.1),
                     "regime_adx_threshold": trial.suggest_float("regime_adx_threshold", 20, 30, step=2),
@@ -106,10 +105,10 @@ def _run_optuna_window(train_candles, test_candles, max_workers, target_strategy
                 bp = study.best_params
                 logger.info(
                     "Optuna phase %d/%d done — best score=%.2f | "
-                    "atr=%.1f rr=%.1f risk=%.1f cooldown=%dh",
+                    "atr=%.1f rr=%.1f risk=%.1f hold=%dh",
                     phase + 1, 2, study.best_value,
                     bp.get("atr_multiplier", 0), bp.get("rr_ratio", 0),
-                    bp.get("base_risk_pct", 0), bp.get("cooldown_hours", 0),
+                    bp.get("base_risk_pct", 0), bp.get("max_hold_hours", 0),
                 )
             else:
                 logger.info("Optuna phase %d/%d done — no valid trial", phase + 1, 2)

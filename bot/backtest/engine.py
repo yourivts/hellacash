@@ -137,9 +137,8 @@ class BacktestEngine:
         self._atr_pct_history: List[float] = []  # rolling ATR% for median computation
         self._min_confirmations = params.get("min_confirmations", 2)
         self._indicator_weights = params.get("indicator_weights")
-        # Trade cooldown: minimum bars between closing a trade and opening a new one
-        cooldown_hours = params.get("cooldown_hours", 72)
-        self._cooldown_bars = int(cooldown_hours * 12)  # 12 x 5m bars per hour
+        # No trade cooldown — 1 position per coin, reopen immediately on signal
+        self._cooldown_bars = 0
         # Minimum ADX to allow entries (0 = disabled, let walk-forward optimize)
         self._min_adx = params.get("min_adx", 0)
         # Minimum ATR% to allow entries (0 = disabled)

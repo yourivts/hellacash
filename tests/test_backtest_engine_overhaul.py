@@ -157,8 +157,9 @@ class TestEngineSmokeTest:
 
     def test_custom_strategy_params(self):
         candles = _make_candles(100)
-        engine = BacktestEngine(candles, strategy_params={"cooldown_hours": 24})
-        assert engine._cooldown_bars == 24 * 12
+        engine = BacktestEngine(candles, strategy_params={"atr_multiplier": 4.0})
+        assert engine._atr_multiplier == 4.0
+        assert engine._cooldown_bars == 0  # no cooldown
 
 
 # ---------------------------------------------------------------------------
