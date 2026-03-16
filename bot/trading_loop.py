@@ -27,6 +27,7 @@ from bot.risk.fees import get_trading_fees
 from bot.risk.position_sizer import fixed_fractional_size
 from bot.risk.stop_loss import check_stop_triggered, initial_stops, trail_stop
 from bot.strategy.confluence import check_confluence
+from bot.strategy.adopted_universe import CHAMPION_DEFAULTS
 from bot.strategy.router import Regime, StrategyRouter, detect_regime
 
 logger = logging.getLogger(__name__)
@@ -150,11 +151,24 @@ class TradingLoop:
         if symbol in self._pending_orders:
             return
 
-        # Per-symbol cooldown
+        # Skip symbols not in adopted universe
+        if hasattr(self, '_universe') and self._universe is not None:
+            if not self._universe.is_adopted(symbol):
+                return
+
+        # Per-symbol cooldown with per-strategy values
+        if hasattr(self, '_universe') and self._universe is not None and self._universe.is_adopted(symbol):
+            enabled = self._universe.get_enabled_strategies(symbol)
+            cooldown_s = min(
+                self._universe.get_strategy_params(symbol, s).get("cooldown_hours", CHAMPION_DEFAULTS["cooldown_hours"]) * 3600
+                for s in enabled
+            ) if enabled else CHAMPION_DEFAULTS["cooldown_hours"] * 3600
+        else:
+            cooldown_s = CHAMPION_DEFAULTS["cooldown_hours"] * 3600
         last_closed = self._last_trade_closed.get(symbol)
         if last_closed is not None:
             elapsed = time.monotonic() - last_closed
-            if elapsed < self._cooldown_seconds:
+            if elapsed < cooldown_s:
                 return
 
         equity = portfolio.get_equity_eur()
@@ -177,11 +191,19 @@ class TradingLoop:
             price_4h = float(df_4h["close"].iloc[-1])
             atr_pct = (atr_val / price_4h * 100.0) if price_4h > 0 else 0
 
-            if atr_pct < 1.0:
+            if hasattr(self, '_universe') and self._universe is not None and self._universe.is_adopted(symbol):
+                rp = self._universe.get_regime_params(symbol)
+                _quiet_thresh = rp["quiet_atr_threshold"]
+                _regime_adx = rp["regime_adx_threshold"]
+            else:
+                _quiet_thresh = CHAMPION_DEFAULTS["quiet_atr_threshold"]
+                _regime_adx = CHAMPION_DEFAULTS["regime_adx_threshold"]
+
+            if atr_pct < _quiet_thresh:
                 regime = Regime.QUIET
             elif atr_pct > 4.0:
                 regime = Regime.VOLATILE
-            elif adx_val > 25:
+            elif adx_val > _regime_adx:
                 regime = Regime.TRENDING
             elif adx_val < 20:
                 regime = Regime.RANGING
@@ -197,6 +219,12 @@ class TradingLoop:
 
         # Get applicable strategies
         strategies = self.router.get_strategies(regime)
+
+        if hasattr(self, '_universe') and self._universe is not None:
+            enabled = self._universe.get_enabled_strategies(symbol)
+            if enabled:
+                strategies = [s for s in strategies if s.name in enabled]
+
         if not strategies:
             return
 
@@ -314,22 +342,47 @@ class TradingLoop:
         if not signals:
             return
 
-        # Run confluence check
-        confluence = check_confluence(signals)
-        if not confluence.triggered:
-            logger.debug("No confluence for %s — signals: %s", symbol, signals)
-            return
-
-        direction = confluence.direction
-        strength = confluence.strength
+        # Run confluence check — relax when only 1 strategy enabled
+        if hasattr(self, '_universe') and self._universe is not None:
+            enabled = self._universe.get_enabled_strategies(symbol)
+            if len(enabled) <= 1 and signals:
+                # Single strategy — use its signal directly without confluence
+                best = max(signals, key=lambda s: s["strength"])
+                direction = best["direction"]
+                strength = best["strength"]
+            else:
+                confluence = check_confluence(signals)
+                if not confluence.triggered:
+                    logger.debug("No confluence for %s — signals: %s", symbol, signals)
+                    return
+                direction = confluence.direction
+                strength = confluence.strength
+        else:
+            confluence = check_confluence(signals)
+            if not confluence.triggered:
+                logger.debug("No confluence for %s — signals: %s", symbol, signals)
+                return
+            direction = confluence.direction
+            strength = confluence.strength
 
         # Compute position size
         entry_price = price
         if entry_price <= 0:
             return
 
+        # Get per-strategy params from universe
+        if hasattr(self, '_universe') and self._universe is not None and signals:
+            winning_strat = max(signals, key=lambda s: s["strength"])["strategy"]
+            strat_params = self._universe.get_strategy_params(symbol, winning_strat)
+        else:
+            strat_params = CHAMPION_DEFAULTS
+
         # Compute stops
-        stop_loss, take_profit = initial_stops(entry_price, df_1h, direction=direction)
+        stop_loss, take_profit = initial_stops(
+            entry_price, df_1h, direction=direction,
+            atr_multiplier=strat_params["atr_multiplier"],
+            rr_ratio=strat_params["rr_ratio"],
+        )
         stop_distance_pct = max(0.1, abs(entry_price - stop_loss) / entry_price * 100.0)
         tp_distance_pct = max(0.1, abs(take_profit - entry_price) / entry_price * 100.0)
 
@@ -344,7 +397,7 @@ class TradingLoop:
 
         size_eur = fixed_fractional_size(
             equity=equity,
-            base_risk_pct=settings.base_risk_pct,
+            base_risk_pct=strat_params["base_risk_pct"],
             stop_distance_pct=stop_distance_pct,
             atr_pct=atr_pct_1h,
             median_atr_pct=median_atr_pct,
@@ -640,16 +693,25 @@ class TradingLoop:
                 if symbol in self._pending_orders:
                     continue
 
-                # Per-symbol cooldown — prevent overtrading after a close
+                # Skip symbols not in adopted universe
+                if hasattr(self, '_universe') and self._universe is not None:
+                    if not self._universe.is_adopted(symbol):
+                        continue
+
+                # Per-symbol cooldown with per-strategy values from universe
+                if hasattr(self, '_universe') and self._universe is not None and self._universe.is_adopted(symbol):
+                    enabled = self._universe.get_enabled_strategies(symbol)
+                    cooldown_s = min(
+                        self._universe.get_strategy_params(symbol, s).get("cooldown_hours", CHAMPION_DEFAULTS["cooldown_hours"]) * 3600
+                        for s in enabled
+                    ) if enabled else CHAMPION_DEFAULTS["cooldown_hours"] * 3600
+                else:
+                    cooldown_s = CHAMPION_DEFAULTS["cooldown_hours"] * 3600
                 last_closed = self._last_trade_closed.get(symbol)
                 if last_closed is not None:
                     elapsed = time.monotonic() - last_closed
-                    if elapsed < self._cooldown_seconds:
-                        remaining_h = (self._cooldown_seconds - elapsed) / 3600
-                        logger.debug(
-                            "Cooldown active for %s — %.1fh remaining",
-                            symbol, remaining_h,
-                        )
+                    if elapsed < cooldown_s:
+                        logger.debug("Cooldown active for %s — %.1fh remaining", symbol, (cooldown_s - elapsed) / 3600)
                         continue
 
                 # Check if trading is allowed
@@ -662,7 +724,7 @@ class TradingLoop:
                         self._last_halt_log = now
                     return
 
-                # Detect regime and select strategies
+                # Detect regime with per-symbol params from universe
                 df_4h = self._resample(df_5m, "4h") if len(df_5m) >= 200 else None
                 if df_4h is not None and len(df_4h) >= 14:
                     adx_val = float(compute_adx(df_4h["high"], df_4h["low"], df_4h["close"]).iloc[-1])
@@ -670,11 +732,19 @@ class TradingLoop:
                     price_4h = float(df_4h["close"].iloc[-1])
                     atr_pct_4h = (atr_val / price_4h * 100.0) if price_4h > 0 else 0
 
-                    if atr_pct_4h < 1.0:
+                    if hasattr(self, '_universe') and self._universe is not None and self._universe.is_adopted(symbol):
+                        rp = self._universe.get_regime_params(symbol)
+                        _quiet_thresh = rp["quiet_atr_threshold"]
+                        _regime_adx = rp["regime_adx_threshold"]
+                    else:
+                        _quiet_thresh = CHAMPION_DEFAULTS["quiet_atr_threshold"]
+                        _regime_adx = CHAMPION_DEFAULTS["regime_adx_threshold"]
+
+                    if atr_pct_4h < _quiet_thresh:
                         regime = Regime.QUIET
                     elif atr_pct_4h > 4.0:
                         regime = Regime.VOLATILE
-                    elif adx_val > 25:
+                    elif adx_val > _regime_adx:
                         regime = Regime.TRENDING
                     elif adx_val < 20:
                         regime = Regime.RANGING
@@ -684,6 +754,11 @@ class TradingLoop:
                     regime = Regime.NEUTRAL
 
                 strategies = router.get_strategies(regime)
+
+                if hasattr(self, '_universe') and self._universe is not None:
+                    enabled = self._universe.get_enabled_strategies(symbol)
+                    if enabled:
+                        strategies = [s for s in strategies if s.name in enabled]
 
                 # Get sentiment
                 sentiment_score = sentiment.get_score(symbol)
@@ -754,8 +829,18 @@ class TradingLoop:
                 if entry_price <= 0:
                     continue
 
+                # Get per-strategy params from universe
+                if hasattr(self, '_universe') and self._universe is not None and best_signal:
+                    strat_params = self._universe.get_strategy_params(symbol, best_signal.strategy_name)
+                else:
+                    strat_params = CHAMPION_DEFAULTS
+
                 # Compute stops first — stop distance drives position sizing
-                stop_loss, take_profit = initial_stops(entry_price, df_1h, direction=direction)
+                stop_loss, take_profit = initial_stops(
+                    entry_price, df_1h, direction=direction,
+                    atr_multiplier=strat_params["atr_multiplier"],
+                    rr_ratio=strat_params["rr_ratio"],
+                )
                 stop_distance_pct = max(0.1, abs(entry_price - stop_loss) / entry_price * 100.0)
                 risk = stop_distance_pct
                 expected_roi = risk * 2.0  # 2:1 reward/risk
@@ -773,7 +858,7 @@ class TradingLoop:
                 # Fixed fractional position size
                 size_eur = fixed_fractional_size(
                     equity=equity,
-                    base_risk_pct=settings.base_risk_pct,
+                    base_risk_pct=strat_params["base_risk_pct"],
                     stop_distance_pct=stop_distance_pct,
                     atr_pct=atr_pct,
                     median_atr_pct=median_atr_pct,
