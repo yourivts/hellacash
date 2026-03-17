@@ -7,7 +7,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
+import warnings
 
+warnings.filterwarnings("ignore", message="pandas only supports SQLAlchemy")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -38,10 +40,10 @@ async def main():
     await candle_store.bulk_download(symbols)
     logger.info("Download complete.")
 
-    # Step 3: Train models
+    # Step 3: Train models (2048 timesteps for initial bootstrap, retrain weekly with more)
     logger.info("Training RL models for strategies: %s", ALL_STRATEGIES)
     trainer = RLTrainer(candle_store, ALL_STRATEGIES)
-    results = trainer.train()
+    results = trainer.train(total_timesteps=2048)
     logger.info("Training complete: %s", results)
 
 

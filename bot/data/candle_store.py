@@ -15,7 +15,23 @@ import psycopg2.extras
 logger = logging.getLogger(__name__)
 
 # Max entries in the candle DataFrame cache (LRU eviction)
-_CACHE_MAX_ENTRIES = 200
+_CACHE_MAX_ENTRIES = 1000
+
+
+def _connect_with_retry(url: str, max_retries: int = 5):
+    """Connect to PostgreSQL with retry on transient DNS/network failures."""
+    import time as _time
+    for attempt in range(max_retries):
+        try:
+            return psycopg2.connect(url)
+        except psycopg2.OperationalError:
+            if attempt < max_retries - 1:
+                wait = 1 + attempt
+                logger.warning("DB connect failed (attempt %d/%d), retrying in %ds...",
+                               attempt + 1, max_retries, wait)
+                _time.sleep(wait)
+                continue
+            raise
 
 
 class CandleStore:
@@ -111,7 +127,7 @@ class CandleStore:
 
     def _get_oldest_timestamp(self, symbol: str) -> Optional[datetime]:
         """Get oldest stored timestamp for a symbol (sync)."""
-        conn = psycopg2.connect(self._sync_url)
+        conn = _connect_with_retry(self._sync_url)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -125,7 +141,7 @@ class CandleStore:
 
     def _get_last_timestamp(self, symbol: str) -> Optional[datetime]:
         """Get last stored timestamp for a symbol (sync)."""
-        conn = psycopg2.connect(self._sync_url)
+        conn = _connect_with_retry(self._sync_url)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -146,7 +162,7 @@ class CandleStore:
 
     def _store_candles(self, symbol: str, candles: list) -> None:
         """Bulk insert candles into candle_1m table (sync)."""
-        conn = psycopg2.connect(self._sync_url)
+        conn = _connect_with_retry(self._sync_url)
         try:
             with conn.cursor() as cur:
                 values = []
@@ -227,9 +243,12 @@ class CandleStore:
     def _read_candles_sync(self, symbol: str, start: datetime,
                            end: datetime) -> pd.DataFrame:
         """Read 1m candles from DB (sync psycopg2 connection)."""
-        conn = psycopg2.connect(self._sync_url)
+        import warnings
+        conn = _connect_with_retry(self._sync_url)
         try:
-            df = pd.read_sql(
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                df = pd.read_sql(
                 "SELECT timestamp, open, high, low, close, volume "
                 "FROM candle_1m WHERE symbol = %s AND timestamp >= %s AND timestamp < %s "
                 "ORDER BY timestamp",
@@ -248,7 +267,7 @@ class CandleStore:
         """Return (min_ts, max_ts) for a symbol, or None if no data. Cached."""
         if symbol in self._date_range_cache:
             return self._date_range_cache[symbol]
-        conn = psycopg2.connect(self._sync_url)
+        conn = _connect_with_retry(self._sync_url)
         try:
             with conn.cursor() as cur:
                 cur.execute(
@@ -264,7 +283,7 @@ class CandleStore:
 
     def available_symbols(self) -> List[str]:
         """Return list of symbols with stored data (sync)."""
-        conn = psycopg2.connect(self._sync_url)
+        conn = _connect_with_retry(self._sync_url)
         try:
             with conn.cursor() as cur:
                 cur.execute("SELECT DISTINCT symbol FROM candle_1m ORDER BY symbol")
