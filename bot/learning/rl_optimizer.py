@@ -34,7 +34,7 @@ class RLOptimizer:
                 strategy = fname.replace("_ppo.zip", "")
                 path = os.path.join(self._model_dir, fname)
                 try:
-                    self._models[strategy] = PPO.load(path)
+                    self._models[strategy] = PPO.load(path, device="cpu")
                     loaded += 1
                     logger.info("Loaded RL model for %s", strategy)
                 except Exception as e:

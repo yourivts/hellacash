@@ -168,7 +168,7 @@ class RLTrainer:
                 # Check against existing model
                 existing_path = os.path.join(self._model_dir, f"{strategy}_ppo.zip")
                 if os.path.exists(existing_path):
-                    old_model = PPO.load(existing_path)
+                    old_model = PPO.load(existing_path, device="cpu")
                     old_reward, old_stats = self._validate(old_model, strategy, symbols, **gpu_kw)
                     logger.info(
                         "[%s] Old model: avg_reward=%.3f, avg_sharpe=%.2f, avg_pnl=€%.2f",
@@ -271,7 +271,7 @@ class RLTrainer:
                 )
 
                 # Validation gate
-                old_model = PPO.load(model_path)
+                old_model = PPO.load(model_path, device="cpu")
                 old_reward, old_stats = self._validate(old_model, strategy, symbols, **gpu_kw)
                 logger.info(
                     "[%s] Old model: avg_reward=%.3f, avg_sharpe=%.2f, avg_pnl=€%.2f",
