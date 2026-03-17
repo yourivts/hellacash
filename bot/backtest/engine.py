@@ -1014,7 +1014,8 @@ class BacktestEngine:
                     tf_score += self._tf_weight_1d
         total = self._tf_weight_1h + self._tf_weight_4h + self._tf_weight_1d
         if total > 0:
-            strength *= tf_score / total
+            # Floor at 0.5 so higher-TF disagreement dampens but never kills
+            strength *= max(tf_score / total, 0.5)
         return strength
 
     # ------------------------------------------------------------------
