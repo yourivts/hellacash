@@ -11,6 +11,16 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _gpu_available() -> bool:
+    """Check if GPU acceleration is available (CuPy + CUDA)."""
+    try:
+        import cupy as cp
+        cp.cuda.Device(0).compute_capability
+        return True
+    except Exception:
+        return False
+
+
 class _TrainingLogger:
     """Callback to log PPO training progress at regular intervals."""
 
@@ -58,7 +68,7 @@ class RLTrainer:
     def train(self, total_timesteps: int = 10_000) -> Dict[str, float]:
         """Full training run. Returns {strategy: avg_reward}."""
         from stable_baselines3 import PPO
-        from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+        from stable_baselines3.common.vec_env import DummyVecEnv
 
         from bot.learning.rl_environment import TradingParamEnv
 
@@ -70,39 +80,75 @@ class RLTrainer:
         logger.info("RLTrainer: %d symbols available for training: %s",
                      len(symbols), ", ".join(symbols[:10]) + ("..." if len(symbols) > 10 else ""))
 
-        n_envs = min(os.cpu_count() or 1, 4)
+        use_gpu = _gpu_available()
+        if use_gpu:
+            from bot.learning.gpu_vec_env import GpuTradingVecEnv
+            from bot.learning.gpu_backtest_kernel import compile_kernel, prepare_gpu_data
+            n_envs = 512
+            logger.info("GPU detected -- using GpuTradingVecEnv (%d envs)", n_envs)
+
+            # Prepare GPU data ONCE for all strategies
+            gpu_prep_start = time.time()
+            gpu_kernel = compile_kernel()
+            gpu_data = prepare_gpu_data(self._candle_store, symbols)
+            logger.info("GPU data prepared in %.1fs", time.time() - gpu_prep_start)
+        else:
+            n_envs = min(os.cpu_count() or 1, 4)
+
         results = {}
         overall_start = time.time()
 
+        if not use_gpu:
+            # Warm disk cache so env preloading skips DB+compute
+            cache_dir = os.path.join(self._model_dir, ".signal_cache")
+            logger.info("Warming signal cache for %d symbols -> %s", len(symbols), cache_dir)
+            cache_start = time.time()
+            TradingParamEnv.warm_signal_cache(self._candle_store, symbols, cache_dir)
+            logger.info("Signal cache ready in %.1fs", time.time() - cache_start)
+
         for strategy in self._strategies:
+            # Skip strategies that already have a trained model (bootstrap resume)
+            existing_path = os.path.join(self._model_dir, f"{strategy}_ppo.zip")
+            if os.path.exists(existing_path):
+                logger.info("=== Skipping %s — model already exists at %s ===",
+                            strategy, existing_path)
+                continue
+
             strat_start = time.time()
             logger.info(
-                "=== Training %s model === timesteps=%d, envs=%d, symbols=%d",
-                strategy, total_timesteps, n_envs, len(symbols),
+                "=== Training %s model === timesteps=%d, envs=%d, symbols=%d, gpu=%s",
+                strategy, total_timesteps, n_envs, len(symbols), use_gpu,
             )
 
-            def make_env(s=strategy):
-                return TradingParamEnv(self._candle_store, symbols, s)
-
-            # Try SubprocVecEnv, fall back to DummyVecEnv
-            try:
-                vec_env = SubprocVecEnv([make_env for _ in range(n_envs)])
-                logger.info("[%s] Using SubprocVecEnv (%d workers)", strategy, n_envs)
-            except Exception as e:
-                logger.warning("[%s] SubprocVecEnv failed (%s), using DummyVecEnv", strategy, e)
+            if use_gpu:
+                vec_env = GpuTradingVecEnv(
+                    self._candle_store, symbols, strategy,
+                    n_envs=n_envs, n_segments=3,
+                    _gpu_data=gpu_data, _kernel=gpu_kernel,
+                )
+                logger.info("[%s] Using GpuTradingVecEnv (%d envs)", strategy, n_envs)
+                ppo_n_steps = 128
+                ppo_batch_size = 256
+            else:
+                def make_env(s=strategy):
+                    return TradingParamEnv(self._candle_store, symbols, s,
+                                           n_segments=3)
                 vec_env = DummyVecEnv([make_env for _ in range(n_envs)])
+                logger.info("[%s] Using DummyVecEnv (%d envs)", strategy, n_envs)
+                ppo_n_steps = 512
+                ppo_batch_size = 64
 
             try:
                 model = PPO(
                     "MlpPolicy", vec_env,
                     learning_rate=3e-4,
-                    n_steps=1024,
-                    batch_size=64,
-                    policy_kwargs={"net_arch": [256, 256, 256]},
+                    n_steps=ppo_n_steps,
+                    batch_size=ppo_batch_size,
+                    policy_kwargs={"net_arch": [256, 256]},
                     verbose=0,
                 )
 
-                train_cb = _TrainingLogger(strategy, total_timesteps, log_every=1024)
+                train_cb = _TrainingLogger(strategy, total_timesteps, log_every=2048)
                 model.learn(total_timesteps=total_timesteps, callback=train_cb)
                 train_elapsed = time.time() - strat_start
                 logger.info("[%s] Training done in %.1fs", strategy, train_elapsed)
@@ -154,7 +200,7 @@ class RLTrainer:
         return results
 
     def retrain(self, fine_tune_months: int = 6,
-                total_timesteps: int = 5_000) -> Dict[str, float]:
+                total_timesteps: int = 50_000) -> Dict[str, float]:
         """Weekly incremental retrain on recent data."""
         from stable_baselines3 import PPO
         from stable_baselines3.common.vec_env import DummyVecEnv
@@ -165,8 +211,24 @@ class RLTrainer:
         if not symbols:
             return {}
 
+        use_gpu = _gpu_available()
+        if use_gpu:
+            from bot.learning.gpu_vec_env import GpuTradingVecEnv
+            from bot.learning.gpu_backtest_kernel import compile_kernel, prepare_gpu_data
+
+            gpu_prep_start = time.time()
+            gpu_kernel = compile_kernel()
+            gpu_data = prepare_gpu_data(self._candle_store, symbols)
+            logger.info("GPU data prepared in %.1fs", time.time() - gpu_prep_start)
+
         results = {}
         overall_start = time.time()
+
+        if not use_gpu:
+            # Warm disk cache for retrain workers
+            cache_dir = os.path.join(self._model_dir, ".signal_cache")
+            logger.info("Warming signal cache for retrain (%d symbols)", len(symbols))
+            TradingParamEnv.warm_signal_cache(self._candle_store, symbols, cache_dir)
 
         for strategy in self._strategies:
             model_path = os.path.join(self._model_dir, f"{strategy}_ppo.zip")
@@ -175,11 +237,20 @@ class RLTrainer:
                 continue
 
             strat_start = time.time()
-            logger.info("=== Retraining %s === timesteps=%d", strategy, total_timesteps)
+            logger.info("=== Retraining %s === timesteps=%d, gpu=%s",
+                        strategy, total_timesteps, use_gpu)
 
-            env = DummyVecEnv([
-                lambda s=strategy: TradingParamEnv(self._candle_store, symbols, s)
-            ])
+            if use_gpu:
+                env = GpuTradingVecEnv(
+                    self._candle_store, symbols, strategy,
+                    n_envs=512, n_segments=3,
+                    _gpu_data=gpu_data, _kernel=gpu_kernel,
+                )
+            else:
+                env = DummyVecEnv([
+                    lambda s=strategy: TradingParamEnv(self._candle_store, symbols, s,
+                                                        n_segments=3)
+                ])
 
             try:
                 model = PPO.load(model_path, env=env)
@@ -228,11 +299,14 @@ class RLTrainer:
 
     def _validate(self, model, strategy: str, symbols: List[str],
                   n_episodes: int = 20) -> tuple:
-        """Run model on validation episodes, return (avg_reward, stats_dict)."""
+        """Run model on validation episodes, return (avg_reward, stats_dict).
+
+        Handles both single-step and multi-step (n_segments>1) environments.
+        """
         from bot.learning.rl_environment import TradingParamEnv
 
         env = TradingParamEnv(self._candle_store, symbols, strategy,
-                              validation_mode=True)
+                              validation_mode=True, n_segments=3)
         rewards = []
         sharpes = []
         pnls = []
@@ -243,28 +317,41 @@ class RLTrainer:
 
         for ep in range(n_episodes):
             obs, _ = env.reset()
-            action, _ = model.predict(obs, deterministic=True)
-            _, reward, _, _, info = env.step(action)
-            rewards.append(reward)
+            ep_reward = 0.0
+            ep_pnl = 0.0
+            ep_trades = 0
+            last_result = None
 
-            result = info.get("result")
-            if result:
-                sharpes.append(result.sharpe_ratio)
-                pnls.append(result.total_pnl)
-                pf = result.profit_factor
+            # Run through all segments (1 for single-step, n_segments for multi-step)
+            terminated = False
+            while not terminated:
+                action, _ = model.predict(obs, deterministic=True)
+                obs, reward, terminated, _, info = env.step(action)
+                ep_reward += reward
+                result = info.get("result")
+                if result:
+                    last_result = result
+                    ep_pnl += result.total_pnl
+                    ep_trades += result.total_trades
+
+            rewards.append(ep_reward)
+
+            if last_result:
+                sharpes.append(last_result.sharpe_ratio)
+                pnls.append(ep_pnl)
+                pf = last_result.profit_factor
                 pfs.append(pf if not (pf == float('inf') or pf != pf) else 0.0)
-                trade_counts.append(result.total_trades)
-                win_rates.append(result.win_rate)
-                drawdowns.append(result.max_drawdown_pct)
+                trade_counts.append(ep_trades)
+                win_rates.append(last_result.win_rate)
+                drawdowns.append(last_result.max_drawdown_pct)
 
                 if (ep + 1) % 5 == 0 or ep == 0:
                     logger.info(
-                        "  [%s] val ep %d/%d: reward=%.2f, sharpe=%.2f, pnl=€%.2f, "
-                        "pf=%.2f, trades=%d, win=%.0f%%, dd=%.1f%%",
-                        strategy, ep + 1, n_episodes, reward,
-                        result.sharpe_ratio, result.total_pnl,
-                        result.profit_factor, result.total_trades,
-                        result.win_rate, result.max_drawdown_pct,
+                        "  [%s] val ep %d/%d: reward=%.2f, pnl=€%.2f, "
+                        "trades=%d, win=%.0f%%, dd=%.1f%%",
+                        strategy, ep + 1, n_episodes, ep_reward,
+                        ep_pnl, ep_trades,
+                        last_result.win_rate, last_result.max_drawdown_pct,
                     )
 
         avg_reward = np.mean(rewards) if rewards else 0.0

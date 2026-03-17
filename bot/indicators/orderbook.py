@@ -5,6 +5,7 @@ import logging
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -163,3 +164,40 @@ class OrderBookProvider:
             ask_v = sum(q for p, q in bs.asks.items() if bl <= p < bh)
             buckets.append(DepthBucket(bl, bh, bid_v, ask_v))
         return buckets
+
+    async def save_snapshots(self) -> None:
+        """Persist current orderbook imbalance data for future backtesting."""
+        if not self._books:
+            return
+        try:
+            from bot.data.database import get_session
+            from bot.data.models import OrderbookSnapshot
+
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            async with get_session() as session:
+                for symbol, bs in self._books.items():
+                    if not bs.bids or not bs.asks:
+                        continue
+                    imbalance = self._compute_imbalance(bs)
+                    best_bid = max(bs.bids.keys())
+                    best_ask = min(bs.asks.keys())
+                    mid = (best_bid + best_ask) / 2
+                    spread_pct = (best_ask - best_bid) / mid * 100 if mid > 0 else 0
+
+                    n = self._depth_levels
+                    bid_depth = sum(p * q for p, q in sorted(bs.bids.items(), key=lambda x: -x[0])[:n])
+                    ask_depth = sum(p * q for p, q in sorted(bs.asks.items(), key=lambda x: x[0])[:n])
+
+                    snapshot = OrderbookSnapshot(
+                        symbol=symbol,
+                        imbalance=imbalance,
+                        spread_pct=spread_pct,
+                        bid_depth_eur=bid_depth,
+                        ask_depth_eur=ask_depth,
+                        recorded_at=now,
+                    )
+                    session.add(snapshot)
+                await session.commit()
+                logger.debug("Saved orderbook snapshots for %d symbols", len(self._books))
+        except Exception as e:
+            logger.warning("Failed to save orderbook snapshots: %s", e)

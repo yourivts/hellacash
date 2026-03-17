@@ -40,10 +40,10 @@ async def main():
     await candle_store.bulk_download(symbols)
     logger.info("Download complete.")
 
-    # Step 3: Train models (2048 timesteps for initial bootstrap, retrain weekly with more)
+    # Step 3: Train models (50K timesteps — Numba backtest makes this fast)
     logger.info("Training RL models for strategies: %s", ALL_STRATEGIES)
     trainer = RLTrainer(candle_store, ALL_STRATEGIES)
-    results = trainer.train(total_timesteps=2048)
+    results = trainer.train(total_timesteps=500_000)
     logger.info("Training complete: %s", results)
 
 

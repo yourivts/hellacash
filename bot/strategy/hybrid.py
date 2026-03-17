@@ -10,7 +10,7 @@ from bot.strategy.mtf_voter import MTFVoter
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ENTRY_THRESHOLD = 0.35
+DEFAULT_ENTRY_THRESHOLD = 0.50
 
 
 def redistribute_weights(

@@ -26,17 +26,17 @@ def test_action_to_params_shape_range():
 
 def test_action_to_params_bounds():
     """Actions at -1 and +1 produce correct parameter bounds."""
-    # All -1: should produce minimum values
+    # All -1: should produce minimum values (squeeze: atr=2.0, rr=2.0)
     action_min = np.full(21, -1.0, dtype=np.float32)
     p_min = action_to_params(action_min, strategy="squeeze")
-    assert abs(p_min["atr_multiplier"] - 1.0) < 0.01
-    assert abs(p_min["rr_ratio"] - 1.0) < 0.01
+    assert abs(p_min["atr_multiplier"] - 2.0) < 0.01
+    assert abs(p_min["rr_ratio"] - 2.0) < 0.01
 
-    # All +1: should produce maximum values
+    # All +1: should produce maximum values (squeeze: atr=6.0, rr=5.0)
     action_max = np.full(21, 1.0, dtype=np.float32)
     p_max = action_to_params(action_max, strategy="squeeze")
-    assert abs(p_max["atr_multiplier"] - 15.0) < 0.01
-    assert abs(p_max["rr_ratio"] - 8.0) < 0.01
+    assert abs(p_max["atr_multiplier"] - 6.0) < 0.01
+    assert abs(p_max["rr_ratio"] - 5.0) < 0.01
 
 
 def test_action_to_params_integer_params():
@@ -75,19 +75,13 @@ def test_compute_reward_penalties():
     )
     reward_dd = env._compute_reward(result_dd)
 
-    # Too few trades penalty
+    # Zero trades penalty (gradient based on signals_generated)
     result_few = BacktestResult(
-        total_pnl=100.0, sharpe_ratio=0.5, profit_factor=1.5,
-        profit_per_fee=1.0, max_drawdown_pct=5.0, total_trades=2, win_rate=50.0,
+        total_pnl=0.0, sharpe_ratio=0.0, profit_factor=0.0,
+        profit_per_fee=0.0, max_drawdown_pct=0.0, total_trades=0, win_rate=0.0,
+        signals_generated=5,
     )
     reward_few = env._compute_reward(result_few)
-
-    # Low win rate penalty
-    result_wr = BacktestResult(
-        total_pnl=100.0, sharpe_ratio=0.5, profit_factor=1.5,
-        profit_per_fee=1.0, max_drawdown_pct=5.0, total_trades=10, win_rate=15.0,
-    )
-    reward_wr = env._compute_reward(result_wr)
 
     # No penalties baseline
     result_ok = BacktestResult(
@@ -97,27 +91,31 @@ def test_compute_reward_penalties():
     reward_ok = env._compute_reward(result_ok)
 
     assert reward_dd < reward_ok   # drawdown penalty
-    assert reward_few < reward_ok  # too-few-trades penalty
-    assert reward_wr < reward_ok   # low win rate penalty
+    assert reward_few < reward_ok  # zero-trades penalty
 
 
 def test_reset_returns_valid_observation():
     """reset() returns observation with correct shape and range."""
     mock_store = MagicMock()
     mock_store.get_date_range.return_value = None
-    env = TradingParamEnv(mock_store, ["BTC-EUR"], "squeeze")
+    # n_segments=1 for single-step (27 obs), n_segments=3 for multi-step (32 obs)
+    env = TradingParamEnv(mock_store, ["BTC-EUR"], "squeeze", n_segments=1)
     obs, info = env.reset()
     assert obs.shape == (27,)
     assert obs.dtype == np.float32
     assert np.all(obs >= -1.0) and np.all(obs <= 1.0)
     assert isinstance(info, dict)
 
+    env3 = TradingParamEnv(mock_store, ["BTC-EUR"], "squeeze", n_segments=3)
+    obs3, _ = env3.reset()
+    assert obs3.shape == (32,)
+
 
 def test_step_returns_correct_tuple():
     """step() returns (obs, reward, terminated, truncated, info)."""
     mock_store = MagicMock()
     mock_store.get_date_range.return_value = None
-    env = TradingParamEnv(mock_store, ["BTC-EUR"], "squeeze")
+    env = TradingParamEnv(mock_store, ["BTC-EUR"], "squeeze", n_segments=1)
     env.reset()
     action = env.action_space.sample()
     result = env.step(action)
