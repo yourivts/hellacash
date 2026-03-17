@@ -41,7 +41,9 @@ SIG_OPEN = 9
 SIG_HIGH = 10
 SIG_LOW = 11
 SIG_CLOSE = 12
-N_SIG_1H = 13
+SIG_EMA20 = 13
+SIG_EMA50 = 14
+N_SIG_1H = 15
 
 # 4h signals: 3 columns per bar
 SIG4_ADX = 0
@@ -131,7 +133,7 @@ void backtest_kernel(
     const int*    __restrict__ h1d_map,      // [total_5m_bars]
 
     /* -- Signal arrays (packed row-major) ------------------------ */
-    const float*  __restrict__ sig_1h,       // [total_1h * 13]
+    const float*  __restrict__ sig_1h,       // [total_1h * 15]
     const int     total_1h,
     const float*  __restrict__ sig_4h,       // [total_4h * 3]
     const int     total_4h,
@@ -175,6 +177,10 @@ void backtest_kernel(
     #define STRAT_RANGE     1
     #define STRAT_SQUEEZE   2
     #define STRAT_FUNDING   3
+    #define STRAT_BREAKOUT  4
+    #define STRAT_TREND     5
+    #define STRAT_MOMENTUM  6
+    #define STRAT_MEANREV   7
     #define WARMUP_BARS    60
     #define SIGNAL_EVERY   12
     #define INITIAL_CAPITAL 10000.0
@@ -218,7 +224,9 @@ void backtest_kernel(
     #define SIG_HIGH     10
     #define SIG_LOW      11
     #define SIG_CLOSE    12
-    #define N_SIG_1H     13
+    #define SIG_EMA20    13
+    #define SIG_EMA50    14
+    #define N_SIG_1H     15
 
     #define SIG4_ADX      0
     #define SIG4_EMA50    1
@@ -768,6 +776,114 @@ void backtest_kernel(
                 }
             }
         }
+        else if (strategy_id == STRAT_BREAKOUT) {
+            if (h1_idx >= 21 && h1_idx < total_1h) {
+                /* Find recent high/low over 20 bars */
+                double recent_high = -1e18;
+                double recent_low  =  1e18;
+                for (int lb = 1; lb <= 20 && (h1_idx - lb) >= 0; lb++) {
+                    double hh = (double)__ldg(&sig_1h[(h1_idx - lb) * N_SIG_1H + SIG_HIGH]);
+                    double ll = (double)__ldg(&sig_1h[(h1_idx - lb) * N_SIG_1H + SIG_LOW]);
+                    if (hh > recent_high) recent_high = hh;
+                    if (ll < recent_low)  recent_low  = ll;
+                }
+                double vol_surge = (double)__ldg(&sig_1h[h1_idx * N_SIG_1H + SIG_VSR]);
+                if (price > recent_high && vol_surge >= 1.5) {
+                    sig_dir = DIR_LONG;
+                    sig_strength = fmin(0.5 + (vol_surge - 1.5) * 0.2, 1.0);
+                    if (atr_pct < 0.3) sig_strength = fmax(sig_strength - 0.2, 0.0);
+                } else if (price < recent_low && vol_surge >= 1.5) {
+                    sig_dir = DIR_SHORT;
+                    sig_strength = fmin(0.5 + (vol_surge - 1.5) * 0.2, 1.0);
+                    if (atr_pct < 0.3) sig_strength = fmax(sig_strength - 0.2, 0.0);
+                }
+            }
+        }
+        else if (strategy_id == STRAT_TREND) {
+            if (h1_idx >= 2 && h1_idx < total_1h) {
+                double ema_fast      = (double)__ldg(&sig_1h[h1_idx * N_SIG_1H + SIG_EMA20]);
+                double ema_slow      = (double)__ldg(&sig_1h[h1_idx * N_SIG_1H + SIG_EMA50]);
+                double ema_fast_prev = (double)__ldg(&sig_1h[(h1_idx - 1) * N_SIG_1H + SIG_EMA20]);
+                double ema_slow_prev = (double)__ldg(&sig_1h[(h1_idx - 1) * N_SIG_1H + SIG_EMA50]);
+                double adx_val = (h4_idx >= 0 && h4_idx < total_4h)
+                    ? (double)__ldg(&sig_4h[h4_idx * N_SIG_4H + SIG4_ADX]) : 20.0;
+                double macd_h = (double)__ldg(&sig_1h[h1_idx * N_SIG_1H + SIG_MACD_HIST]);
+
+                bool cross_up   = (ema_fast > ema_slow) && (ema_fast_prev <= ema_slow_prev);
+                bool cross_down = (ema_fast < ema_slow) && (ema_fast_prev >= ema_slow_prev);
+
+                if (cross_up && adx_val > 20.0 && macd_h > 0.0) {
+                    sig_dir = DIR_LONG;
+                    sig_strength = fmin(adx_val / 50.0 + 0.2, 1.0);
+                } else if (cross_down && adx_val > 20.0 && macd_h < 0.0) {
+                    sig_dir = DIR_SHORT;
+                    sig_strength = fmin(adx_val / 50.0 + 0.2, 1.0);
+                }
+                /* Weaker continuation signal */
+                else if (ema_fast > ema_slow && adx_val > 30.0 && macd_h > 0.0) {
+                    sig_dir = DIR_LONG;
+                    sig_strength = 0.3;
+                } else if (ema_fast < ema_slow && adx_val > 30.0 && macd_h < 0.0) {
+                    sig_dir = DIR_SHORT;
+                    sig_strength = 0.3;
+                }
+            }
+        }
+        else if (strategy_id == STRAT_MOMENTUM) {
+            if (h1_idx >= 2 && h1_idx < total_1h) {
+                double rsi_now  = (double)__ldg(&sig_1h[h1_idx * N_SIG_1H + SIG_RSI]);
+                double rsi_prev = (double)__ldg(&sig_1h[(h1_idx - 1) * N_SIG_1H + SIG_RSI]);
+                double macd_h   = (double)__ldg(&sig_1h[h1_idx * N_SIG_1H + SIG_MACD_HIST]);
+                double macd_h_p = (double)__ldg(&sig_1h[(h1_idx - 1) * N_SIG_1H + SIG_MACD_HIST]);
+                double vol_surge = (double)__ldg(&sig_1h[h1_idx * N_SIG_1H + SIG_VSR]);
+
+                /* RSI crossing out of oversold */
+                if (rsi_prev <= 30.0 && rsi_now > 30.0 && macd_h > macd_h_p) {
+                    sig_dir = DIR_LONG;
+                    sig_strength = fmin(0.5 + vol_surge * 0.1, 1.0);
+                }
+                /* RSI crossing out of overbought */
+                else if (rsi_prev >= 70.0 && rsi_now < 70.0 && macd_h < macd_h_p) {
+                    sig_dir = DIR_SHORT;
+                    sig_strength = fmin(0.5 + vol_surge * 0.1, 1.0);
+                }
+                /* Momentum continuation */
+                else if (rsi_now > 60.0 && macd_h > 0.0 && macd_h > macd_h_p && vol_surge >= 1.3) {
+                    sig_dir = DIR_LONG;
+                    sig_strength = fmin(0.3 + (rsi_now - 60.0) / 40.0 * 0.3, 0.7);
+                }
+                else if (rsi_now < 40.0 && macd_h < 0.0 && macd_h < macd_h_p && vol_surge >= 1.3) {
+                    sig_dir = DIR_SHORT;
+                    sig_strength = fmin(0.3 + (40.0 - rsi_now) / 40.0 * 0.3, 0.7);
+                }
+            }
+        }
+        else if (strategy_id == STRAT_MEANREV) {
+            if (h1_idx >= 2 && h1_idx < total_1h) {
+                double ema50 = (double)__ldg(&sig_1h[h1_idx * N_SIG_1H + SIG_EMA50]);
+                double rsi_now = (double)__ldg(&sig_1h[h1_idx * N_SIG_1H + SIG_RSI]);
+                double bb_lower = (double)__ldg(&sig_1h[h1_idx * N_SIG_1H + SIG_BB_LOWER]);
+                double bb_upper = (double)__ldg(&sig_1h[h1_idx * N_SIG_1H + SIG_BB_UPPER]);
+                double adx_val = (h4_idx >= 0 && h4_idx < total_4h)
+                    ? (double)__ldg(&sig_4h[h4_idx * N_SIG_4H + SIG4_ADX]) : 25.0;
+
+                if (adx_val <= 25.0 && ema50 > 0.0) {
+                    double dev_pct = (price - ema50) / ema50 * 100.0;
+                    /* Oversold: price well below EMA50 */
+                    if (dev_pct < -2.0 && rsi_now < 35.0) {
+                        sig_dir = DIR_LONG;
+                        sig_strength = fmin(0.4 + fabs(dev_pct) / 10.0, 1.0);
+                        if (price <= bb_lower) sig_strength = fmin(sig_strength + 0.15, 1.0);
+                    }
+                    /* Overbought: price well above EMA50 */
+                    else if (dev_pct > 2.0 && rsi_now > 65.0) {
+                        sig_dir = DIR_SHORT;
+                        sig_strength = fmin(0.4 + fabs(dev_pct) / 10.0, 1.0);
+                        if (price >= bb_upper) sig_strength = fmin(sig_strength + 0.15, 1.0);
+                    }
+                }
+            }
+        }
 
         /* -- Consecutive confirmation ---------------------------- */
         if (sig_dir != DIR_NEUTRAL) {
@@ -821,8 +937,11 @@ void backtest_kernel(
                 }
             }
             double total_tf = tf_weight_1h + tf_weight_4h + tf_weight_1d;
-            if (total_tf > 0.0)
-                sig_strength *= tf_score / total_tf;
+            if (total_tf > 0.0) {
+                double ratio = tf_score / total_tf;
+                if (ratio < 0.5) ratio = 0.5;  /* floor at 50% */
+                sig_strength *= ratio;
+            }
         }
 
         /* ==============================================================
@@ -1062,6 +1181,10 @@ void backtest_kernel(
     #undef STRAT_RANGE
     #undef STRAT_SQUEEZE
     #undef STRAT_FUNDING
+    #undef STRAT_BREAKOUT
+    #undef STRAT_TREND
+    #undef STRAT_MOMENTUM
+    #undef STRAT_MEANREV
     #undef WARMUP_BARS
     #undef SIGNAL_EVERY
     #undef INITIAL_CAPITAL
@@ -1195,7 +1318,7 @@ def prepare_gpu_data(
         h4_map_abs = h4_map_local + offset_4h
         h1d_map_abs = h1d_map_local + offset_1d
 
-        # Pack 1h signals: 13 columns per bar, row-major
+        # Pack 1h signals: 15 columns per bar, row-major
         sig_1h_packed = np.zeros((n_1h, N_SIG_1H), dtype=np.float32)
         _safe_copy = lambda arr, n: arr[:n] if len(arr) >= n else np.pad(arr, (0, n - len(arr)))
         sig_1h_packed[:, SIG_RSI]       = _safe_copy(precomp_1h["rsi"], n_1h)
@@ -1211,6 +1334,8 @@ def prepare_gpu_data(
         sig_1h_packed[:, SIG_HIGH]      = _safe_copy(precomp_1h["high"], n_1h)
         sig_1h_packed[:, SIG_LOW]       = _safe_copy(precomp_1h["low"], n_1h)
         sig_1h_packed[:, SIG_CLOSE]     = _safe_copy(precomp_1h["close"], n_1h)
+        sig_1h_packed[:, SIG_EMA20]     = _safe_copy(precomp_1h["ema20"], n_1h)
+        sig_1h_packed[:, SIG_EMA50]     = _safe_copy(precomp_1h["ema50"], n_1h)
 
         # Pack 4h signals: 3 columns per bar
         sig_4h_packed = np.zeros((n_4h, N_SIG_4H), dtype=np.float32)

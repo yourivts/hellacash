@@ -11,7 +11,10 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
-_GPU_STRATEGIES = {"orderflow", "range", "squeeze", "funding_contrarian"}
+_GPU_STRATEGIES = {
+    "orderflow", "range", "squeeze", "funding_contrarian",
+    "breakout", "trend_following", "momentum", "mean_reversion",
+}
 
 
 def _gpu_available() -> bool:
