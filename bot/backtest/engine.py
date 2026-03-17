@@ -935,6 +935,61 @@ class BacktestEngine:
                         volume_surge, ema50_slope,
                     )
 
+                elif strat.name == "breakout":
+                    if idx_1h < 21:
+                        continue
+                    price = current_price
+                    recent_high = max(precomp_1h["high"][idx_1h - 20:idx_1h])
+                    recent_low = min(precomp_1h["low"][idx_1h - 20:idx_1h])
+                    volume_surge = precomp_1h["vsr"][idx_1h] if idx_1h < len(precomp_1h["vsr"]) else 1.0
+                    atr_pct_val = atr_pct
+
+                    direction, strength = strat.evaluate_1h(
+                        price, recent_high, recent_low, volume_surge, atr_pct_val,
+                    )
+
+                elif strat.name == "trend_following":
+                    if idx_1h < 2:
+                        continue
+                    ema_fast = precomp_1h["ema20"][idx_1h] if idx_1h < len(precomp_1h["ema20"]) else current_price
+                    ema_slow = precomp_1h["ema50"][idx_1h] if idx_1h < len(precomp_1h["ema50"]) else current_price
+                    ema_fast_prev = precomp_1h["ema20"][idx_1h - 1] if idx_1h > 0 and idx_1h < len(precomp_1h["ema20"]) else ema_fast
+                    ema_slow_prev = precomp_1h["ema50"][idx_1h - 1] if idx_1h > 0 and idx_1h < len(precomp_1h["ema50"]) else ema_slow
+                    adx_val = precomp_4h["adx"][h4_idx] if precomp_4h and 0 <= h4_idx < len(precomp_4h["adx"]) else 20.0
+                    macd_hist = precomp_1h["macd_hist"][idx_1h] if idx_1h < len(precomp_1h["macd_hist"]) else 0.0
+
+                    direction, strength = strat.evaluate_1h(
+                        ema_fast, ema_slow, ema_fast_prev, ema_slow_prev,
+                        adx_val, macd_hist,
+                    )
+
+                elif strat.name == "momentum":
+                    if idx_1h < 2:
+                        continue
+                    rsi_1h = precomp_1h["rsi"][idx_1h] if idx_1h < len(precomp_1h["rsi"]) else 50.0
+                    rsi_1h_prev = precomp_1h["rsi"][idx_1h - 1] if idx_1h > 0 and idx_1h < len(precomp_1h["rsi"]) else 50.0
+                    macd_hist = precomp_1h["macd_hist"][idx_1h] if idx_1h < len(precomp_1h["macd_hist"]) else 0.0
+                    macd_hist_prev = precomp_1h["macd_hist"][idx_1h - 1] if idx_1h > 0 and idx_1h < len(precomp_1h["macd_hist"]) else 0.0
+                    volume_surge = precomp_1h["vsr"][idx_1h] if idx_1h < len(precomp_1h["vsr"]) else 1.0
+
+                    direction, strength = strat.evaluate_1h(
+                        rsi_1h, rsi_1h_prev, macd_hist, macd_hist_prev, volume_surge,
+                    )
+
+                elif strat.name == "mean_reversion":
+                    if idx_1h < 2:
+                        continue
+                    price = current_price
+                    ema50 = precomp_1h["ema50"][idx_1h] if idx_1h < len(precomp_1h["ema50"]) else price
+                    rsi_1h = precomp_1h["rsi"][idx_1h] if idx_1h < len(precomp_1h["rsi"]) else 50.0
+                    adx_val = precomp_4h["adx"][h4_idx] if precomp_4h and 0 <= h4_idx < len(precomp_4h["adx"]) else 25.0
+                    bb_lower = precomp_1h["bb_lower"][idx_1h] if idx_1h < len(precomp_1h["bb_lower"]) else price
+                    bb_upper = precomp_1h["bb_upper"][idx_1h] if idx_1h < len(precomp_1h["bb_upper"]) else price
+
+                    direction, strength = strat.evaluate_1h(
+                        price, ema50, rsi_1h, adx_val, bb_lower, bb_upper,
+                    )
+
                 else:
                     continue
 

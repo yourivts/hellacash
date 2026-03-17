@@ -18,7 +18,10 @@ CHAMPION_DEFAULTS: Dict[str, Any] = {
     "ranging_adx_threshold": 20,
 }
 
-ALL_STRATEGIES = ["orderflow", "range", "squeeze", "funding_contrarian"]
+ALL_STRATEGIES = [
+    "orderflow", "range", "squeeze", "funding_contrarian",
+    "breakout", "trend_following", "momentum", "mean_reversion",
+]
 
 
 @dataclass

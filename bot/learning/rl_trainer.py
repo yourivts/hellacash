@@ -11,6 +11,9 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+_GPU_STRATEGIES = {"orderflow", "range", "squeeze", "funding_contrarian"}
+
+
 def _gpu_available() -> bool:
     """Check if GPU acceleration is available (CuPy + CUDA)."""
     try:
@@ -98,8 +101,9 @@ class RLTrainer:
         results = {}
         overall_start = time.time()
 
-        if not use_gpu:
-            # Warm disk cache so env preloading skips DB+compute
+        # Warm signal cache if any strategies need CPU env
+        has_cpu_strats = any(s not in _GPU_STRATEGIES for s in self._strategies)
+        if not use_gpu or has_cpu_strats:
             cache_dir = os.path.join(self._model_dir, ".signal_cache")
             logger.info("Warming signal cache for %d symbols -> %s", len(symbols), cache_dir)
             cache_start = time.time()
@@ -115,12 +119,14 @@ class RLTrainer:
                 continue
 
             strat_start = time.time()
+            strat_gpu = use_gpu and strategy in _GPU_STRATEGIES
+            strat_n_envs = n_envs if strat_gpu else min(os.cpu_count() or 1, 4)
             logger.info(
                 "=== Training %s model === timesteps=%d, envs=%d, symbols=%d, gpu=%s",
-                strategy, total_timesteps, n_envs, len(symbols), use_gpu,
+                strategy, total_timesteps, strat_n_envs, len(symbols), strat_gpu,
             )
 
-            if use_gpu:
+            if strat_gpu:
                 vec_env = GpuTradingVecEnv(
                     self._candle_store, symbols, strategy,
                     n_envs=n_envs, n_segments=3,
@@ -154,7 +160,7 @@ class RLTrainer:
                 logger.info("[%s] Training done in %.1fs", strategy, train_elapsed)
 
                 # Validate
-                gpu_kw = dict(gpu_data=gpu_data, gpu_kernel=gpu_kernel) if use_gpu else {}
+                gpu_kw = dict(gpu_data=gpu_data, gpu_kernel=gpu_kernel) if strat_gpu else {}
                 avg_reward, val_stats = self._validate(model, strategy, symbols, **gpu_kw)
                 results[strategy] = avg_reward
                 logger.info(
@@ -225,8 +231,8 @@ class RLTrainer:
         results = {}
         overall_start = time.time()
 
-        if not use_gpu:
-            # Warm disk cache for retrain workers
+        has_cpu_strats = any(s not in _GPU_STRATEGIES for s in self._strategies)
+        if not use_gpu or has_cpu_strats:
             cache_dir = os.path.join(self._model_dir, ".signal_cache")
             logger.info("Warming signal cache for retrain (%d symbols)", len(symbols))
             TradingParamEnv.warm_signal_cache(self._candle_store, symbols, cache_dir)
@@ -238,10 +244,11 @@ class RLTrainer:
                 continue
 
             strat_start = time.time()
+            strat_gpu = use_gpu and strategy in _GPU_STRATEGIES
             logger.info("=== Retraining %s === timesteps=%d, gpu=%s",
-                        strategy, total_timesteps, use_gpu)
+                        strategy, total_timesteps, strat_gpu)
 
-            if use_gpu:
+            if strat_gpu:
                 env = GpuTradingVecEnv(
                     self._candle_store, symbols, strategy,
                     n_envs=512, n_segments=3,
@@ -260,7 +267,7 @@ class RLTrainer:
                 model.learn(total_timesteps=total_timesteps, callback=train_cb)
                 logger.info("[%s] Retrain done in %.1fs", strategy, time.time() - strat_start)
 
-                gpu_kw = dict(gpu_data=gpu_data, gpu_kernel=gpu_kernel) if use_gpu else {}
+                gpu_kw = dict(gpu_data=gpu_data, gpu_kernel=gpu_kernel) if strat_gpu else {}
                 avg_reward, val_stats = self._validate(model, strategy, symbols, **gpu_kw)
                 results[strategy] = avg_reward
                 logger.info(

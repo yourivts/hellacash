@@ -96,12 +96,20 @@ STRAT_ORDERFLOW = 0
 STRAT_RANGE = 1
 STRAT_SQUEEZE = 2
 STRAT_FUNDING = 3
+STRAT_BREAKOUT = 4
+STRAT_TREND = 5
+STRAT_MOMENTUM = 6
+STRAT_MEANREV = 7
 
 STRATEGY_NAME_TO_ID = {
     "orderflow": STRAT_ORDERFLOW,
     "range": STRAT_RANGE,
     "squeeze": STRAT_SQUEEZE,
     "funding_contrarian": STRAT_FUNDING,
+    "breakout": STRAT_BREAKOUT,
+    "trend_following": STRAT_TREND,
+    "momentum": STRAT_MOMENTUM,
+    "mean_reversion": STRAT_MEANREV,
 }
 
 # ---------------------------------------------------------------------------

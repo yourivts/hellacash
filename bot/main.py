@@ -480,9 +480,9 @@ async def _main() -> None:
         logger.info("RL retrain complete: %s", results)
 
     def _rl_models_ready() -> bool:
-        """Check if ALL 4 RL models have been trained (on disk)."""
+        """Check if all RL models have been trained (on disk)."""
         rl_opt = _get_rl_optimizer()
-        required = ALL_STRATEGIES  # ['orderflow', 'range', 'squeeze', 'funding_contrarian']
+        required = ALL_STRATEGIES
         if all(rl_opt.has_model(s) for s in required):
             return True
         # Models might have been trained by bootstrap — try reloading from disk
