@@ -154,7 +154,8 @@ class RLTrainer:
                 logger.info("[%s] Training done in %.1fs", strategy, train_elapsed)
 
                 # Validate
-                avg_reward, val_stats = self._validate(model, strategy, symbols)
+                gpu_kw = dict(gpu_data=gpu_data, gpu_kernel=gpu_kernel) if use_gpu else {}
+                avg_reward, val_stats = self._validate(model, strategy, symbols, **gpu_kw)
                 results[strategy] = avg_reward
                 logger.info(
                     "[%s] Validation: avg_reward=%.3f, avg_sharpe=%.2f, avg_pnl=€%.2f, "
@@ -168,7 +169,7 @@ class RLTrainer:
                 existing_path = os.path.join(self._model_dir, f"{strategy}_ppo.zip")
                 if os.path.exists(existing_path):
                     old_model = PPO.load(existing_path)
-                    old_reward, old_stats = self._validate(old_model, strategy, symbols)
+                    old_reward, old_stats = self._validate(old_model, strategy, symbols, **gpu_kw)
                     logger.info(
                         "[%s] Old model: avg_reward=%.3f, avg_sharpe=%.2f, avg_pnl=€%.2f",
                         strategy, old_reward, old_stats["avg_sharpe"], old_stats["avg_pnl"],
@@ -259,7 +260,8 @@ class RLTrainer:
                 model.learn(total_timesteps=total_timesteps, callback=train_cb)
                 logger.info("[%s] Retrain done in %.1fs", strategy, time.time() - strat_start)
 
-                avg_reward, val_stats = self._validate(model, strategy, symbols)
+                gpu_kw = dict(gpu_data=gpu_data, gpu_kernel=gpu_kernel) if use_gpu else {}
+                avg_reward, val_stats = self._validate(model, strategy, symbols, **gpu_kw)
                 results[strategy] = avg_reward
                 logger.info(
                     "[%s] Retrain validation: avg_reward=%.3f, avg_sharpe=%.2f, "
@@ -270,7 +272,7 @@ class RLTrainer:
 
                 # Validation gate
                 old_model = PPO.load(model_path)
-                old_reward, old_stats = self._validate(old_model, strategy, symbols)
+                old_reward, old_stats = self._validate(old_model, strategy, symbols, **gpu_kw)
                 logger.info(
                     "[%s] Old model: avg_reward=%.3f, avg_sharpe=%.2f, avg_pnl=€%.2f",
                     strategy, old_reward, old_stats["avg_sharpe"], old_stats["avg_pnl"],
@@ -298,11 +300,17 @@ class RLTrainer:
         return results
 
     def _validate(self, model, strategy: str, symbols: List[str],
-                  n_episodes: int = 20) -> tuple:
+                  n_episodes: int = 20, gpu_data=None, gpu_kernel=None) -> tuple:
         """Run model on validation episodes, return (avg_reward, stats_dict).
 
-        Handles both single-step and multi-step (n_segments>1) environments.
+        Uses GPU VecEnv when gpu_data/gpu_kernel are provided, otherwise
+        falls back to CPU TradingParamEnv.
         """
+        if gpu_data is not None and gpu_kernel is not None:
+            return self._validate_gpu(
+                model, strategy, symbols, n_episodes, gpu_data, gpu_kernel,
+            )
+
         from bot.learning.rl_environment import TradingParamEnv
 
         env = TradingParamEnv(self._candle_store, symbols, strategy,
@@ -363,4 +371,59 @@ class RLTrainer:
             "avg_win_rate": np.mean(win_rates) if win_rates else 0.0,
             "avg_drawdown": np.mean(drawdowns) if drawdowns else 0.0,
         }
+        return avg_reward, stats
+
+    def _validate_gpu(self, model, strategy: str, symbols: List[str],
+                      n_episodes: int, gpu_data, gpu_kernel) -> tuple:
+        """GPU-accelerated validation using GpuTradingVecEnv."""
+        from bot.learning.gpu_vec_env import GpuTradingVecEnv
+
+        env = GpuTradingVecEnv(
+            self._candle_store, symbols, strategy,
+            n_envs=n_episodes, n_segments=3,
+            validation_mode=True,
+            _gpu_data=gpu_data, _kernel=gpu_kernel,
+        )
+
+        obs = env.reset()
+        all_rewards = np.zeros(n_episodes, dtype=np.float64)
+        all_pnl = np.zeros(n_episodes, dtype=np.float64)
+        all_trades = np.zeros(n_episodes, dtype=np.int32)
+        all_sharpe = np.zeros(n_episodes, dtype=np.float64)
+        all_dd = np.zeros(n_episodes, dtype=np.float64)
+        all_pf = np.zeros(n_episodes, dtype=np.float64)
+
+        # Run through all 3 segments
+        for seg in range(3):
+            actions, _ = model.predict(obs, deterministic=True)
+            obs, rewards, dones, infos = env.step(actions)
+            all_rewards += rewards
+
+            for i in range(n_episodes):
+                all_pnl[i] += infos[i].get("segment_pnl", 0.0)
+                all_trades[i] += infos[i].get("segment_trades", 0)
+                all_sharpe[i] = infos[i].get("segment_sharpe", 0.0)
+                all_dd[i] = max(all_dd[i], infos[i].get("segment_max_dd", 0.0))
+                all_pf[i] = infos[i].get("segment_profit_factor", 0.0)
+
+        env.close()
+
+        # Compute win rate from trades and wins (approximate from PF)
+        avg_reward = float(np.mean(all_rewards))
+        stats = {
+            "avg_sharpe": float(np.mean(all_sharpe)),
+            "avg_pnl": float(np.mean(all_pnl)),
+            "avg_pf": float(np.mean(np.clip(all_pf, 0.0, 5.0))),
+            "avg_trades": float(np.mean(all_trades)),
+            "avg_win_rate": 0.0,  # not tracked per-position in GPU kernel
+            "avg_drawdown": float(np.mean(all_dd)),
+        }
+
+        logger.info(
+            "  [%s] GPU val: avg_reward=%.2f, pnl=%.2f, trades=%.0f, "
+            "sharpe=%.2f, dd=%.1f%%",
+            strategy, avg_reward, stats["avg_pnl"], stats["avg_trades"],
+            stats["avg_sharpe"], stats["avg_drawdown"],
+        )
+
         return avg_reward, stats
