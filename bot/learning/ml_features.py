@@ -546,9 +546,13 @@ def extract_all_features(
 
     n = len(df_5m)
 
+    # Use a fixed-size window to avoid O(N²) indicator recomputation
+    _FEAT_WINDOW = 2000  # enough history for all indicators (EMA200 on daily needs ~1000 5m bars)
+
     for i in range(MIN_BARS_5M, n, SIGNAL_EVERY):
-        slice_5m = df_5m.iloc[:i]
-        btc_slice = btc_df_5m.iloc[:i] if btc_df_5m is not None else None
+        w_start = max(0, i - _FEAT_WINDOW)
+        slice_5m = df_5m.iloc[w_start:i]
+        btc_slice = btc_df_5m.iloc[w_start:i] if btc_df_5m is not None else None
 
         tab = extract_tabular_features(
             slice_5m, symbol, btc_slice,

@@ -150,15 +150,21 @@ def main():
     print("\n  Building LSTM training data...")
     all_seqs = []
     all_lstm_targets = []
+    LSTM_STRIDE = 6  # sample every 6 bars (30 min) — consecutive bars have 95/96 overlap
+    WINDOW_PAD = 300  # extra bars for indicator warmup (only need ~120, pad generously)
     for pair, df in all_dfs.items():
         from bot.learning.ml_features import build_lstm_sequence, LSTM_MIN_BARS
         targets = build_lstm_targets(df)
-        for i in range(LSTM_MIN_BARS, len(df) - LSTM_PREDICT_BARS):
-            seq = build_lstm_sequence(df.iloc[:i + 1])
+        n_pair = len(df) - LSTM_PREDICT_BARS
+        count_before = len(all_seqs)
+        for i in range(LSTM_MIN_BARS, n_pair, LSTM_STRIDE):
+            # Pass a small window instead of growing slice — avoids O(N²)
+            window_start = max(0, i + 1 - WINDOW_PAD)
+            seq = build_lstm_sequence(df.iloc[window_start:i + 1])
             if not np.all(seq == 0):
                 all_seqs.append(seq)
                 all_lstm_targets.append(targets[i])
-        print(f"    {pair}: {len(all_seqs)} sequences so far")
+        print(f"    {pair}: {len(all_seqs) - count_before:,} sequences ({len(all_seqs):,} total)")
 
     seqs_arr = np.stack(all_seqs)
     targets_arr = np.stack(all_lstm_targets)
@@ -186,11 +192,13 @@ def main():
     all_tabular = []
     all_labels = []
     all_embeddings = []
+    all_timestamps_flat = []
 
     btc_df = all_dfs.get("BTC-EUR")
 
     for pair, df in all_dfs.items():
         print(f"    {pair}: extracting features...", end="", flush=True)
+        t0 = time.time()
         tabular, sequences, timestamps = extract_all_features(
             df, symbol=pair, btc_df_5m=btc_df if pair != "BTC-EUR" else None,
         )
@@ -202,16 +210,17 @@ def main():
         ts_indices = [df.index.get_loc(ts) for ts in timestamps]
         label_rows = labels[ts_indices]
 
-        embeddings = []
-        for seq in sequences:
-            emb = lstm.embed_numpy(seq)
-            embeddings.append(emb)
-        embeddings = np.stack(embeddings)
+        # Batch embedding extraction (faster than per-sequence)
+        import torch
+        seq_tensor = torch.from_numpy(sequences).float()
+        with torch.no_grad():
+            embeddings = lstm.embed(seq_tensor).numpy()
 
         all_tabular.append(tabular)
         all_labels.append(label_rows)
         all_embeddings.append(embeddings)
-        print(f" {len(tabular):,} samples")
+        all_timestamps_flat.extend(timestamps)
+        print(f" {len(tabular):,} samples ({time.time() - t0:.0f}s)")
 
     X_tab = np.vstack(all_tabular)
     y_all = np.vstack(all_labels)
@@ -220,12 +229,6 @@ def main():
     print(f"  Total XGBoost samples: {len(X):,}, features: {X.shape[1]}")
 
     # Step 4: Walk-forward split and train XGBoost
-    all_timestamps_flat = []
-    for pair, df in all_dfs.items():
-        _, _, timestamps = extract_all_features(
-            df, symbol=pair, btc_df_5m=btc_df if pair != "BTC-EUR" else None,
-        )
-        all_timestamps_flat.extend(timestamps)
     all_ts = pd.DatetimeIndex(all_timestamps_flat)
     total_span = (all_ts.max() - all_ts.min()).days
     train_cutoff = all_ts.min() + timedelta(days=int(total_span * 0.6))
