@@ -1786,24 +1786,29 @@ class MLSignalGenerator:
         transformer_path = self._model_dir / "transformer.pt"
         lstm_path = self._model_dir / "lstm.pt"
 
+        import torch
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         if transformer_path.exists():
             from bot.learning.transformer_embedder import TransformerEmbedder
             self._embedder = TransformerEmbedder()
             self._embedder.load(str(transformer_path))
+            self._embedder.to(device)
             self._embedder.eval()
-            logger.info("Loaded Transformer embedder from %s", transformer_path)
+            logger.info("Loaded Transformer embedder on %s from %s", device, transformer_path)
         elif lstm_path.exists():
             from bot.learning.lstm_embedder import LSTMEmbedder
             self._embedder = LSTMEmbedder()
             self._embedder.load(str(lstm_path))
+            self._embedder.to(device)
             self._embedder.eval()
-            logger.info("Loaded LSTM embedder (fallback) from %s", lstm_path)
+            logger.info("Loaded LSTM embedder (fallback) on %s from %s", device, lstm_path)
         else:
             raise FileNotFoundError(
                 f"No embedder model found. Expected transformer.pt or lstm.pt in {model_dir}"
             )
 
-        # Load XGBoost models
+        # Load XGBoost models (GPU inference if available)
         self._xgb_models: Dict[str, xgb.XGBClassifier] = {}
         for h in HORIZONS:
             for d in DIRECTIONS:
@@ -1813,6 +1818,11 @@ class MLSignalGenerator:
                     raise FileNotFoundError(f"XGBoost model not found: {path}")
                 model = xgb.XGBClassifier()
                 model.load_model(str(path))
+                # Enable GPU prediction if model was trained on GPU
+                try:
+                    model.set_params(device="cuda")
+                except Exception:
+                    pass  # Fall back to CPU prediction if GPU not available
                 self._xgb_models[key] = model
 
         # Load feature config (accept both n_embed and n_lstm_embed for backward compat)
