@@ -2246,12 +2246,17 @@ def optuna_transformer_hpo(train_seqs, train_targets, val_seqs, val_targets, n_t
 - [ ] **Step 3: Add threshold search function**
 
 ```python
-def search_thresholds(X, close_prices, train_mask, val_mask, horizons):
+def search_thresholds(X, all_dfs, processed_pairs, train_mask, val_mask, horizons):
     """Search for optimal thresholds per horizon that maximize validation F1.
+
+    Computes labels per-pair on full-resolution close prices (5m bars) to avoid
+    subsampling artifacts and cross-pair contamination. Then subsamples to match
+    the feature matrix X.
 
     Args:
         X: feature matrix (N, n_features)
-        close_prices: raw close prices array (N,) for recomputing labels
+        all_dfs: dict of pair → DataFrame with full 5m candles
+        processed_pairs: list of pair names that were successfully processed in X
         train_mask: boolean mask for training samples
         val_mask: boolean mask for validation samples
         horizons: list of (name, bars_ahead, base_threshold_pct) tuples
@@ -2259,7 +2264,8 @@ def search_thresholds(X, close_prices, train_mask, val_mask, horizons):
     Returns:
         dict mapping horizon name to optimal threshold percentage.
     """
-    n = len(close_prices)
+    from bot.learning.ml_features import MIN_BARS_5M, SIGNAL_EVERY
+
     optimal = {}
     for h_idx, (h_name, bars, base_threshold) in enumerate(horizons):
         best_f1 = -1
@@ -2268,27 +2274,33 @@ def search_thresholds(X, close_prices, train_mask, val_mask, horizons):
             thresh_pct = base_threshold * factor
             thresh_frac = thresh_pct / 100.0
 
-            # Recompute labels with this threshold from raw prices
-            valid = n - bars
-            if valid <= 0:
-                continue
-            future_close = close_prices[bars:bars + valid]
-            current_close = close_prices[:valid]
-            future_return = (future_close - current_close) / (current_close + 1e-12)
-            y_up = np.zeros(n, dtype=np.float32)
-            y_up[:valid] = (future_return > thresh_frac).astype(np.float32)
-            # Set NaN for last `bars` rows (no future data)
-            y_up_full = np.full(n, np.nan, dtype=np.float32)
-            y_up_full[:valid] = y_up[:valid]
+            # Recompute labels per-pair on full-resolution 5m close prices
+            all_y_up = []
+            for pair in processed_pairs:
+                df = all_dfs[pair]
+                close = df["close"].values.astype(np.float64)
+                n = len(close)
+                y_up_full = np.full(n, np.nan, dtype=np.float32)
+                valid = n - bars
+                if valid > 0:
+                    future_close = close[bars:bars + valid]
+                    current_close = close[:valid]
+                    future_return = (future_close - current_close) / (current_close + 1e-12)
+                    y_up_full[:valid] = (future_return > thresh_frac).astype(np.float32)
+                # Subsample with i-1 offset to match extract_all_features timestamps
+                sample_indices = np.arange(MIN_BARS_5M, n, SIGNAL_EVERY)
+                all_y_up.append(y_up_full[sample_indices - 1])
 
-            train_valid = train_mask & ~np.isnan(y_up_full)
-            val_valid = val_mask & ~np.isnan(y_up_full)
+            y_up = np.concatenate(all_y_up)
+
+            train_valid = train_mask & ~np.isnan(y_up)
+            val_valid = val_mask & ~np.isnan(y_up)
 
             if train_valid.sum() < 100 or val_valid.sum() < 100:
                 continue
 
-            X_t, y_t = X[train_valid], y_up_full[train_valid]
-            X_v, y_v = X[val_valid], y_up_full[val_valid]
+            X_t, y_t = X[train_valid], y_up[train_valid]
+            X_v, y_v = X[val_valid], y_up[val_valid]
 
             quick_model = xgb.XGBClassifier(
                 n_estimators=100, max_depth=6, learning_rate=0.1,
@@ -2494,6 +2506,7 @@ def main():
     all_labels = []
     all_embeddings = []
     all_timestamps_flat = []
+    processed_pairs = []  # Track which pairs had valid features (for Steps 8/8b)
 
     for pair, df in all_dfs.items():
         print(f"    {pair}: extracting features...", end="", flush=True)
@@ -2518,6 +2531,8 @@ def main():
         if len(tabular) == 0:
             print(" skipped (no features)")
             continue
+
+        processed_pairs.append(pair)
 
         labels = compute_labels(df)
         ts_indices = [df.index.get_loc(ts) for ts in timestamps]
@@ -2558,17 +2573,10 @@ def main():
           f"val={val_mask.sum():,}, test={test_mask.sum():,}")
 
     # ── Step 8: Threshold search (needs embeddings for F1 evaluation) ──
-    # Build close_prices array aligned to X (same sample points used for features)
-    all_close_prices = []
-    for pair, df in all_dfs.items():
-        close = df["close"].values
-        from bot.learning.ml_features import MIN_BARS_5M, SIGNAL_EVERY
-        sample_indices = np.arange(MIN_BARS_5M, len(df), SIGNAL_EVERY)
-        all_close_prices.append(close[sample_indices])
-    close_prices = np.concatenate(all_close_prices)
-
+    # search_thresholds computes labels per-pair on full-resolution 5m data
+    # to avoid subsampling artifacts and cross-pair contamination.
     print("\n  Searching optimal thresholds per horizon...")
-    optimal_thresholds = search_thresholds(X, close_prices, train_mask, val_mask, HORIZONS)
+    optimal_thresholds = search_thresholds(X, all_dfs, processed_pairs, train_mask, val_mask, HORIZONS)
 
     # ── Step 8b: Recompute labels with optimal thresholds ──
     # CRITICAL: models must train on labels computed with the same thresholds
@@ -2578,9 +2586,11 @@ def main():
         (name, bars, optimal_thresholds.get(name, thresh))
         for name, bars, thresh in HORIZONS
     ]
-    # Rebuild y_all with optimal thresholds
+    # Rebuild y_all with optimal thresholds (only processed pairs, matching Step 6)
+    from bot.learning.ml_features import MIN_BARS_5M, SIGNAL_EVERY
     all_labels = []
-    for pair, df in all_dfs.items():
+    for pair in processed_pairs:
+        df = all_dfs[pair]
         n = len(df)
         close = df["close"].values.astype(np.float64)
         labels = np.full((n, 12), np.nan, dtype=np.float32)
@@ -2595,9 +2605,9 @@ def main():
             labels[:valid, h_idx * 2] = (future_return > threshold_frac).astype(np.float32)
             labels[:valid, h_idx * 2 + 1] = (future_return < -threshold_frac).astype(np.float32)
 
-        from bot.learning.ml_features import MIN_BARS_5M, SIGNAL_EVERY
-        sample_indices = np.arange(MIN_BARS_5M, len(df), SIGNAL_EVERY)
-        all_labels.append(labels[sample_indices])
+        sample_indices = np.arange(MIN_BARS_5M, n, SIGNAL_EVERY)
+        # Use i-1 offset to match extract_all_features() timestamp convention
+        all_labels.append(labels[sample_indices - 1])
 
     y_all = np.vstack(all_labels)
     print(f"  Labels recomputed with optimal thresholds for {len(y_all):,} samples")
@@ -2870,17 +2880,29 @@ The `compute_labels()` and `build_lstm_targets()` functions haven't changed thei
 class TestThresholdSearch:
     """Tests for threshold optimization."""
 
+    def _make_synthetic_pairs(self, n_bars=3000):
+        """Create synthetic pair DataFrames for threshold search tests."""
+        np.random.seed(42)
+        timestamps = pd.date_range("2020-01-01", periods=n_bars, freq="5min")
+        base = 50000.0
+        close = base * np.exp(np.cumsum(np.random.randn(n_bars) * 0.001))
+        return {"BTC-EUR": pd.DataFrame({
+            "open": close * 0.999, "high": close * 1.002,
+            "low": close * 0.998, "close": close,
+            "volume": np.random.exponential(100, n_bars),
+        }, index=timestamps)}
+
     def test_search_returns_dict_with_horizon_keys(self):
         from scripts.train_ml_signals import search_thresholds, HORIZONS
-        # Create minimal synthetic data with realistic price structure
+        from bot.learning.ml_features import MIN_BARS_5M, SIGNAL_EVERY
         np.random.seed(42)
-        n = 500
-        X = np.random.randn(n, 106).astype(np.float32)
-        base_price = 50000.0
-        close_prices = base_price * np.exp(np.cumsum(np.random.randn(n) * 0.001))
-        train_mask = np.arange(n) < 300
-        val_mask = (np.arange(n) >= 300) & (np.arange(n) < 400)
-        result = search_thresholds(X, close_prices, train_mask, val_mask, HORIZONS)
+        all_dfs = self._make_synthetic_pairs()
+        n_bars = len(all_dfs["BTC-EUR"])
+        n_samples = len(np.arange(MIN_BARS_5M, n_bars, SIGNAL_EVERY))
+        X = np.random.randn(n_samples, 106).astype(np.float32)
+        train_mask = np.arange(n_samples) < int(n_samples * 0.6)
+        val_mask = (np.arange(n_samples) >= int(n_samples * 0.6)) & (np.arange(n_samples) < int(n_samples * 0.8))
+        result = search_thresholds(X, all_dfs, ["BTC-EUR"], train_mask, val_mask, HORIZONS)
         assert isinstance(result, dict)
         for h_name, _, _ in HORIZONS:
             assert h_name in result
@@ -2888,13 +2910,15 @@ class TestThresholdSearch:
     def test_search_returns_different_thresholds(self):
         """Optimal thresholds should vary across horizons."""
         from scripts.train_ml_signals import search_thresholds, HORIZONS
+        from bot.learning.ml_features import MIN_BARS_5M, SIGNAL_EVERY
         np.random.seed(42)
-        n = 500
-        X = np.random.randn(n, 106).astype(np.float32)
-        close_prices = 50000.0 * np.exp(np.cumsum(np.random.randn(n) * 0.001))
-        train_mask = np.arange(n) < 300
-        val_mask = (np.arange(n) >= 300) & (np.arange(n) < 400)
-        result = search_thresholds(X, close_prices, train_mask, val_mask, HORIZONS)
+        all_dfs = self._make_synthetic_pairs()
+        n_bars = len(all_dfs["BTC-EUR"])
+        n_samples = len(np.arange(MIN_BARS_5M, n_bars, SIGNAL_EVERY))
+        X = np.random.randn(n_samples, 106).astype(np.float32)
+        train_mask = np.arange(n_samples) < int(n_samples * 0.6)
+        val_mask = (np.arange(n_samples) >= int(n_samples * 0.6)) & (np.arange(n_samples) < int(n_samples * 0.8))
+        result = search_thresholds(X, all_dfs, ["BTC-EUR"], train_mask, val_mask, HORIZONS)
         values = list(result.values())
         # At least some should differ from their base values
         assert len(set(f"{v:.3f}" for v in values)) >= 2, "All thresholds are identical"
