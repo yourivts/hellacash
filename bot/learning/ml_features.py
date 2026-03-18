@@ -505,6 +505,333 @@ def build_lstm_sequence(df_5m: pd.DataFrame) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Batch precomputation (compute all indicators once, then index)
+# ---------------------------------------------------------------------------
+
+def _precompute_indicators(
+    df_5m: pd.DataFrame, btc_df_5m: pd.DataFrame | None,
+) -> dict:
+    """Compute all technical indicators once on the full DataFrame.
+
+    Returns a dict of numpy arrays, all aligned to df_5m's integer index.
+    """
+    n = len(df_5m)
+    idx_5m = df_5m.index
+    close_5m = df_5m["close"]
+    vol_5m = df_5m["volume"]
+
+    # Resample ONCE
+    df_1h = df_5m.resample("1h").agg(_RESAMPLE_OHLCV).dropna()
+    df_4h = df_5m.resample("4h").agg(_RESAMPLE_OHLCV).dropna()
+    df_1d = df_5m.resample("1D").agg(_RESAMPLE_OHLCV).dropna()
+
+    def ffill(series):
+        """Forward-fill a resampled Series to 5m resolution."""
+        return series.reindex(idx_5m, method="ffill").values.astype(np.float64)
+
+    pc: dict = {}
+
+    # ---- 1h indicators ----
+    pc["rsi_1h"] = ffill(rsi(df_1h["close"]))
+
+    macd_1h_d = macd(df_1h["close"])
+    pc["macd_hist_1h"] = ffill(macd_1h_d["histogram"])
+
+    stoch_1h_d = stochastic(df_1h["high"], df_1h["low"], df_1h["close"])
+    pc["stoch_k_1h"] = ffill(stoch_1h_d["k"])
+    pc["stoch_d_1h"] = ffill(stoch_1h_d["d"])
+
+    pc["cci_1h"] = ffill(cci(df_1h["high"], df_1h["low"], df_1h["close"]))
+
+    atr_1h_s = atr(df_1h["high"], df_1h["low"], df_1h["close"])
+    pc["atr_1h"] = ffill(atr_1h_s)
+    pc["close_1h"] = ffill(df_1h["close"])
+    pc["atr_1h_exp_mean"] = ffill(atr_1h_s.expanding().mean())
+
+    bb_1h_d = bollinger_bands(df_1h["close"])
+    pc["bb_bandwidth_1h"] = ffill(bb_1h_d["bandwidth"])
+    pc["bb_pct_b_1h"] = ffill(bb_1h_d["pct_b"])
+
+    kc_1h_d = keltner_channels(df_1h["high"], df_1h["low"], df_1h["close"])
+    pc["kc_upper_1h"] = ffill(kc_1h_d["upper"])
+    pc["kc_lower_1h"] = ffill(kc_1h_d["lower"])
+
+    pc["ema20_1h"] = ffill(ema(df_1h["close"], 20))
+    pc["ema50_1h"] = ffill(ema(df_1h["close"], 50))
+    pc["ema200_1h"] = ffill(ema(df_1h["close"], 200))
+
+    if len(df_1h) >= 20:
+        pc["supertrend_1h"] = ffill(supertrend(df_1h["high"], df_1h["low"], df_1h["close"]))
+    else:
+        pc["supertrend_1h"] = np.zeros(n)
+
+    # ---- 4h indicators ----
+    pc["rsi_4h"] = ffill(rsi(df_4h["close"]))
+
+    macd_4h_d = macd(df_4h["close"])
+    pc["macd_hist_4h"] = ffill(macd_4h_d["histogram"])
+
+    atr_4h_s = atr(df_4h["high"], df_4h["low"], df_4h["close"])
+    pc["atr_4h"] = ffill(atr_4h_s)
+    pc["close_4h"] = ffill(df_4h["close"])
+
+    # EMA50 slope (10-bar diff in 4h timeframe, then ffill)
+    ema50_4h_s = ema(df_4h["close"], 50)
+    pc["ema50_4h_diff10"] = ffill(ema50_4h_s - ema50_4h_s.shift(10))
+
+    pc["adx_4h"] = ffill(adx(df_4h["high"], df_4h["low"], df_4h["close"]))
+
+    # ---- 1d indicators ----
+    if len(df_1d) >= 56:
+        ema50_1d_s = ema(df_1d["close"], 50)
+        pc["ema50_1d_diff5"] = ffill(ema50_1d_s - ema50_1d_s.shift(5))
+    else:
+        pc["ema50_1d_diff5"] = np.zeros(n)
+
+    # ---- 5m indicators ----
+    pc["rsi_5m"] = rsi(close_5m).values.astype(np.float64)
+    pc["vol_surge_5m"] = volume_surge_ratio(vol_5m).values.astype(np.float64)
+
+    obv_5m_s = obv(close_5m, vol_5m)
+    obv_slope = obv_5m_s - obv_5m_s.shift(20)
+    obv_abs_max = obv_5m_s.abs().rolling(20).max().fillna(1.0) + 1e-9
+    pc["obv_slope_norm"] = (obv_slope / obv_abs_max).values.astype(np.float64)
+
+    pc["cmf_5m"] = cmf(df_5m["high"], df_5m["low"], close_5m, vol_5m).values.astype(np.float64)
+
+    # Rolling VWAP (2000-bar window to match original windowed behavior)
+    tp = (df_5m["high"] + df_5m["low"] + close_5m) / 3
+    vwap_num = (tp * vol_5m).rolling(2000, min_periods=1).sum()
+    vwap_den = vol_5m.rolling(2000, min_periods=1).sum().replace(0, 1e-9)
+    pc["vwap_5m"] = (vwap_num / vwap_den).values.astype(np.float64)
+
+    pc["vps_5m"] = volume_profile_support(close_5m, vol_5m).values.astype(np.float64)
+    pc["rsi_div_5m"] = rsi_divergence(close_5m).values.astype(np.float64)
+    pc["vol_div_5m"] = volume_divergence(close_5m, vol_5m).values.astype(np.float64)
+
+    pc["close_5m"] = close_5m.values.astype(np.float64)
+
+    # Multi-TF returns (log return over shifted bars)
+    for shift_bars, label in [
+        (12, "1h"), (48, "4h"), (144, "12h"),
+        (288, "24h"), (864, "72h"), (2016, "7d"),
+    ]:
+        shifted = close_5m.shift(shift_bars)
+        log_ret = np.where(
+            shifted.values > 0,
+            np.log(close_5m.values / np.where(shifted.values > 0, shifted.values, 1.0)),
+            0.0,
+        )
+        pc[f"return_{label}"] = np.clip(log_ret, -1.0, 1.0)
+
+    # Candle structure (rolling 96-bar means)
+    o, h, lo, c = df_5m["open"], df_5m["high"], df_5m["low"], close_5m
+    body = (c - o).abs()
+    candle_range = (h - lo).replace(0, np.nan)
+    pc["body_ratio_96"] = (body / candle_range).fillna(0.5).rolling(96).mean().values.astype(np.float64)
+    upper_wick = h - pd.concat([o, c], axis=1).max(axis=1)
+    lower_wick = pd.concat([o, c], axis=1).min(axis=1) - lo
+    pc["uw_ratio_96"] = (upper_wick / candle_range).fillna(0.0).rolling(96).mean().values.astype(np.float64)
+    pc["lw_ratio_96"] = (lower_wick / candle_range).fillna(0.0).rolling(96).mean().values.astype(np.float64)
+
+    # Consecutive green/red streak (single O(n) pass)
+    direction = np.where(c.values > o.values, 1, -1)
+    streak = np.ones(n, dtype=np.int32)
+    for i in range(1, n):
+        if direction[i] == direction[i - 1]:
+            streak[i] = streak[i - 1] + 1
+        else:
+            streak[i] = 1
+    pc["streak_feature"] = (np.clip(streak / 20.0, 0.0, 1.0) * direction).astype(np.float64)
+
+    # Time features
+    pc["hour"] = idx_5m.hour.values.astype(np.float64)
+    pc["dayofweek"] = idx_5m.dayofweek.values.astype(np.float64)
+    pc["month"] = idx_5m.month.values.astype(np.float64)
+
+    # BTC cross-asset
+    if btc_df_5m is not None and len(btc_df_5m) >= 49:
+        btc_close = btc_df_5m["close"]
+        # Compute on BTC's index, then align to main pair's timestamps
+        btc_shifted_12 = btc_close.shift(12)
+        btc_shifted_48 = btc_close.shift(48)
+        btc_ret_1h = np.where(
+            btc_shifted_12.values > 0,
+            np.log(btc_close.values / np.where(btc_shifted_12.values > 0, btc_shifted_12.values, 1.0)),
+            0.0,
+        )
+        btc_ret_4h = np.where(
+            btc_shifted_48.values > 0,
+            np.log(btc_close.values / np.where(btc_shifted_48.values > 0, btc_shifted_48.values, 1.0)),
+            0.0,
+        )
+        btc_ret_1h_s = pd.Series(btc_ret_1h, index=btc_df_5m.index)
+        btc_ret_4h_s = pd.Series(btc_ret_4h, index=btc_df_5m.index)
+        pc["btc_return_1h"] = np.clip(btc_ret_1h_s.reindex(idx_5m, method="ffill").values, -1.0, 1.0)
+        pc["btc_return_4h"] = np.clip(btc_ret_4h_s.reindex(idx_5m, method="ffill").values, -1.0, 1.0)
+
+        # Rolling 96-bar correlation
+        btc_aligned = btc_close.reindex(idx_5m, method="ffill")
+        corr_96 = close_5m.rolling(96).corr(btc_aligned)
+        pc["btc_corr_96"] = corr_96.values.astype(np.float64)
+    else:
+        pc["btc_return_1h"] = np.zeros(n)
+        pc["btc_return_4h"] = np.zeros(n)
+        pc["btc_corr_96"] = np.zeros(n)
+
+    return pc
+
+
+def _batch_extract_tabular(
+    df_5m: pd.DataFrame,
+    symbol: str,
+    btc_df_5m: pd.DataFrame | None,
+    sample_indices: np.ndarray,
+) -> np.ndarray:
+    """Extract 65 tabular features at multiple sample points using precomputed indicators.
+
+    Fully vectorized: indicators are computed once on the full DataFrame, then
+    features for all sample points are assembled via numpy fancy-indexing.
+
+    Parameters
+    ----------
+    df_5m           : full 5m DataFrame
+    symbol          : trading pair symbol
+    btc_df_5m       : BTC 5m DataFrame (may be None)
+    sample_indices  : integer indices into df_5m (0-based)
+
+    Returns
+    -------
+    np.ndarray of shape (len(sample_indices), 65), dtype float32.
+    """
+    logger.info("Precomputing indicators on %d bars for %s...", len(df_5m), symbol)
+    pc = _precompute_indicators(df_5m, btc_df_5m)
+    logger.info("Precomputation done, extracting features at %d sample points", len(sample_indices))
+
+    idx = sample_indices
+    ns = len(idx)
+    features = np.zeros((ns, N_TABULAR), dtype=np.float64)
+
+    price = pc["close_5m"][idx]
+    safe_price = np.where(price > 0, price, 1.0)
+    valid = (price > 0) & np.isfinite(price)
+
+    def g(arr):
+        """Get precomputed values at sample indices."""
+        return arr[idx]
+
+    # ---- 0-8: Price action ----
+    features[:, 0] = np.clip(g(pc["rsi_1h"]) / 100.0, 0.0, 1.0)
+    features[:, 1] = np.clip(g(pc["rsi_4h"]) / 100.0, 0.0, 1.0)
+    features[:, 2] = np.clip(g(pc["macd_hist_1h"]) / safe_price * 100.0, -1.0, 1.0)
+    features[:, 3] = np.clip(g(pc["macd_hist_4h"]) / safe_price * 100.0, -1.0, 1.0)
+    features[:, 4] = np.where(g(pc["macd_hist_1h"]) > 0, 1.0, -1.0)
+    features[:, 5] = np.clip(g(pc["stoch_k_1h"]) / 100.0, 0.0, 1.0)
+    features[:, 6] = np.clip(g(pc["stoch_d_1h"]) / 100.0, 0.0, 1.0)
+    features[:, 7] = np.clip(g(pc["cci_1h"]) / 300.0, -1.0, 1.0)
+    features[:, 8] = np.clip(g(pc["rsi_5m"]) / 100.0, 0.0, 1.0)
+
+    # ---- 9-14: Volatility ----
+    close_1h = np.where(g(pc["close_1h"]) > 0, g(pc["close_1h"]), 1.0)
+    close_4h = np.where(g(pc["close_4h"]) > 0, g(pc["close_4h"]), 1.0)
+    features[:, 9] = np.clip(g(pc["atr_1h"]) / close_1h / 0.05, 0.0, 1.0)
+    features[:, 10] = np.clip(g(pc["atr_4h"]) / close_4h / 0.10, 0.0, 1.0)
+    features[:, 11] = np.clip(g(pc["bb_bandwidth_1h"]) / 0.2, 0.0, 1.0)
+    features[:, 12] = np.clip(g(pc["bb_pct_b_1h"]), -0.5, 1.5)
+
+    kc_upper = g(pc["kc_upper_1h"])
+    kc_lower = g(pc["kc_lower_1h"])
+    kc_range = kc_upper - kc_lower
+    features[:, 13] = np.where(kc_range > 0, np.clip((price - kc_lower) / kc_range, 0.0, 1.0), 0.5)
+
+    atr_exp = np.where(g(pc["atr_1h_exp_mean"]) > 0, g(pc["atr_1h_exp_mean"]), 1.0)
+    features[:, 14] = np.clip(g(pc["atr_1h"]) / atr_exp, 0.0, 3.0) / 3.0
+
+    # ---- 15-21: Trend ----
+    ema20 = g(pc["ema20_1h"])
+    ema20_s = np.where((ema20 > 0) & np.isfinite(ema20), ema20, price)
+    features[:, 15] = np.clip((price - ema20_s) / np.where(ema20_s > 0, ema20_s, 1.0), -1.0, 1.0)
+
+    ema50 = g(pc["ema50_1h"])
+    ema50_s = np.where((ema50 > 0) & np.isfinite(ema50), ema50, price)
+    features[:, 16] = np.clip((price - ema50_s) / np.where(ema50_s > 0, ema50_s, 1.0), -1.0, 1.0)
+
+    ema200 = g(pc["ema200_1h"])
+    ema200_s = np.where((ema200 > 0) & np.isfinite(ema200), ema200, price)
+    features[:, 17] = np.clip((price - ema200_s) / np.where(ema200_s > 0, ema200_s, 1.0), -1.0, 1.0)
+
+    features[:, 18] = np.clip(g(pc["ema50_4h_diff10"]) / safe_price, -1.0, 1.0)
+    features[:, 19] = np.clip(g(pc["ema50_1d_diff5"]) / safe_price, -1.0, 1.0)
+    features[:, 20] = np.clip(g(pc["adx_4h"]) / 60.0, 0.0, 1.0)
+    features[:, 21] = np.clip(g(pc["supertrend_1h"]), -1.0, 1.0)
+
+    # ---- 22-26: Volume ----
+    features[:, 22] = np.clip(g(pc["vol_surge_5m"]) / 3.0, 0.0, 1.0)
+    features[:, 23] = np.clip(g(pc["obv_slope_norm"]), -1.0, 1.0)
+    features[:, 24] = np.clip(g(pc["cmf_5m"]), -1.0, 1.0)
+
+    vwap_val = g(pc["vwap_5m"])
+    vwap_s = np.where(vwap_val > 0, vwap_val, price)
+    features[:, 25] = np.clip(
+        np.where(vwap_s > 0, (price - vwap_s) / vwap_s, 0.0) / 0.05, -1.0, 1.0,
+    )
+    features[:, 26] = np.clip(g(pc["vps_5m"]), -1.0, 1.0)
+
+    # ---- 27-28: Divergence ----
+    features[:, 27] = np.clip(g(pc["rsi_div_5m"]), -1.0, 1.0)
+    features[:, 28] = np.clip(g(pc["vol_div_5m"]), -1.0, 1.0)
+
+    # ---- 29-34: Regime (zero in batch — regime_id=0, regime_hours=0) ----
+    features[:, 29] = 1.0  # one-hot for regime_id=0
+
+    # ---- 35-40: Multi-TF returns ----
+    features[:, 35] = g(pc["return_1h"])
+    features[:, 36] = g(pc["return_4h"])
+    features[:, 37] = g(pc["return_12h"])
+    features[:, 38] = g(pc["return_24h"])
+    features[:, 39] = g(pc["return_72h"])
+    features[:, 40] = g(pc["return_7d"])
+
+    # ---- 41-44: Candle structure ----
+    features[:, 41] = np.clip(g(pc["body_ratio_96"]), 0.0, 1.0)
+    features[:, 42] = np.clip(g(pc["uw_ratio_96"]), 0.0, 1.0)
+    features[:, 43] = np.clip(g(pc["lw_ratio_96"]), 0.0, 1.0)
+    features[:, 44] = g(pc["streak_feature"])
+
+    # ---- 45-50: Time (cyclic) ----
+    hour = g(pc["hour"])
+    dow = g(pc["dayofweek"])
+    month = g(pc["month"])
+    features[:, 45] = np.sin(2 * np.pi * hour / 24.0)
+    features[:, 46] = np.cos(2 * np.pi * hour / 24.0)
+    features[:, 47] = np.sin(2 * np.pi * dow / 7.0)
+    features[:, 48] = np.cos(2 * np.pi * dow / 7.0)
+    features[:, 49] = np.sin(2 * np.pi * (month - 1) / 12.0)
+    features[:, 50] = np.cos(2 * np.pi * (month - 1) / 12.0)
+
+    # ---- 51-54: Coin markers (constant per symbol) ----
+    profile = get_coin_profile(symbol)
+    features[:, 51] = float(profile["cap_tier"]) / 3.0
+    features[:, 52] = float(profile["vol_class"]) / 2.0
+    features[:, 53] = float(np.clip(profile["age"] / 16.0, 0.0, 1.0))
+    features[:, 54] = float(profile["is_btc"])
+
+    # 55-61: Funding/OB/on-chain — all zeros in batch (no live data)
+
+    # ---- 62-64: Cross-asset (BTC) ----
+    features[:, 62] = g(pc["btc_return_1h"])
+    features[:, 63] = g(pc["btc_return_4h"])
+    features[:, 64] = np.clip(g(pc["btc_corr_96"]), -1.0, 1.0)
+
+    # Zero out invalid prices
+    features[~valid] = 0.0
+
+    # Final sanitisation
+    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
+    return features.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
 # extract_all_features (batch)
 # ---------------------------------------------------------------------------
 
@@ -515,8 +842,8 @@ def extract_all_features(
 ) -> Tuple[np.ndarray, np.ndarray, List]:
     """Batch feature extraction for training.
 
-    Iterates through *df_5m* at every SIGNAL_EVERY bars and extracts both
-    tabular features and an LSTM sequence at each point in time.
+    Computes all indicators once on the full DataFrame, then extracts tabular
+    features via vectorized indexing and LSTM sequences per sample point.
 
     Parameters
     ----------
@@ -540,35 +867,26 @@ def extract_all_features(
     if df_5m is None or len(df_5m) < MIN_BARS_5M:
         return empty
 
-    tabular_list: List[np.ndarray] = []
-    sequence_list: List[np.ndarray] = []
-    timestamps: List = []
-
     n = len(df_5m)
 
-    # Use a fixed-size window to avoid O(N²) indicator recomputation
-    _FEAT_WINDOW = 2000  # enough history for all indicators (EMA200 on daily needs ~1000 5m bars)
-
-    for i in range(MIN_BARS_5M, n, SIGNAL_EVERY):
-        w_start = max(0, i - _FEAT_WINDOW)
-        slice_5m = df_5m.iloc[w_start:i]
-        btc_slice = btc_df_5m.iloc[w_start:i] if btc_df_5m is not None else None
-
-        tab = extract_tabular_features(
-            slice_5m, symbol, btc_slice,
-            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0,
-        )
-        seq = build_lstm_sequence(slice_5m)
-
-        tabular_list.append(tab)
-        sequence_list.append(seq)
-        timestamps.append(df_5m.index[i - 1])
-
-    if not tabular_list:
+    # Determine sample indices (every SIGNAL_EVERY bars, starting at MIN_BARS_5M)
+    sample_indices = np.arange(MIN_BARS_5M, n, SIGNAL_EVERY)
+    if len(sample_indices) == 0:
         return empty
 
+    # Vectorized tabular feature extraction (indicators computed once)
+    tabular = _batch_extract_tabular(df_5m, symbol, btc_df_5m, sample_indices)
+
+    # LSTM sequences (per-point — each uses a small 116-bar window, fast)
+    sequence_list: List[np.ndarray] = []
+    for i in sample_indices:
+        seq = build_lstm_sequence(df_5m.iloc[max(0, i - LSTM_WINDOW - 20):i])
+        sequence_list.append(seq)
+
+    timestamps = [df_5m.index[i - 1] for i in sample_indices]
+
     return (
-        np.array(tabular_list, dtype=np.float32),
+        tabular,
         np.array(sequence_list, dtype=np.float32),
         timestamps,
     )
