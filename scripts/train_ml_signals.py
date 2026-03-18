@@ -62,6 +62,7 @@ XGB_PARAMS = {
     "eval_metric": "logloss",
     "tree_method": "hist",
     "device": "cuda",
+    "early_stopping_rounds": 50,
 }
 
 
@@ -268,7 +269,6 @@ def main():
             model.fit(
                 X_train, y_train,
                 eval_set=[(X_val, y_val)],
-                early_stopping_rounds=50,
                 verbose=False,
             )
 
