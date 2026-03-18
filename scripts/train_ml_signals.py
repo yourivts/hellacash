@@ -60,7 +60,8 @@ XGB_PARAMS = {
     "reg_alpha": 0.1,
     "reg_lambda": 1.0,
     "eval_metric": "logloss",
-    "use_label_encoder": False,
+    "tree_method": "hist",
+    "device": "cuda",
 }
 
 
@@ -188,6 +189,9 @@ def main():
 
     # Step 3: Extract features + embeddings for XGBoost
     print("\n  Extracting tabular features + LSTM embeddings...")
+    import torch
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    lstm.to(device)
     lstm.eval()
     all_tabular = []
     all_labels = []
@@ -212,9 +216,10 @@ def main():
 
         # Batch embedding extraction (faster than per-sequence)
         import torch
-        seq_tensor = torch.from_numpy(sequences).float()
+        device = next(lstm.parameters()).device
+        seq_tensor = torch.from_numpy(sequences).float().to(device)
         with torch.no_grad():
-            embeddings = lstm.embed(seq_tensor).numpy()
+            embeddings = lstm.embed(seq_tensor).cpu().numpy()
 
         all_tabular.append(tabular)
         all_labels.append(label_rows)

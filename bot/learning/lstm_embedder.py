@@ -72,15 +72,16 @@ class LSTMEmbedder(nn.Module):
     def embed_numpy(self, seq: np.ndarray) -> np.ndarray:
         """Convenience: single numpy sequence (96, 7) → embedding (16,)."""
         self.eval()
-        x = torch.from_numpy(seq).unsqueeze(0).float()
+        device = next(self.parameters()).device
+        x = torch.from_numpy(seq).unsqueeze(0).float().to(device)
         with torch.no_grad():
             emb = self.embed(x)
-        return emb.squeeze(0).numpy()
+        return emb.squeeze(0).cpu().numpy()
 
     def save(self, path: str) -> None:
-        """Save model weights."""
+        """Save model weights (always saved as CPU state for portability)."""
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        torch.save(self.state_dict(), path)
+        torch.save(self.cpu().state_dict(), path)
         logger.info("LSTM embedder saved to %s", path)
 
     def load(self, path: str) -> None:
@@ -113,9 +114,10 @@ def train_lstm(
     Returns:
         List of per-epoch average training loss values.
     """
-    device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.train()
+    logger.info("LSTM training on %s", device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
