@@ -1577,7 +1577,7 @@ class ExternalDataProvider:
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `pytest tests/test_external_features.py -v`
-Expected: All 15 tests PASS
+Expected: All 16 tests PASS
 
 - [ ] **Step 5: Commit**
 
