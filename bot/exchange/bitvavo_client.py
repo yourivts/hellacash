@@ -316,11 +316,14 @@ class BitvavoClient:
                 raw = _api_get(url)
                 candles = self._parse_candles(symbol, interval, raw)
                 if not candles:
-                    # Skip empty pages (pair may not have existed yet)
+                    if all_candles:
+                        break  # End of data (had candles before)
+                    # Skip forward faster when searching for first data
                     consecutive_empty += 1
-                    if all_candles or consecutive_empty > 50:
-                        break  # End of data (had candles before) or too many empty pages
-                    cursor_ms = page_end
+                    skip_ms = step_ms * 30  # ~150 days per skip
+                    cursor_ms = min(cursor_ms + skip_ms, end_ms)
+                    if cursor_ms >= end_ms:
+                        break
                     _time.sleep(0.1)
                     continue
                 consecutive_empty = 0
