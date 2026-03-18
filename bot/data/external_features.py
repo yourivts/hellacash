@@ -320,6 +320,128 @@ def _fetch_blockchain_com_hashrate() -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _fetch_blockchain_com_puell() -> pd.DataFrame:
+    """Self-calculate Puell Multiple from Blockchain.com miners-revenue.
+
+    Puell = daily_miner_revenue / 365_day_MA(daily_miner_revenue)
+    """
+    import requests
+    try:
+        url = "https://api.blockchain.info/charts/miners-revenue"
+        params = {"timespan": "5years", "format": "json"}
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json().get("values", [])
+        if not data:
+            return pd.DataFrame()
+        rows = []
+        for d in data:
+            ts = datetime.fromtimestamp(d["x"], tz=timezone.utc)
+            rows.append({"date": ts, "value": float(d["y"])})
+        df = pd.DataFrame(rows).set_index("date").sort_index()
+        ma365 = df["value"].rolling(365, min_periods=30).mean()
+        df["value"] = df["value"] / ma365.where(ma365 > 0, 1.0)
+        df = df.dropna()
+        return df
+    except Exception as e:
+        logger.warning("Blockchain.com miners-revenue fetch failed: %s", e)
+        return pd.DataFrame()
+
+
+def _fetch_binance_open_interest_hist(symbol: str = "BTCUSDT") -> pd.DataFrame:
+    """Fetch historical open interest from Binance Futures (5m intervals, paginated)."""
+    import requests
+    try:
+        url = "https://fapi.binance.com/futures/data/openInterestHist"
+        all_rows = []
+        end_time = None
+        for _ in range(100):
+            params = {"symbol": symbol, "period": "5m", "limit": 500}
+            if end_time:
+                params["endTime"] = end_time
+            resp = requests.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            if not data:
+                break
+            for d in data:
+                ts = datetime.fromtimestamp(d["timestamp"] / 1000, tz=timezone.utc)
+                all_rows.append({"date": ts, "value": float(d["sumOpenInterestValue"])})
+            if len(data) < 500:
+                break
+            end_time = data[0]["timestamp"] - 1
+            time.sleep(0.2)
+        if not all_rows:
+            return pd.DataFrame()
+        return pd.DataFrame(all_rows).set_index("date").sort_index().drop_duplicates()
+    except Exception as e:
+        logger.warning("Binance OI hist fetch failed: %s", e)
+        return pd.DataFrame()
+
+
+def _fetch_binance_long_short_ratio(symbol: str = "BTCUSDT") -> pd.DataFrame:
+    """Fetch global long/short account ratio from Binance Futures."""
+    import requests
+    try:
+        url = "https://fapi.binance.com/futures/data/globalLongShortAccountRatio"
+        all_rows = []
+        end_time = None
+        for _ in range(100):
+            params = {"symbol": symbol, "period": "5m", "limit": 500}
+            if end_time:
+                params["endTime"] = end_time
+            resp = requests.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            if not data:
+                break
+            for d in data:
+                ts = datetime.fromtimestamp(d["timestamp"] / 1000, tz=timezone.utc)
+                all_rows.append({
+                    "date": ts,
+                    "long_ratio": float(d["longAccount"]),
+                    "short_ratio": float(d["shortAccount"]),
+                    "ls_ratio": float(d["longShortRatio"]),
+                })
+            if len(data) < 500:
+                break
+            end_time = data[0]["timestamp"] - 1
+            time.sleep(0.2)
+        if not all_rows:
+            return pd.DataFrame()
+        return pd.DataFrame(all_rows).set_index("date").sort_index().drop_duplicates()
+    except Exception as e:
+        logger.warning("Binance long/short ratio fetch failed: %s", e)
+        return pd.DataFrame()
+
+
+def _fetch_binance_liquidations(symbol: str = "BTCUSDT") -> pd.DataFrame:
+    """Fetch recent forced liquidation orders from Binance Futures."""
+    import requests
+    try:
+        url = "https://fapi.binance.com/fapi/v1/allForceOrders"
+        params = {"symbol": symbol, "limit": 1000}
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data:
+            return pd.DataFrame()
+        rows = []
+        for d in data:
+            ts = datetime.fromtimestamp(d["time"] / 1000, tz=timezone.utc)
+            rows.append({
+                "date": ts,
+                "side": d["side"],  # BUY = short liq, SELL = long liq
+                "qty": float(d["origQty"]),
+                "price": float(d["price"]),
+                "value_usd": float(d["origQty"]) * float(d["price"]),
+            })
+        return pd.DataFrame(rows).set_index("date").sort_index()
+    except Exception as e:
+        logger.warning("Binance liquidations fetch failed: %s", e)
+        return pd.DataFrame()
+
+
 def _fetch_coinmetrics(asset: str, metric: str) -> pd.DataFrame:
     """Fetch metrics from CoinMetrics Community API."""
     import requests
@@ -567,8 +689,12 @@ class ExternalDataProvider:
         # On-chain: SOPR — no free source available, zero-fill
         result["sopr"] = np.zeros(len(idx_5m))
 
-        # On-chain: Puell Multiple — no free source available, zero-fill
-        result["puell"] = np.zeros(len(idx_5m))
+        # On-chain: Puell Multiple (self-calculated from Blockchain.com miners-revenue)
+        puell_df = self._cached_fetch("blockchain_com_puell", _fetch_blockchain_com_puell)
+        if not puell_df.empty:
+            result["puell"] = np.clip(align_to_5m(puell_df["value"], idx_5m) / 4.0, 0, 1)
+        else:
+            result["puell"] = np.zeros(len(idx_5m))
 
         # On-chain: Hashrate (CoinMetrics -> Blockchain.com fallback)
         hr_df = self._cached_fetch("coinmetrics_hashrate", _fetch_onchain_hashrate)
@@ -618,14 +744,33 @@ class ExternalDataProvider:
             result["funding_rate_current"] = np.zeros(len(idx_5m))
             result["funding_7d_avg"] = np.zeros(len(idx_5m))
 
-        # Index 57: OI change 24h (Coinalyze -- optional, needs free signup API key)
-        # Index 58-59: Long/short liquidations (Binance CSV -- manual download)
-        # These are zero-filled when API key or data not available.
-        # The model learns to ignore zero-valued features via feature importance.
-        result["oi_change_24h"] = np.zeros(len(idx_5m))
-        result["long_liq_24h"] = np.zeros(len(idx_5m))
-        result["short_liq_24h"] = np.zeros(len(idx_5m))
-        logger.info("OI/liquidation features zero-filled (optional data sources)")
+        # Index 57: OI change 24h (Binance Futures)
+        oi_df = self._cached_fetch("binance_oi_hist", _fetch_binance_open_interest_hist)
+        if not oi_df.empty:
+            oi_aligned = align_to_5m(oi_df["value"], idx_5m)
+            oi_series = pd.Series(oi_aligned, index=idx_5m)
+            oi_change_24h = oi_series.pct_change(288).clip(-1, 1)  # 288 x 5m = 24h
+            result["oi_change_24h"] = oi_change_24h.fillna(0).values
+        else:
+            result["oi_change_24h"] = np.zeros(len(idx_5m))
+
+        # Index 58-59: Long/short liquidations (Binance Futures)
+        liq_df = self._cached_fetch("binance_liquidations", _fetch_binance_liquidations)
+        if not liq_df.empty:
+            # Resample to 5m bins, sum USD value
+            long_liqs = liq_df[liq_df["side"] == "SELL"]["value_usd"]  # SELL = long liq
+            short_liqs = liq_df[liq_df["side"] == "BUY"]["value_usd"]  # BUY = short liq
+            long_5m = long_liqs.resample("5min").sum().reindex(idx_5m, fill_value=0)
+            short_5m = short_liqs.resample("5min").sum().reindex(idx_5m, fill_value=0)
+            # Rolling 24h sum, normalized
+            long_24h = long_5m.rolling(288, min_periods=1).sum()
+            short_24h = short_5m.rolling(288, min_periods=1).sum()
+            max_liq = max(long_24h.max(), short_24h.max(), 1.0)
+            result["long_liq_24h"] = (long_24h / max_liq).clip(0, 1).fillna(0).values
+            result["short_liq_24h"] = (short_24h / max_liq).clip(0, 1).fillna(0).values
+        else:
+            result["long_liq_24h"] = np.zeros(len(idx_5m))
+            result["short_liq_24h"] = np.zeros(len(idx_5m))
 
         # Index 60: Exchange netflow (Blockchain.com tx volume as proxy)
         exflow = self._cached_fetch("blockchain_com_txvol", _fetch_blockchain_com_exchange_flows)
@@ -643,11 +788,20 @@ class ExternalDataProvider:
         else:
             result["active_addr_change_7d"] = np.zeros(len(idx_5m))
 
-        # Index 83: OI change 7d (zero-filled without Coinalyze API key)
-        result["oi_change_7d"] = np.zeros(len(idx_5m))
+        # Index 83: OI change 7d (from Binance OI data)
+        if not oi_df.empty:
+            oi_change_7d = oi_series.pct_change(2016).clip(-1, 1)  # 2016 x 5m = 7d
+            result["oi_change_7d"] = oi_change_7d.fillna(0).values
+        else:
+            result["oi_change_7d"] = np.zeros(len(idx_5m))
 
-        # Index 84: Liquidation ratio (zero-filled without Binance CSV data)
-        result["liq_ratio"] = np.zeros(len(idx_5m))
+        # Index 84: Liquidation ratio (long_liq / (long_liq + short_liq))
+        if not liq_df.empty:
+            total_liq = long_24h + short_24h
+            ratio = (long_24h / total_liq.where(total_liq > 0, 1.0)).clip(0, 1)
+            result["liq_ratio"] = ratio.fillna(0.5).values
+        else:
+            result["liq_ratio"] = np.zeros(len(idx_5m))
 
         # Taker buy ratio
         taker = self._cached_fetch("taker_buy_ratio", _fetch_taker_buy_ratio)
@@ -861,9 +1015,47 @@ class ExternalDataProvider:
             taker = _fetch_taker_buy_ratio(limit=10)
             if not taker.empty:
                 self._live_cache["taker_buy_ratio"] = float(taker["value"].iloc[-1])
-                self._last_fetched["oi_liquidations"] = now
         except Exception as e:
             logger.warning("Live refresh taker_buy failed: %s", e)
+
+        # Binance Futures: OI, liquidations, long/short ratio
+        try:
+            import requests
+            # Open Interest (current)
+            resp = requests.get("https://fapi.binance.com/fapi/v1/openInterest",
+                                params={"symbol": "BTCUSDT"}, timeout=10)
+            if resp.ok:
+                oi_val = float(resp.json().get("openInterest", 0))
+                prev_oi = self._live_cache.get("_oi_prev", oi_val)
+                self._live_cache["oi_change_24h"] = np.clip((oi_val - prev_oi) / max(prev_oi, 1) * 10, -1, 1)
+                self._live_cache["_oi_prev"] = oi_val
+
+            # Long/short ratio
+            ls_df = _fetch_binance_long_short_ratio(symbol="BTCUSDT")
+            if not ls_df.empty:
+                self._live_cache["liq_ratio"] = float(ls_df["long_ratio"].iloc[-1])
+
+            # Liquidations (recent)
+            liq_df = _fetch_binance_liquidations(symbol="BTCUSDT")
+            if not liq_df.empty:
+                recent = liq_df[liq_df.index >= now - timedelta(hours=24)]
+                long_liq = recent[recent["side"] == "SELL"]["value_usd"].sum()
+                short_liq = recent[recent["side"] == "BUY"]["value_usd"].sum()
+                total = max(long_liq + short_liq, 1.0)
+                self._live_cache["long_liq_24h"] = np.clip(long_liq / total, 0, 1)
+                self._live_cache["short_liq_24h"] = np.clip(short_liq / total, 0, 1)
+
+            self._last_fetched["oi_liquidations"] = now
+        except Exception as e:
+            logger.warning("Live refresh Binance derivatives failed: %s", e)
+
+        # Puell Multiple (Blockchain.com)
+        try:
+            puell_df = _fetch_blockchain_com_puell()
+            if not puell_df.empty:
+                self._live_cache["puell"] = float(np.clip(puell_df["value"].iloc[-1] / 4.0, 0, 1))
+        except Exception as e:
+            logger.warning("Live refresh puell failed: %s", e)
 
         # Hashrate (CoinMetrics -> Blockchain.com fallback)
         try:
