@@ -1,0 +1,851 @@
+"""External data pipeline: fetch, cache, and serve market data from free APIs.
+
+Training mode: bulk-fetch history -> cache to parquet -> align to 5m index
+Live mode: periodic refresh -> in-memory cache -> staleness tracking
+
+Sources:
+    - Binance Futures: funding rates
+    - Alternative.me: Fear & Greed Index
+    - Google Trends: search interest (pytrends)
+    - yfinance: DXY, S&P 500, Gold, VIX, Treasury yields
+    - BGeometrics: NVT, MVRV, SOPR, Puell, exchange flows, hashrate
+    - CoinMetrics: active addresses, tx count
+    - DefiLlama: stablecoin supply, DeFi TVL
+    - Coinalyze: OI, liquidations
+    - Binance: taker buy/sell volume, liquidation snapshots
+    - Deribit: DVOL implied volatility
+    - CoinGecko: BTC dominance
+"""
+from __future__ import annotations
+
+import logging
+import os
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+# Staleness thresholds per source group
+STALENESS_THRESHOLDS = {
+    "funding_rate": timedelta(hours=2),
+    "fear_greed": timedelta(hours=48),
+    "google_trends": timedelta(days=7),
+    "macro": timedelta(hours=48),
+    "onchain": timedelta(hours=48),
+    "defi": timedelta(hours=48),
+    "oi_liquidations": timedelta(hours=48),
+    "dvol": timedelta(hours=48),
+}
+
+CRITICAL_STALE_RATIO = 0.30  # Disable ML signals when >30% of sources are stale
+
+
+def align_to_5m(series: pd.Series, idx_5m: pd.DatetimeIndex) -> np.ndarray:
+    """Align a time series to a 5m DatetimeIndex via forward-fill.
+
+    Pre-inception periods are filled with 0.0.
+    """
+    if series.empty:
+        return np.zeros(len(idx_5m), dtype=np.float64)
+
+    # Ensure timezone-aware
+    if series.index.tz is None:
+        series.index = series.index.tz_localize("UTC")
+    if idx_5m.tz is None:
+        idx_5m = idx_5m.tz_localize("UTC")
+
+    aligned = series.reindex(idx_5m, method="ffill")
+    # Pre-inception: fill NaN with 0.0
+    aligned = aligned.fillna(0.0)
+    return aligned.values.astype(np.float64)
+
+
+def save_cache(df: pd.DataFrame, path: str) -> None:
+    """Save DataFrame to parquet."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(path)
+
+
+def load_cache(path: str) -> Optional[pd.DataFrame]:
+    """Load DataFrame from parquet, or None if not found."""
+    if not Path(path).exists():
+        return None
+    try:
+        return pd.read_parquet(path)
+    except Exception as e:
+        logger.warning("Failed to load cache %s: %s", path, e)
+        return None
+
+
+def _fetch_fear_greed(limit: int = 0) -> pd.DataFrame:
+    """Fetch Fear & Greed Index from Alternative.me."""
+    import requests
+    try:
+        url = "https://api.alternative.me/fng/"
+        params = {"limit": limit, "format": "json"}
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json().get("data", [])
+        if not data:
+            return pd.DataFrame()
+        rows = []
+        for d in data:
+            ts = datetime.fromtimestamp(int(d["timestamp"]), tz=timezone.utc)
+            rows.append({"date": ts, "value": int(d["value"])})
+        df = pd.DataFrame(rows).set_index("date").sort_index()
+        return df
+    except Exception as e:
+        logger.warning("Fear & Greed fetch failed: %s", e)
+        return pd.DataFrame()
+
+
+def _fetch_funding_rates(symbol: str = "BTCUSDT", limit: int = 1000) -> pd.DataFrame:
+    """Fetch funding rates from Binance Futures."""
+    import requests
+    try:
+        url = "https://fapi.binance.com/fapi/v1/fundingRate"
+        all_rows = []
+        start_time = None
+        for _ in range(50):  # max 50 pages
+            params = {"symbol": symbol, "limit": limit}
+            if start_time:
+                params["startTime"] = start_time
+            resp = requests.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            if not data:
+                break
+            for d in data:
+                ts = datetime.fromtimestamp(d["fundingTime"] / 1000, tz=timezone.utc)
+                all_rows.append({"date": ts, "rate": float(d["fundingRate"])})
+            if len(data) < limit:
+                break
+            start_time = data[-1]["fundingTime"] + 1
+            time.sleep(0.2)
+        if not all_rows:
+            return pd.DataFrame()
+        return pd.DataFrame(all_rows).set_index("date").sort_index()
+    except Exception as e:
+        logger.warning("Funding rate fetch failed: %s", e)
+        return pd.DataFrame()
+
+
+def _fetch_macro_yfinance(start: datetime, end: datetime) -> dict[str, pd.DataFrame]:
+    """Fetch macro data from yfinance: DXY, S&P 500, Gold, VIX, Treasury yields."""
+    try:
+        import yfinance as yf
+        tickers = {
+            "dxy": "DX-Y.NYB",
+            "sp500": "^GSPC",
+            "gold": "GC=F",
+            "vix": "^VIX",
+            "tnx": "^TNX",  # 10Y Treasury yield
+            "twoy": "2YY=F",  # 2Y Treasury yield (for 10Y-2Y spread)
+        }
+        result = {}
+        for name, ticker in tickers.items():
+            try:
+                df = yf.download(ticker, start=start.strftime("%Y-%m-%d"),
+                                 end=end.strftime("%Y-%m-%d"), progress=False)
+                if not df.empty:
+                    # Flatten MultiIndex columns if present
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+                    result[name] = df[["Close"]].rename(columns={"Close": "value"})
+            except Exception as e:
+                logger.warning("yfinance %s fetch failed: %s", name, e)
+        return result
+    except Exception as e:
+        logger.warning("yfinance import/fetch failed: %s", e)
+        return {}
+
+
+def _fetch_google_trends(keywords: list[str]) -> dict[str, pd.DataFrame]:
+    """Fetch Google Trends data. Optional -- frequently rate-limited."""
+    try:
+        from pytrends.request import TrendReq
+        pytrends = TrendReq(hl="en-US", tz=0)
+        result = {}
+        for kw in keywords:
+            for attempt in range(3):
+                try:
+                    pytrends.build_payload([kw], timeframe="today 5-y")
+                    df = pytrends.interest_over_time()
+                    if not df.empty and kw in df.columns:
+                        result[kw] = df[[kw]].rename(columns={kw: "value"})
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        time.sleep(2 ** (attempt + 1))
+                    else:
+                        logger.warning("Google Trends '%s' failed after 3 attempts: %s", kw, e)
+        return result
+    except Exception as e:
+        logger.warning("pytrends not available: %s", e)
+        return {}
+
+
+def _fetch_bgeometrics(metric: str) -> pd.DataFrame:
+    """Fetch on-chain metrics from BGeometrics Charts API.
+
+    Falls back to Blockchain.com Charts API for hashrate if BGeometrics fails.
+    """
+    import requests
+    try:
+        url = f"https://charts.bgeometrics.com/api/{metric}"
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data:
+            raise ValueError("Empty response")
+        rows = []
+        for d in data:
+            ts = pd.to_datetime(d.get("date") or d.get("t"))
+            val = float(d.get("value") or d.get("v") or 0)
+            rows.append({"date": ts, "value": val})
+        df = pd.DataFrame(rows).set_index("date").sort_index()
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        return df
+    except Exception as e:
+        logger.warning("BGeometrics %s fetch failed: %s", metric, e)
+        # Fallback for hashrate: try Blockchain.com Charts API
+        if metric == "hashrate":
+            return _fetch_blockchain_com_hashrate()
+        return pd.DataFrame()
+
+
+def _fetch_blockchain_com_hashrate() -> pd.DataFrame:
+    """Fallback: fetch BTC hashrate from Blockchain.com Charts API."""
+    import requests
+    try:
+        url = "https://api.blockchain.info/charts/hash-rate"
+        params = {"timespan": "5years", "format": "json", "rollingAverage": "7days"}
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json().get("values", [])
+        if not data:
+            return pd.DataFrame()
+        rows = []
+        for d in data:
+            ts = datetime.fromtimestamp(d["x"], tz=timezone.utc)
+            rows.append({"date": ts, "value": float(d["y"])})
+        return pd.DataFrame(rows).set_index("date").sort_index()
+    except Exception as e:
+        logger.warning("Blockchain.com hashrate fallback failed: %s", e)
+        return pd.DataFrame()
+
+
+def _fetch_coinmetrics(asset: str, metric: str) -> pd.DataFrame:
+    """Fetch metrics from CoinMetrics Community API."""
+    import requests
+    try:
+        url = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
+        params = {"assets": asset, "metrics": metric, "frequency": "1d", "page_size": 10000}
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json().get("data", [])
+        if not data:
+            return pd.DataFrame()
+        rows = []
+        for d in data:
+            ts = pd.to_datetime(d["time"])
+            val = float(d.get(metric, 0))
+            rows.append({"date": ts, "value": val})
+        df = pd.DataFrame(rows).set_index("date").sort_index()
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        return df
+    except Exception as e:
+        logger.warning("CoinMetrics %s/%s fetch failed: %s", asset, metric, e)
+        return pd.DataFrame()
+
+
+def _fetch_defillama_stablecoins() -> pd.DataFrame:
+    """Fetch stablecoin total supply from DefiLlama."""
+    import requests
+    try:
+        url = "https://stablecoins.llama.fi/stablecoincharts/all"
+        params = {"stablecoin": 1}  # USDT
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data:
+            return pd.DataFrame()
+        rows = []
+        for d in data:
+            ts = datetime.fromtimestamp(d["date"], tz=timezone.utc)
+            val = float(d.get("totalCirculatingUSD", {}).get("peggedUSD", 0))
+            rows.append({"date": ts, "value": val})
+        return pd.DataFrame(rows).set_index("date").sort_index()
+    except Exception as e:
+        logger.warning("DefiLlama stablecoins fetch failed: %s", e)
+        return pd.DataFrame()
+
+
+def _fetch_defillama_tvl() -> pd.DataFrame:
+    """Fetch total DeFi TVL from DefiLlama."""
+    import requests
+    try:
+        url = "https://api.llama.fi/v2/historicalChainTvl"
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data:
+            return pd.DataFrame()
+        rows = []
+        for d in data:
+            ts = datetime.fromtimestamp(d["date"], tz=timezone.utc)
+            rows.append({"date": ts, "value": float(d.get("tvl", 0))})
+        return pd.DataFrame(rows).set_index("date").sort_index()
+    except Exception as e:
+        logger.warning("DefiLlama TVL fetch failed: %s", e)
+        return pd.DataFrame()
+
+
+def _fetch_deribit_dvol() -> pd.DataFrame:
+    """Fetch BTC DVOL implied volatility from Deribit."""
+    import requests
+    try:
+        url = "https://deribit.com/api/v2/public/get_volatility_index_data"
+        end_ts = int(datetime.now(timezone.utc).timestamp() * 1000)
+        start_ts = end_ts - (365 * 5 * 24 * 3600 * 1000)  # ~5 years
+        params = {"currency": "BTC", "start_timestamp": start_ts,
+                  "end_timestamp": end_ts, "resolution": "1D"}
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json().get("result", {}).get("data", [])
+        if not data:
+            return pd.DataFrame()
+        rows = []
+        for d in data:
+            ts = datetime.fromtimestamp(d[0] / 1000, tz=timezone.utc)
+            rows.append({"date": ts, "value": float(d[4])})  # close
+        return pd.DataFrame(rows).set_index("date").sort_index()
+    except Exception as e:
+        logger.warning("Deribit DVOL fetch failed: %s", e)
+        return pd.DataFrame()
+
+
+def _fetch_coingecko_btc_dominance() -> pd.DataFrame:
+    """Fetch BTC dominance from CoinGecko /global endpoint."""
+    import requests
+    try:
+        url = "https://api.coingecko.com/api/v3/global"
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        data = resp.json().get("data", {})
+        btc_dom = data.get("market_cap_percentage", {}).get("btc", 0)
+        ts = datetime.now(timezone.utc)
+        return pd.DataFrame([{"date": ts, "value": float(btc_dom)}]).set_index("date")
+    except Exception as e:
+        logger.warning("CoinGecko BTC dominance fetch failed: %s", e)
+        return pd.DataFrame()
+
+
+def _fetch_taker_buy_ratio(symbol: str = "BTCUSDT", interval: str = "1h",
+                           limit: int = 1500) -> pd.DataFrame:
+    """Fetch taker buy/sell volume ratio from Binance Futures klines.
+
+    Uses 1h granularity (practical compromise -- 5m over 5y = too many requests).
+    Forward-filled to 5m resolution via align_to_5m().
+    """
+    import requests
+    try:
+        url = "https://fapi.binance.com/fapi/v1/klines"
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        rows = []
+        for d in data:
+            ts = datetime.fromtimestamp(d[0] / 1000, tz=timezone.utc)
+            total_vol = float(d[5])
+            taker_buy_vol = float(d[9])
+            ratio = taker_buy_vol / total_vol if total_vol > 0 else 0.5
+            rows.append({"date": ts, "value": ratio})
+        return pd.DataFrame(rows).set_index("date").sort_index()
+    except Exception as e:
+        logger.warning("Taker buy ratio fetch failed: %s", e)
+        return pd.DataFrame()
+
+
+class ExternalDataProvider:
+    """Fetch, cache, and serve external market data for ML features.
+
+    Training mode: call fetch_all_training() to bulk-fetch history.
+    Live mode: call refresh() periodically, then build_live_features().
+    """
+
+    def __init__(self, cache_dir: str | None = "data/external_cache") -> None:
+        self._cache_dir = Path(cache_dir) if cache_dir else None
+        self._live_cache: dict[str, float] = {}  # source -> latest value
+        self._last_fetched: dict[str, datetime] = {
+            source: datetime.now(timezone.utc)
+            for source in STALENESS_THRESHOLDS
+        }
+
+    def is_critically_stale(self) -> bool:
+        """Check if >30% of sources exceed their staleness threshold."""
+        now = datetime.now(timezone.utc)
+        stale_count = 0
+        total = len(STALENESS_THRESHOLDS)
+        for source, threshold in STALENESS_THRESHOLDS.items():
+            last = self._last_fetched.get(source, now)
+            if (now - last) > threshold:
+                stale_count += 1
+        return (stale_count / max(total, 1)) > CRITICAL_STALE_RATIO
+
+    def fetch_all_training(self, idx_5m: pd.DatetimeIndex) -> dict[str, np.ndarray]:
+        """Bulk-fetch all external data sources for training.
+
+        Returns dict mapping feature names to aligned numpy arrays.
+        Each array has length == len(idx_5m).
+        """
+        start = idx_5m[0].to_pydatetime() if len(idx_5m) > 0 else datetime(2019, 1, 1, tzinfo=timezone.utc)
+        end = idx_5m[-1].to_pydatetime() if len(idx_5m) > 0 else datetime.now(timezone.utc)
+
+        result = {}
+
+        # Fear & Greed
+        fng = self._cached_fetch("fear_greed", lambda: _fetch_fear_greed(limit=0))
+        if not fng.empty:
+            result["fear_greed"] = align_to_5m(fng["value"] / 100.0, idx_5m)
+            # 7d momentum
+            fng_7d = fng["value"].rolling(7).apply(lambda x: (x.iloc[-1] - x.iloc[0]) / 100.0 if len(x) > 1 else 0)
+            result["fear_greed_mom"] = align_to_5m(fng_7d, idx_5m)
+        else:
+            result["fear_greed"] = np.zeros(len(idx_5m))
+            result["fear_greed_mom"] = np.zeros(len(idx_5m))
+
+        # Google Trends (optional)
+        gt = _fetch_google_trends(["bitcoin", "crypto"])
+        for kw in ["bitcoin", "crypto"]:
+            if kw in gt and not gt[kw].empty:
+                result[f"gtrends_{kw}"] = align_to_5m(gt[kw]["value"] / 100.0, idx_5m)
+            else:
+                result[f"gtrends_{kw}"] = np.zeros(len(idx_5m))
+
+        # Macro (yfinance)
+        macro = _fetch_macro_yfinance(start, end)
+        # Shift macro data by 1 day to avoid look-ahead bias
+        if "dxy" in macro and not macro["dxy"].empty:
+            dxy_ret = macro["dxy"]["value"].pct_change().shift(1).clip(-0.05, 0.05) * 20
+            result["dxy_return"] = align_to_5m(dxy_ret, idx_5m)
+        else:
+            result["dxy_return"] = np.zeros(len(idx_5m))
+
+        if "sp500" in macro and not macro["sp500"].empty:
+            sp_ret = macro["sp500"]["value"].pct_change().shift(1).clip(-0.05, 0.05) * 20
+            result["sp500_return"] = align_to_5m(sp_ret, idx_5m)
+        else:
+            result["sp500_return"] = np.zeros(len(idx_5m))
+
+        if "gold" in macro and not macro["gold"].empty:
+            gold_ret = macro["gold"]["value"].pct_change().shift(1).clip(-0.05, 0.05) * 20
+            result["gold_return"] = align_to_5m(gold_ret, idx_5m)
+        else:
+            result["gold_return"] = np.zeros(len(idx_5m))
+
+        if "vix" in macro and not macro["vix"].empty:
+            result["vix"] = align_to_5m((macro["vix"]["value"] / 80.0).clip(0, 1), idx_5m)
+        else:
+            result["vix"] = np.zeros(len(idx_5m))
+
+        if "tnx" in macro and not macro["tnx"].empty:
+            result["treasury_10y"] = align_to_5m((macro["tnx"]["value"] / 10.0).clip(0, 1), idx_5m)
+            if "twoy" in macro and not macro["twoy"].empty:
+                spread = (macro["tnx"]["value"] - macro["twoy"]["value"]).clip(-5, 5) / 5.0
+                result["yield_spread"] = align_to_5m(spread, idx_5m)
+            else:
+                result["yield_spread"] = np.zeros(len(idx_5m))
+        else:
+            result["treasury_10y"] = np.zeros(len(idx_5m))
+            result["yield_spread"] = np.zeros(len(idx_5m))
+
+        # On-chain (BGeometrics)
+        for metric, key, scale_fn in [
+            ("nvt", "nvt", lambda s: np.clip(np.log1p(s) / np.log1p(200), 0, 1)),
+            ("mvrv", "mvrv", lambda s: np.clip(s / 5.0, 0, 1)),
+            ("sopr", "sopr", lambda s: np.clip((s - 1.0) * 5.0, -1, 1)),
+            ("puell-multiple", "puell", lambda s: np.clip(s / 4.0, 0, 1)),
+            ("hashrate", "hashrate", None),
+        ]:
+            df = self._cached_fetch(f"bgeometrics_{metric}", lambda m=metric: _fetch_bgeometrics(m))
+            if not df.empty:
+                vals = df["value"]
+                if key == "hashrate":
+                    # 30d change
+                    change = vals.pct_change(30).clip(-1, 1)
+                    result[key] = align_to_5m(change, idx_5m)
+                elif scale_fn is not None:
+                    aligned_raw = align_to_5m(vals, idx_5m)
+                    result[key] = scale_fn(aligned_raw)
+            else:
+                result[key] = np.zeros(len(idx_5m))
+
+        # CoinMetrics: active addresses
+        for asset, key in [("eth", "eth_active_addr")]:
+            df = self._cached_fetch(
+                f"coinmetrics_{asset}_addr",
+                lambda a=asset: _fetch_coinmetrics(a, "AdrActCnt"),
+            )
+            if not df.empty:
+                change = df["value"].pct_change(7).clip(-1, 1)
+                result[key] = align_to_5m(change, idx_5m)
+            else:
+                result[key] = np.zeros(len(idx_5m))
+
+        # DefiLlama: stablecoin supply
+        stable_df = self._cached_fetch("defillama_stablecoins", _fetch_defillama_stablecoins)
+        if not stable_df.empty:
+            change = stable_df["value"].pct_change(7).clip(-1, 1)
+            result["stable_supply_change"] = align_to_5m(change, idx_5m)
+        else:
+            result["stable_supply_change"] = np.zeros(len(idx_5m))
+
+        # DefiLlama: TVL
+        tvl_df = self._cached_fetch("defillama_tvl", _fetch_defillama_tvl)
+        if not tvl_df.empty:
+            change = tvl_df["value"].pct_change(7).clip(-1, 1)
+            result["tvl_change"] = align_to_5m(change, idx_5m)
+        else:
+            result["tvl_change"] = np.zeros(len(idx_5m))
+
+        # Funding rates (Binance)
+        funding = self._cached_fetch("funding_rates", _fetch_funding_rates)
+        if not funding.empty:
+            result["funding_24h_avg"] = align_to_5m(funding["rate"].rolling(3).mean().clip(-0.01, 0.01) * 100, idx_5m)
+            # Indices 55-56: current funding rate and 7d average (for training)
+            result["funding_rate_current"] = align_to_5m(funding["rate"].clip(-0.01, 0.01) * 100, idx_5m)
+            result["funding_7d_avg"] = align_to_5m(funding["rate"].rolling(21).mean().clip(-0.01, 0.01) * 100, idx_5m)  # 21 x 8h = ~7d
+        else:
+            result["funding_24h_avg"] = np.zeros(len(idx_5m))
+            result["funding_rate_current"] = np.zeros(len(idx_5m))
+            result["funding_7d_avg"] = np.zeros(len(idx_5m))
+
+        # Index 57: OI change 24h (Coinalyze -- optional, needs free signup API key)
+        # Index 58-59: Long/short liquidations (Binance CSV -- manual download)
+        # These are zero-filled when API key or data not available.
+        # The model learns to ignore zero-valued features via feature importance.
+        result["oi_change_24h"] = np.zeros(len(idx_5m))
+        result["long_liq_24h"] = np.zeros(len(idx_5m))
+        result["short_liq_24h"] = np.zeros(len(idx_5m))
+        logger.info("OI/liquidation features zero-filled (optional data sources)")
+
+        # Index 60: Exchange netflow (BGeometrics exchange-flows)
+        exflow = self._cached_fetch("bgeometrics_exchange-flows", lambda: _fetch_bgeometrics("exchange-flows"))
+        if not exflow.empty:
+            change = exflow["value"].pct_change(7).clip(-1, 1)
+            result["exchange_netflow"] = align_to_5m(change, idx_5m)
+        else:
+            result["exchange_netflow"] = np.zeros(len(idx_5m))
+
+        # Index 61: BTC active addresses change 7d (CoinMetrics)
+        btc_addr = self._cached_fetch("coinmetrics_btc_addr", lambda: _fetch_coinmetrics("btc", "AdrActCnt"))
+        if not btc_addr.empty:
+            change = btc_addr["value"].pct_change(7).clip(-1, 1)
+            result["active_addr_change_7d"] = align_to_5m(change, idx_5m)
+        else:
+            result["active_addr_change_7d"] = np.zeros(len(idx_5m))
+
+        # Index 83: OI change 7d (zero-filled without Coinalyze API key)
+        result["oi_change_7d"] = np.zeros(len(idx_5m))
+
+        # Index 84: Liquidation ratio (zero-filled without Binance CSV data)
+        result["liq_ratio"] = np.zeros(len(idx_5m))
+
+        # Taker buy ratio
+        taker = self._cached_fetch("taker_buy_ratio", _fetch_taker_buy_ratio)
+        if not taker.empty:
+            result["taker_buy_ratio"] = align_to_5m(taker["value"], idx_5m)
+        else:
+            result["taker_buy_ratio"] = np.full(len(idx_5m), 0.5)
+
+        # Deribit DVOL
+        dvol = self._cached_fetch("deribit_dvol", _fetch_deribit_dvol)
+        if not dvol.empty:
+            result["dvol"] = align_to_5m((dvol["value"] / 200.0).clip(0, 1), idx_5m)
+        else:
+            result["dvol"] = np.zeros(len(idx_5m))
+
+        # BTC dominance change (CoinGecko -- limited history for training)
+        result["btc_dom_change"] = np.zeros(len(idx_5m))
+
+        # Stablecoin / BTC market cap ratio
+        if not stable_df.empty and "dxy" in macro:
+            try:
+                import yfinance as yf
+                btc_hist = yf.download("BTC-USD", start=start.strftime("%Y-%m-%d"),
+                                       end=end.strftime("%Y-%m-%d"), progress=False)
+                if not btc_hist.empty:
+                    if isinstance(btc_hist.columns, pd.MultiIndex):
+                        btc_hist.columns = btc_hist.columns.get_level_values(0)
+                    btc_mcap = btc_hist["Close"] * 19_800_000
+                    stable_aligned = stable_df["value"].reindex(btc_mcap.index, method="ffill").fillna(0)
+                    ratio = (stable_aligned / btc_mcap.replace(0, np.nan)).fillna(0).clip(0, 1)
+                    result["stable_btc_ratio"] = align_to_5m(ratio, idx_5m)
+                else:
+                    result["stable_btc_ratio"] = np.zeros(len(idx_5m))
+            except Exception as e:
+                logger.warning("Stablecoin/BTC ratio computation failed: %s", e)
+                result["stable_btc_ratio"] = np.zeros(len(idx_5m))
+        else:
+            result["stable_btc_ratio"] = np.zeros(len(idx_5m))
+
+        return result
+
+    def build_training_features(self, idx_5m: pd.DatetimeIndex) -> np.ndarray:
+        """Build 32-column external feature array aligned to 5m index.
+
+        Layout: 7 columns for indices 55-61 + 25 columns for indices 65-89.
+        This matches what _batch_extract_tabular expects.
+        """
+        data = self.fetch_all_training(idx_5m)
+        n = len(idx_5m)
+        features = np.zeros((n, 32), dtype=np.float64)
+
+        # Columns 0-6 -> feature indices 55-61
+        idx55_keys = [
+            "funding_rate_current",    # 55: funding rate current
+            "funding_7d_avg",          # 56: funding rate 7d average
+            "oi_change_24h",           # 57: OI change 24h
+            "long_liq_24h",            # 58: long liquidations 24h
+            "short_liq_24h",           # 59: short liquidations 24h
+            "exchange_netflow",        # 60: BTC exchange netflow
+            "active_addr_change_7d",   # 61: active addresses change 7d
+        ]
+        for col, key in enumerate(idx55_keys):
+            if key in data:
+                features[:, col] = data[key]
+
+        # Columns 7-31 -> feature indices 65-89
+        idx65_keys = [
+            "fear_greed",           # 65
+            "fear_greed_mom",       # 66
+            "gtrends_bitcoin",      # 67
+            "gtrends_crypto",       # 68
+            "dxy_return",           # 69
+            "sp500_return",         # 70
+            "gold_return",          # 71
+            "vix",                  # 72
+            "treasury_10y",         # 73
+            "yield_spread",         # 74
+            "nvt",                  # 75
+            "mvrv",                 # 76
+            "sopr",                 # 77
+            "puell",                # 78
+            "hashrate",             # 79
+            "eth_active_addr",      # 80
+            "stable_supply_change", # 81
+            "tvl_change",           # 82
+            "oi_change_7d",         # 83
+            "liq_ratio",            # 84
+            "taker_buy_ratio",      # 85
+            "dvol",                 # 86
+            "funding_24h_avg",      # 87
+            "btc_dom_change",       # 88
+            "stable_btc_ratio",     # 89
+        ]
+        for col, key in enumerate(idx65_keys):
+            if key in data:
+                features[:, 7 + col] = data[key]
+
+        return np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+    def build_live_features(self) -> np.ndarray:
+        """Build 25-element feature vector from live cached data.
+
+        Returns zeros for any source that hasn't been fetched yet.
+        Feature keys map to indices 65-89 (same order as build_training_features).
+        """
+        feature_keys = [
+            "fear_greed", "fear_greed_mom", "gtrends_bitcoin", "gtrends_crypto",
+            "dxy_return", "sp500_return", "gold_return", "vix",
+            "treasury_10y", "yield_spread", "nvt", "mvrv", "sopr", "puell",
+            "hashrate", "eth_active_addr", "stable_supply_change", "tvl_change",
+            "oi_change_7d", "liq_ratio", "taker_buy_ratio", "dvol",
+            "funding_24h_avg", "btc_dom_change", "stable_btc_ratio",
+        ]
+        features = np.zeros(25, dtype=np.float32)
+        for i, key in enumerate(feature_keys):
+            features[i] = float(self._live_cache.get(key, 0.0))
+        return features
+
+    def refresh_live(self) -> None:
+        """Refresh live data cache (called periodically by trading loop).
+
+        Each source is fetched with error handling. On success, the cache
+        and last-fetched timestamp are updated. On failure, stale values
+        are retained and a warning is logged.
+        """
+        now = datetime.now(timezone.utc)
+
+        # Fear & Greed (daily source)
+        try:
+            fng = _fetch_fear_greed(limit=8)
+            if not fng.empty:
+                val = float(fng["value"].iloc[-1]) / 100.0
+                self._live_cache["fear_greed"] = val
+                if len(fng) >= 7:
+                    self._live_cache["fear_greed_mom"] = (float(fng["value"].iloc[-1]) - float(fng["value"].iloc[-7])) / 100.0
+                elif len(fng) >= 2:
+                    self._live_cache["fear_greed_mom"] = (float(fng["value"].iloc[-1]) - float(fng["value"].iloc[0])) / 100.0
+                self._last_fetched["fear_greed"] = now
+        except Exception as e:
+            logger.warning("Live refresh fear_greed failed: %s", e)
+
+        # Macro data (yfinance)
+        try:
+            end = now
+            start = now - timedelta(days=7)
+            macro = _fetch_macro_yfinance(start, end)
+            for key, ticker_key, transform in [
+                ("dxy_return", "dxy", lambda s: float(s.pct_change().iloc[-1]) * 20 if len(s) > 1 else 0.0),
+                ("sp500_return", "sp500", lambda s: float(s.pct_change().iloc[-1]) * 20 if len(s) > 1 else 0.0),
+                ("gold_return", "gold", lambda s: float(s.pct_change().iloc[-1]) * 20 if len(s) > 1 else 0.0),
+                ("vix", "vix", lambda s: np.clip(float(s.iloc[-1]) / 80.0, 0, 1) if len(s) > 0 else 0.0),
+                ("treasury_10y", "tnx", lambda s: np.clip(float(s.iloc[-1]) / 10.0, 0, 1) if len(s) > 0 else 0.0),
+            ]:
+                if ticker_key in macro and not macro[ticker_key].empty:
+                    self._live_cache[key] = transform(macro[ticker_key]["value"])
+            self._last_fetched["macro"] = now
+        except Exception as e:
+            logger.warning("Live refresh macro failed: %s", e)
+
+        # Funding rates
+        try:
+            funding = _fetch_funding_rates(limit=10)
+            if not funding.empty:
+                avg = float(funding["rate"].tail(3).mean()) * 100
+                self._live_cache["funding_24h_avg"] = np.clip(avg, -1, 1)
+                self._last_fetched["funding_rate"] = now
+        except Exception as e:
+            logger.warning("Live refresh funding failed: %s", e)
+
+        # On-chain (BGeometrics)
+        try:
+            for metric, key, transform in [
+                ("nvt", "nvt", lambda v: np.clip(np.log1p(v) / np.log1p(200), 0, 1)),
+                ("mvrv", "mvrv", lambda v: np.clip(v / 5.0, 0, 1)),
+                ("sopr", "sopr", lambda v: np.clip((v - 1.0) * 5.0, -1, 1)),
+                ("puell-multiple", "puell", lambda v: np.clip(v / 4.0, 0, 1)),
+            ]:
+                df = _fetch_bgeometrics(metric)
+                if not df.empty:
+                    self._live_cache[key] = float(transform(df["value"].iloc[-1]))
+            self._last_fetched["onchain"] = now
+        except Exception as e:
+            logger.warning("Live refresh onchain failed: %s", e)
+
+        # DeFi (DefiLlama)
+        try:
+            tvl = _fetch_defillama_tvl()
+            if not tvl.empty and len(tvl) >= 8:
+                change = (float(tvl["value"].iloc[-1]) - float(tvl["value"].iloc[-8])) / max(float(tvl["value"].iloc[-8]), 1)
+                self._live_cache["tvl_change"] = np.clip(change, -1, 1)
+            self._last_fetched["defi"] = now
+        except Exception as e:
+            logger.warning("Live refresh defi failed: %s", e)
+
+        # Deribit DVOL
+        try:
+            dvol = _fetch_deribit_dvol()
+            if not dvol.empty:
+                self._live_cache["dvol"] = np.clip(float(dvol["value"].iloc[-1]) / 200.0, 0, 1)
+                self._last_fetched["dvol"] = now
+        except Exception as e:
+            logger.warning("Live refresh dvol failed: %s", e)
+
+        # Taker buy ratio
+        try:
+            taker = _fetch_taker_buy_ratio(limit=10)
+            if not taker.empty:
+                self._live_cache["taker_buy_ratio"] = float(taker["value"].iloc[-1])
+                self._last_fetched["oi_liquidations"] = now
+        except Exception as e:
+            logger.warning("Live refresh taker_buy failed: %s", e)
+
+        # Hashrate (BGeometrics)
+        try:
+            hr = _fetch_bgeometrics("hashrate")
+            if not hr.empty and len(hr) >= 31:
+                change = (float(hr["value"].iloc[-1]) - float(hr["value"].iloc[-31])) / max(float(hr["value"].iloc[-31]), 1)
+                self._live_cache["hashrate"] = np.clip(change, -1, 1)
+        except Exception as e:
+            logger.warning("Live refresh hashrate failed: %s", e)
+
+        # ETH active addresses (CoinMetrics)
+        try:
+            eth_addr = _fetch_coinmetrics("eth", "AdrActCnt")
+            if not eth_addr.empty and len(eth_addr) >= 8:
+                change = (float(eth_addr["value"].iloc[-1]) - float(eth_addr["value"].iloc[-8])) / max(float(eth_addr["value"].iloc[-8]), 1)
+                self._live_cache["eth_active_addr"] = np.clip(change, -1, 1)
+        except Exception as e:
+            logger.warning("Live refresh eth_active_addr failed: %s", e)
+
+        # Stablecoin supply change (DefiLlama)
+        try:
+            stable = _fetch_defillama_stablecoins()
+            if not stable.empty and len(stable) >= 8:
+                change = (float(stable["value"].iloc[-1]) - float(stable["value"].iloc[-8])) / max(float(stable["value"].iloc[-8]), 1)
+                self._live_cache["stable_supply_change"] = np.clip(change, -1, 1)
+        except Exception as e:
+            logger.warning("Live refresh stable_supply_change failed: %s", e)
+
+        # Yield spread (compute from macro if available)
+        try:
+            end_ys = now
+            start_ys = now - timedelta(days=7)
+            macro_ys = _fetch_macro_yfinance(start_ys, end_ys)
+            if "tnx" in macro_ys and "twoy" in macro_ys:
+                tnx_val = float(macro_ys["tnx"]["value"].iloc[-1]) if not macro_ys["tnx"].empty else 0
+                twoy_val = float(macro_ys["twoy"]["value"].iloc[-1]) if not macro_ys["twoy"].empty else 0
+                self._live_cache["yield_spread"] = np.clip((tnx_val - twoy_val) / 5.0, -1, 1)
+        except Exception as e:
+            logger.warning("Live refresh yield_spread failed: %s", e)
+
+        # BTC dominance change (CoinGecko -- live only)
+        try:
+            btc_dom = _fetch_coingecko_btc_dominance()
+            if not btc_dom.empty:
+                current = float(btc_dom["value"].iloc[-1]) / 100.0
+                prev = self._live_cache.get("_btc_dom_prev", current)
+                self._live_cache["btc_dom_change"] = np.clip((current - prev) * 10, -1, 1)
+                self._live_cache["_btc_dom_prev"] = current
+        except Exception as e:
+            logger.warning("Live refresh btc_dom failed: %s", e)
+
+        # Google Trends -- skipped in live mode (weekly data, rate-limited)
+
+        # stable_btc_ratio -- simplified in live mode
+        try:
+            if "stable_supply_change" in self._live_cache:
+                self._live_cache["stable_btc_ratio"] = 0.0
+        except Exception:
+            pass
+
+    def _cached_fetch(self, name: str, fetch_fn) -> pd.DataFrame:
+        """Fetch data with parquet cache."""
+        if self._cache_dir:
+            cache_path = str(self._cache_dir / f"{name}.parquet")
+            cached = load_cache(cache_path)
+            if cached is not None:
+                logger.info("Using cached data for %s (%d rows)", name, len(cached))
+                return cached
+
+        logger.info("Fetching %s from API...", name)
+        try:
+            df = fetch_fn()
+            if self._cache_dir and not df.empty:
+                save_cache(df, str(self._cache_dir / f"{name}.parquet"))
+                logger.info("Cached %s (%d rows)", name, len(df))
+            return df
+        except Exception as e:
+            logger.warning("Failed to fetch %s: %s", name, e)
+            return pd.DataFrame()
