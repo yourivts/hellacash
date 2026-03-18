@@ -348,97 +348,224 @@ def _fetch_blockchain_com_puell() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def _fetch_binance_open_interest_hist(symbol: str = "BTCUSDT") -> pd.DataFrame:
-    """Fetch historical open interest from Binance Futures (5m intervals, paginated)."""
+def _fetch_binance_futures_klines(symbol: str = "BTCUSDT") -> pd.DataFrame:
+    """Fetch Binance Futures klines (full history) — extracts taker buy ratio.
+
+    Each kline includes total volume and taker buy volume, giving us
+    taker buy ratio with years of history (unlike /futures/data/* which is 30 days).
+    """
     import requests
     try:
-        url = "https://fapi.binance.com/futures/data/openInterestHist"
+        url = "https://fapi.binance.com/fapi/v1/klines"
         all_rows = []
-        end_time = None
-        for _ in range(100):
-            params = {"symbol": symbol, "period": "5m", "limit": 500}
-            if end_time:
-                params["endTime"] = end_time
+        start_time = None
+        for _ in range(500):  # up to 500 pages x 1500 candles = ~5 years of 1h
+            params = {"symbol": symbol, "interval": "1h", "limit": 1500}
+            if start_time:
+                params["startTime"] = start_time
             resp = requests.get(url, params=params, timeout=30)
             resp.raise_for_status()
             data = resp.json()
             if not data:
                 break
             for d in data:
-                ts = datetime.fromtimestamp(d["timestamp"] / 1000, tz=timezone.utc)
-                all_rows.append({"date": ts, "value": float(d["sumOpenInterestValue"])})
-            if len(data) < 500:
-                break
-            end_time = data[0]["timestamp"] - 1
-            time.sleep(0.2)
-        if not all_rows:
-            return pd.DataFrame()
-        return pd.DataFrame(all_rows).set_index("date").sort_index().drop_duplicates()
-    except Exception as e:
-        logger.warning("Binance OI hist fetch failed: %s", e)
-        return pd.DataFrame()
-
-
-def _fetch_binance_long_short_ratio(symbol: str = "BTCUSDT") -> pd.DataFrame:
-    """Fetch global long/short account ratio from Binance Futures."""
-    import requests
-    try:
-        url = "https://fapi.binance.com/futures/data/globalLongShortAccountRatio"
-        all_rows = []
-        end_time = None
-        for _ in range(100):
-            params = {"symbol": symbol, "period": "5m", "limit": 500}
-            if end_time:
-                params["endTime"] = end_time
-            resp = requests.get(url, params=params, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-            if not data:
-                break
-            for d in data:
-                ts = datetime.fromtimestamp(d["timestamp"] / 1000, tz=timezone.utc)
+                ts = datetime.fromtimestamp(d[0] / 1000, tz=timezone.utc)
+                volume = float(d[5])        # Quote asset volume
+                taker_buy = float(d[10])     # Taker buy quote volume
                 all_rows.append({
                     "date": ts,
-                    "long_ratio": float(d["longAccount"]),
-                    "short_ratio": float(d["shortAccount"]),
-                    "ls_ratio": float(d["longShortRatio"]),
+                    "volume": volume,
+                    "taker_buy_vol": taker_buy,
+                    "taker_buy_ratio": taker_buy / volume if volume > 0 else 0.5,
                 })
-            if len(data) < 500:
+            if len(data) < 1500:
                 break
-            end_time = data[0]["timestamp"] - 1
+            start_time = data[-1][0] + 1
             time.sleep(0.2)
         if not all_rows:
             return pd.DataFrame()
         return pd.DataFrame(all_rows).set_index("date").sort_index().drop_duplicates()
     except Exception as e:
-        logger.warning("Binance long/short ratio fetch failed: %s", e)
+        logger.warning("Binance futures klines fetch failed: %s", e)
         return pd.DataFrame()
 
 
-def _fetch_binance_liquidations(symbol: str = "BTCUSDT") -> pd.DataFrame:
-    """Fetch recent forced liquidation orders from Binance Futures."""
+def _fetch_bybit_open_interest(symbol: str = "BTCUSDT") -> pd.DataFrame:
+    """Fetch historical OI from Bybit (free, no auth, back to symbol launch).
+
+    Uses daily interval, paginates with cursor. BTCUSDT launched ~late 2020.
+    """
     import requests
     try:
-        url = "https://fapi.binance.com/fapi/v1/allForceOrders"
-        params = {"symbol": symbol, "limit": 1000}
-        resp = requests.get(url, params=params, timeout=30)
+        url = "https://api.bybit.com/v5/market/open-interest"
+        all_rows = []
+        cursor = None
+        for _ in range(100):  # safety limit
+            params = {
+                "category": "linear",
+                "symbol": symbol,
+                "intervalTime": "1d",
+                "limit": 200,
+            }
+            if cursor:
+                params["cursor"] = cursor
+            resp = requests.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+            result = resp.json().get("result", {})
+            items = result.get("list", [])
+            if not items:
+                break
+            for item in items:
+                ts = datetime.fromtimestamp(int(item["timestamp"]) / 1000, tz=timezone.utc)
+                all_rows.append({"date": ts, "value": float(item["openInterest"])})
+            cursor = result.get("nextPageCursor", "")
+            if not cursor:
+                break
+            time.sleep(0.15)
+        if not all_rows:
+            return pd.DataFrame()
+        return pd.DataFrame(all_rows).set_index("date").sort_index().drop_duplicates()
+    except Exception as e:
+        logger.warning("Bybit OI fetch failed: %s", e)
+        return pd.DataFrame()
+
+
+def _fetch_coinalyze_liquidations(symbol: str = "BTCUSDT_PERP.A") -> pd.DataFrame:
+    """Fetch historical liquidation data from Coinalyze (free API key, unlimited daily).
+
+    Returns long and short liquidation volumes in USD.
+    Requires COINALYZE_API_KEY env var.
+    """
+    import os
+    import requests
+    api_key = os.environ.get("COINALYZE_API_KEY", "")
+    if not api_key:
+        logger.warning("COINALYZE_API_KEY not set, skipping liquidation fetch")
+        return pd.DataFrame()
+    try:
+        url = "https://api.coinalyze.net/v1/liquidation-history"
+        # Fetch from 2020 onwards
+        start = int(datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp())
+        end = int(datetime.now(timezone.utc).timestamp())
+        params = {
+            "symbols": symbol,
+            "interval": "daily",
+            "from": start,
+            "to": end,
+        }
+        resp = requests.get(url, params=params, headers={"api_key": api_key}, timeout=60)
         resp.raise_for_status()
         data = resp.json()
-        if not data:
+        if not data or not isinstance(data, list) or not data[0].get("history"):
             return pd.DataFrame()
         rows = []
-        for d in data:
-            ts = datetime.fromtimestamp(d["time"] / 1000, tz=timezone.utc)
+        for item in data[0]["history"]:
+            ts = datetime.fromtimestamp(item["t"], tz=timezone.utc)
             rows.append({
                 "date": ts,
-                "side": d["side"],  # BUY = short liq, SELL = long liq
-                "qty": float(d["origQty"]),
-                "price": float(d["price"]),
-                "value_usd": float(d["origQty"]) * float(d["price"]),
+                "long_liq": float(item.get("l", 0)),
+                "short_liq": float(item.get("s", 0)),
             })
         return pd.DataFrame(rows).set_index("date").sort_index()
     except Exception as e:
-        logger.warning("Binance liquidations fetch failed: %s", e)
+        logger.warning("Coinalyze liquidation fetch failed: %s", e)
+        return pd.DataFrame()
+
+
+def _fetch_coinalyze_long_short_ratio(symbol: str = "BTCUSDT_PERP.A") -> pd.DataFrame:
+    """Fetch historical long/short ratio from Coinalyze (free API key, unlimited daily)."""
+    import os
+    import requests
+    api_key = os.environ.get("COINALYZE_API_KEY", "")
+    if not api_key:
+        logger.warning("COINALYZE_API_KEY not set, skipping long/short ratio fetch")
+        return pd.DataFrame()
+    try:
+        url = "https://api.coinalyze.net/v1/long-short-ratio-history"
+        start = int(datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp())
+        end = int(datetime.now(timezone.utc).timestamp())
+        params = {
+            "symbols": symbol,
+            "interval": "daily",
+            "from": start,
+            "to": end,
+        }
+        resp = requests.get(url, params=params, headers={"api_key": api_key}, timeout=60)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data or not isinstance(data, list) or not data[0].get("history"):
+            return pd.DataFrame()
+        rows = []
+        for item in data[0]["history"]:
+            ts = datetime.fromtimestamp(item["t"], tz=timezone.utc)
+            rows.append({"date": ts, "value": float(item.get("r", 0.5))})
+        return pd.DataFrame(rows).set_index("date").sort_index()
+    except Exception as e:
+        logger.warning("Coinalyze long/short ratio fetch failed: %s", e)
+        return pd.DataFrame()
+
+
+def _fetch_coingecko_btc_dominance_history() -> pd.DataFrame:
+    """Fetch historical BTC dominance from CoinGecko market_chart endpoint.
+
+    Computes dominance as BTC market cap / total crypto market cap.
+    """
+    import requests
+    try:
+        # BTC market cap history (max range)
+        btc_resp = requests.get(
+            "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
+            params={"vs_currency": "usd", "days": "max", "interval": "daily"},
+            timeout=30,
+        )
+        btc_resp.raise_for_status()
+        btc_data = btc_resp.json().get("market_caps", [])
+        if not btc_data:
+            return pd.DataFrame()
+
+        time.sleep(1.5)  # respect CoinGecko rate limit
+
+        # Total crypto market cap history
+        total_resp = requests.get(
+            "https://api.coingecko.com/api/v3/global/market_cap_chart",
+            params={"days": "max"},
+            timeout=30,
+        )
+
+        if total_resp.ok:
+            total_data = total_resp.json().get("market_cap_chart", {}).get("market_cap", [])
+        else:
+            total_data = None
+
+        rows = []
+        if total_data and len(total_data) > 100:
+            # Build total mcap lookup
+            total_map = {}
+            for ts_ms, val in total_data:
+                day = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+                total_map[day] = val
+            for ts_ms, btc_mcap in btc_data:
+                ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+                day = ts.strftime("%Y-%m-%d")
+                total_mcap = total_map.get(day)
+                if total_mcap and total_mcap > 0:
+                    rows.append({"date": ts, "value": btc_mcap / total_mcap})
+        else:
+            # Fallback: estimate dominance from BTC mcap alone (change metric)
+            for ts_ms, btc_mcap in btc_data:
+                ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+                rows.append({"date": ts, "value": btc_mcap})
+
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows).set_index("date").sort_index()
+        # If we only got raw BTC mcap (fallback), convert to pct_change
+        if total_data is None or len(total_data) <= 100:
+            df["value"] = df["value"].pct_change(7).clip(-0.5, 0.5)
+            df = df.dropna()
+        return df
+    except Exception as e:
+        logger.warning("CoinGecko BTC dominance history fetch failed: %s", e)
         return pd.DataFrame()
 
 
@@ -547,33 +674,6 @@ def _fetch_coingecko_btc_dominance() -> pd.DataFrame:
         return pd.DataFrame([{"date": ts, "value": float(btc_dom)}]).set_index("date")
     except Exception as e:
         logger.warning("CoinGecko BTC dominance fetch failed: %s", e)
-        return pd.DataFrame()
-
-
-def _fetch_taker_buy_ratio(symbol: str = "BTCUSDT", interval: str = "1h",
-                           limit: int = 1500) -> pd.DataFrame:
-    """Fetch taker buy/sell volume ratio from Binance Futures klines.
-
-    Uses 1h granularity (practical compromise -- 5m over 5y = too many requests).
-    Forward-filled to 5m resolution via align_to_5m().
-    """
-    import requests
-    try:
-        url = "https://fapi.binance.com/fapi/v1/klines"
-        params = {"symbol": symbol, "interval": interval, "limit": limit}
-        resp = requests.get(url, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        rows = []
-        for d in data:
-            ts = datetime.fromtimestamp(d[0] / 1000, tz=timezone.utc)
-            total_vol = float(d[5])
-            taker_buy_vol = float(d[9])
-            ratio = taker_buy_vol / total_vol if total_vol > 0 else 0.5
-            rows.append({"date": ts, "value": ratio})
-        return pd.DataFrame(rows).set_index("date").sort_index()
-    except Exception as e:
-        logger.warning("Taker buy ratio fetch failed: %s", e)
         return pd.DataFrame()
 
 
@@ -744,8 +844,8 @@ class ExternalDataProvider:
             result["funding_rate_current"] = np.zeros(len(idx_5m))
             result["funding_7d_avg"] = np.zeros(len(idx_5m))
 
-        # Index 57: OI change 24h (Binance Futures)
-        oi_df = self._cached_fetch("binance_oi_hist", _fetch_binance_open_interest_hist)
+        # Index 57: OI change 24h (Bybit — full history back to 2020)
+        oi_df = self._cached_fetch("bybit_oi", _fetch_bybit_open_interest)
         if not oi_df.empty:
             oi_aligned = align_to_5m(oi_df["value"], idx_5m)
             oi_series = pd.Series(oi_aligned, index=idx_5m)
@@ -754,20 +854,15 @@ class ExternalDataProvider:
         else:
             result["oi_change_24h"] = np.zeros(len(idx_5m))
 
-        # Index 58-59: Long/short liquidations (Binance Futures)
-        liq_df = self._cached_fetch("binance_liquidations", _fetch_binance_liquidations)
-        if not liq_df.empty:
-            # Resample to 5m bins, sum USD value
-            long_liqs = liq_df[liq_df["side"] == "SELL"]["value_usd"]  # SELL = long liq
-            short_liqs = liq_df[liq_df["side"] == "BUY"]["value_usd"]  # BUY = short liq
-            long_5m = long_liqs.resample("5min").sum().reindex(idx_5m, fill_value=0)
-            short_5m = short_liqs.resample("5min").sum().reindex(idx_5m, fill_value=0)
-            # Rolling 24h sum, normalized
-            long_24h = long_5m.rolling(288, min_periods=1).sum()
-            short_24h = short_5m.rolling(288, min_periods=1).sum()
-            max_liq = max(long_24h.max(), short_24h.max(), 1.0)
-            result["long_liq_24h"] = (long_24h / max_liq).clip(0, 1).fillna(0).values
-            result["short_liq_24h"] = (short_24h / max_liq).clip(0, 1).fillna(0).values
+        # Index 58-59: Long/short liquidations (Coinalyze — unlimited daily history)
+        liq_df = self._cached_fetch("coinalyze_liquidations", _fetch_coinalyze_liquidations)
+        if not liq_df.empty and "long_liq" in liq_df.columns:
+            long_aligned = align_to_5m(liq_df["long_liq"], idx_5m)
+            short_aligned = align_to_5m(liq_df["short_liq"], idx_5m)
+            # Normalize to [0, 1] range
+            max_liq = max(np.nanmax(long_aligned), np.nanmax(short_aligned), 1.0)
+            result["long_liq_24h"] = np.clip(long_aligned / max_liq, 0, 1)
+            result["short_liq_24h"] = np.clip(short_aligned / max_liq, 0, 1)
         else:
             result["long_liq_24h"] = np.zeros(len(idx_5m))
             result["short_liq_24h"] = np.zeros(len(idx_5m))
@@ -788,25 +883,25 @@ class ExternalDataProvider:
         else:
             result["active_addr_change_7d"] = np.zeros(len(idx_5m))
 
-        # Index 83: OI change 7d (from Binance OI data)
+        # Index 83: OI change 7d (from Bybit OI data)
         if not oi_df.empty:
             oi_change_7d = oi_series.pct_change(2016).clip(-1, 1)  # 2016 x 5m = 7d
             result["oi_change_7d"] = oi_change_7d.fillna(0).values
         else:
             result["oi_change_7d"] = np.zeros(len(idx_5m))
 
-        # Index 84: Liquidation ratio (long_liq / (long_liq + short_liq))
-        if not liq_df.empty:
-            total_liq = long_24h + short_24h
-            ratio = (long_24h / total_liq.where(total_liq > 0, 1.0)).clip(0, 1)
-            result["liq_ratio"] = ratio.fillna(0.5).values
+        # Index 84: Liquidation ratio (Coinalyze — long / (long + short))
+        if not liq_df.empty and "long_liq" in liq_df.columns:
+            total_liq = liq_df["long_liq"] + liq_df["short_liq"]
+            ratio = (liq_df["long_liq"] / total_liq.where(total_liq > 0, 1.0)).clip(0, 1)
+            result["liq_ratio"] = align_to_5m(ratio, idx_5m)
         else:
             result["liq_ratio"] = np.zeros(len(idx_5m))
 
-        # Taker buy ratio
-        taker = self._cached_fetch("taker_buy_ratio", _fetch_taker_buy_ratio)
-        if not taker.empty:
-            result["taker_buy_ratio"] = align_to_5m(taker["value"], idx_5m)
+        # Taker buy ratio (Binance Futures klines — full history)
+        taker = self._cached_fetch("binance_futures_klines", _fetch_binance_futures_klines)
+        if not taker.empty and "taker_buy_ratio" in taker.columns:
+            result["taker_buy_ratio"] = align_to_5m(taker["taker_buy_ratio"], idx_5m)
         else:
             result["taker_buy_ratio"] = np.full(len(idx_5m), 0.5)
 
@@ -817,8 +912,18 @@ class ExternalDataProvider:
         else:
             result["dvol"] = np.zeros(len(idx_5m))
 
-        # BTC dominance change (CoinGecko -- limited history for training)
-        result["btc_dom_change"] = np.zeros(len(idx_5m))
+        # BTC dominance change (CoinGecko — full history)
+        btc_dom = self._cached_fetch("coingecko_btc_dom_hist", _fetch_coingecko_btc_dominance_history)
+        if not btc_dom.empty:
+            # If we got actual dominance ratios (0-1), compute 7d change
+            if btc_dom["value"].max() <= 1.0:
+                dom_change = btc_dom["value"].diff(7).clip(-0.1, 0.1) * 10  # scale to [-1, 1]
+                result["btc_dom_change"] = align_to_5m(dom_change, idx_5m)
+            else:
+                # Fallback: already pct_change from the fetch function
+                result["btc_dom_change"] = align_to_5m(btc_dom["value"].clip(-1, 1), idx_5m)
+        else:
+            result["btc_dom_change"] = np.zeros(len(idx_5m))
 
         # Stablecoin / BTC market cap ratio
         if not stable_df.empty and "dxy" in macro:
@@ -1010,18 +1115,10 @@ class ExternalDataProvider:
         except Exception as e:
             logger.warning("Live refresh dvol failed: %s", e)
 
-        # Taker buy ratio
-        try:
-            taker = _fetch_taker_buy_ratio(limit=10)
-            if not taker.empty:
-                self._live_cache["taker_buy_ratio"] = float(taker["value"].iloc[-1])
-        except Exception as e:
-            logger.warning("Live refresh taker_buy failed: %s", e)
-
-        # Binance Futures: OI, liquidations, long/short ratio
+        # Binance Futures: OI and taker buy ratio (live)
         try:
             import requests
-            # Open Interest (current)
+            # Open Interest (current snapshot)
             resp = requests.get("https://fapi.binance.com/fapi/v1/openInterest",
                                 params={"symbol": "BTCUSDT"}, timeout=10)
             if resp.ok:
@@ -1030,24 +1127,33 @@ class ExternalDataProvider:
                 self._live_cache["oi_change_24h"] = np.clip((oi_val - prev_oi) / max(prev_oi, 1) * 10, -1, 1)
                 self._live_cache["_oi_prev"] = oi_val
 
-            # Long/short ratio
-            ls_df = _fetch_binance_long_short_ratio(symbol="BTCUSDT")
-            if not ls_df.empty:
-                self._live_cache["liq_ratio"] = float(ls_df["long_ratio"].iloc[-1])
-
-            # Liquidations (recent)
-            liq_df = _fetch_binance_liquidations(symbol="BTCUSDT")
-            if not liq_df.empty:
-                recent = liq_df[liq_df.index >= now - timedelta(hours=24)]
-                long_liq = recent[recent["side"] == "SELL"]["value_usd"].sum()
-                short_liq = recent[recent["side"] == "BUY"]["value_usd"].sum()
-                total = max(long_liq + short_liq, 1.0)
-                self._live_cache["long_liq_24h"] = np.clip(long_liq / total, 0, 1)
-                self._live_cache["short_liq_24h"] = np.clip(short_liq / total, 0, 1)
+            # Taker buy ratio from recent klines
+            resp2 = requests.get("https://fapi.binance.com/fapi/v1/klines",
+                                 params={"symbol": "BTCUSDT", "interval": "1h", "limit": 10},
+                                 timeout=10)
+            if resp2.ok:
+                data = resp2.json()
+                if data:
+                    last = data[-1]
+                    vol = float(last[5])
+                    taker_buy = float(last[10])
+                    self._live_cache["taker_buy_ratio"] = taker_buy / vol if vol > 0 else 0.5
 
             self._last_fetched["oi_liquidations"] = now
         except Exception as e:
             logger.warning("Live refresh Binance derivatives failed: %s", e)
+
+        # Coinalyze: liquidations and long/short ratio (live)
+        try:
+            liq = _fetch_coinalyze_liquidations()
+            if not liq.empty and "long_liq" in liq.columns:
+                last = liq.iloc[-1]
+                total = max(last["long_liq"] + last["short_liq"], 1.0)
+                self._live_cache["long_liq_24h"] = np.clip(last["long_liq"] / total, 0, 1)
+                self._live_cache["short_liq_24h"] = np.clip(last["short_liq"] / total, 0, 1)
+                self._live_cache["liq_ratio"] = np.clip(last["long_liq"] / total, 0, 1)
+        except Exception as e:
+            logger.warning("Live refresh Coinalyze liquidations failed: %s", e)
 
         # Puell Multiple (Blockchain.com)
         try:
