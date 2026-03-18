@@ -84,6 +84,8 @@ The live bot currently passes funding_rate, funding_score, ob_imbalance, spread_
 | 60 | onchain_composite | BTC exchange netflow | Live bot fetches from BGeometrics |
 | 61 | exchange_reserve_trend | Active addresses change 7d | Live bot fetches from CoinMetrics |
 
+Indices 62-64 (BTC cross-asset returns, correlation) — unchanged.
+
 The `extract_tabular_features()` function signature changes: the individual float params (funding_rate, funding_score, etc.) are replaced with a single `external_data: dict` parameter. The live bot's trading loop is updated to build this dict from the external data provider.
 
 **New features (indices 65-89):**
@@ -114,7 +116,7 @@ The `extract_tabular_features()` function signature changes: the individual floa
 | 86 | BTC DVOL implied volatility | Deribit | 0-1 (scaled by 200%) |
 | 87 | Funding rate 24h average | Binance | -1 to 1 |
 | 88 | BTC dominance change 7d | CoinGecko/yfinance | -1 to 1 |
-| 89 | Stablecoin mcap / BTC mcap ratio | DefiLlama | 0-1 |
+| 89 | Stablecoin mcap / BTC mcap ratio | DefiLlama + CoinGecko | 0-1 |
 
 **Total XGBoost input: 90 tabular + 16 Transformer embeddings = 106 features.**
 
@@ -147,7 +149,7 @@ Input: (batch, 96, 7)
     )
   → MeanPooling(dim=1) → (batch, 64)        # aggregate (h_pooled)
   ┌─→ Linear(64 → 16) + ReLU → embedding    # embed branch (from h_pooled)
-  └─→ Linear(64 → 60)                       # predict branch (from h_pooled, discarded after training)
+  └─→ Linear(64 → 60)                       # predict branch (5 OHLCV channels × 12 bars, discarded after training)
 ```
 
 Both the embedding projection and the prediction head branch from the same 64-dim mean-pooled output (`h_pooled`). The prediction head is only used during self-supervised training and is discarded afterward.
@@ -173,6 +175,8 @@ Both the embedding projection and the prediction head branch from the same 64-di
 ---
 
 ## 4. Training Improvements
+
+**Training pipeline order:** Optuna Transformer HPO → train best Transformer → extract embeddings → threshold search (needs embeddings for F1) → Optuna XGBoost HPO (with class weights) → train final XGBoost models.
 
 ### 4a. Class-weighted training
 
@@ -263,7 +267,7 @@ STALENESS_THRESHOLDS = {
 - **Model loading**: `ml_signal_generator.py` tries `transformer.pt` first, falls back to `lstm.pt`. This allows rolling back to the LSTM by simply deleting `transformer.pt`.
 - **Feature count**: `feature_config.json` stores `n_tabular` (90) and `n_embed` (16). The signal generator reads these at load time. Old models with `n_tabular=65` still load correctly — the generator checks the config and uses the matching feature extraction path.
 - **External data unavailable**: If the external data provider fails entirely at startup, the bot logs a warning and runs with zero-filled external features (indices 55-89). This matches training behavior for pre-inception periods.
-- **Config key**: `feature_config.json` uses `n_embed` (generic) instead of `n_lstm_embed` to be architecture-agnostic.
+- **Config key**: `feature_config.json` writes `n_embed` (generic) instead of `n_lstm_embed`. When reading the config, accept both `n_embed` and `n_lstm_embed` (legacy) to avoid breaking existing saved models.
 
 ---
 
