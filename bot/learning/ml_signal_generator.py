@@ -1,12 +1,12 @@
 """ML Signal Generator: load trained models and predict directional probabilities.
 
 Loads:
-    - LSTM embedder (lstm.pt)
+    - Transformer embedder (transformer.pt, fallback to lstm.pt)
     - 12 XGBoost classifiers (xgb_{horizon}_{direction}.json)
     - Feature config (feature_config.json)
 
 Exposes:
-    predict(df_5m, symbol) → dict with probabilities, direction, net_up, net_down
+    predict(df_5m, symbol) -> dict with probabilities, direction, net_up, net_down
 """
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ from typing import Any, Dict, Optional
 import numpy as np
 import xgboost as xgb
 
-from bot.learning.lstm_embedder import LSTMEmbedder
 from bot.learning.ml_features import extract_tabular_features, build_lstm_sequence
 
 logger = logging.getLogger(__name__)
@@ -29,25 +28,45 @@ MIN_SIGNAL_PROB = 0.4  # minimum average probability to generate a direction sig
 
 
 class MLSignalGenerator:
-    """Load trained LSTM + XGBoost models and generate trading signals."""
+    """Load trained embedder + XGBoost models and generate trading signals."""
 
     def __init__(self, model_dir: str = "models/ml_signals") -> None:
         self._model_dir = Path(model_dir)
+        self._disabled = False  # Set by failsafe system
+
         if not self._model_dir.exists():
             raise FileNotFoundError(
                 f"ML model directory not found: {model_dir}. "
                 f"Run scripts/train_ml_signals.py first."
             )
 
-        # Load LSTM
+        # Load embedder: prefer Transformer, fall back to LSTM
+        transformer_path = self._model_dir / "transformer.pt"
         lstm_path = self._model_dir / "lstm.pt"
-        if not lstm_path.exists():
-            raise FileNotFoundError(f"LSTM model not found: {lstm_path}")
-        self._lstm = LSTMEmbedder()
-        self._lstm.load(str(lstm_path))
-        self._lstm.eval()
 
-        # Load XGBoost models
+        import torch
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        if transformer_path.exists():
+            from bot.learning.transformer_embedder import TransformerEmbedder
+            self._embedder = TransformerEmbedder()
+            self._embedder.load(str(transformer_path))
+            self._embedder.to(device)
+            self._embedder.eval()
+            logger.info("Loaded Transformer embedder on %s from %s", device, transformer_path)
+        elif lstm_path.exists():
+            from bot.learning.lstm_embedder import LSTMEmbedder
+            self._embedder = LSTMEmbedder()
+            self._embedder.load(str(lstm_path))
+            self._embedder.to(device)
+            self._embedder.eval()
+            logger.info("Loaded LSTM embedder (fallback) on %s from %s", device, lstm_path)
+        else:
+            raise FileNotFoundError(
+                f"No embedder model found. Expected transformer.pt or lstm.pt in {model_dir}"
+            )
+
+        # Load XGBoost models (GPU inference if available)
         self._xgb_models: Dict[str, xgb.XGBClassifier] = {}
         for h in HORIZONS:
             for d in DIRECTIONS:
@@ -57,18 +76,27 @@ class MLSignalGenerator:
                     raise FileNotFoundError(f"XGBoost model not found: {path}")
                 model = xgb.XGBClassifier()
                 model.load_model(str(path))
+                # Enable GPU prediction if model was trained on GPU
+                try:
+                    model.set_params(device="cuda")
+                except Exception:
+                    pass  # Fall back to CPU prediction if GPU not available
                 self._xgb_models[key] = model
 
-        # Load feature config
+        # Load feature config (accept both n_embed and n_lstm_embed for backward compat)
         config_path = self._model_dir / "feature_config.json"
         if config_path.exists():
             with open(config_path) as f:
                 self._config = json.load(f)
         else:
-            self._config = {"n_tabular": 65, "n_lstm_embed": 16, "horizons": HORIZONS}
+            self._config = {"n_tabular": 90, "n_embed": 16, "horizons": HORIZONS}
+
+        # Accept both key names
+        if "n_embed" not in self._config and "n_lstm_embed" in self._config:
+            self._config["n_embed"] = self._config["n_lstm_embed"]
 
         logger.info(
-            "MLSignalGenerator loaded: LSTM + %d XGBoost models from %s",
+            "MLSignalGenerator loaded: embedder + %d XGBoost models from %s",
             len(self._xgb_models), model_dir,
         )
 
@@ -77,9 +105,17 @@ class MLSignalGenerator:
         df_5m: "pd.DataFrame",
         symbol: str = "BTC-EUR",
         btc_df_5m: Optional["pd.DataFrame"] = None,
+        external_data: dict | None = None,
         **live_features,
     ) -> Dict[str, Any]:
         """Generate predictions for the current market state.
+
+        Args:
+            df_5m: Recent 5m candles (at least MIN_BARS_5M bars)
+            symbol: Trading pair symbol
+            btc_df_5m: BTC candles for cross-asset features
+            external_data: Dict of external feature values (from ExternalDataProvider)
+            **live_features: Additional live features (regime_id, regime_hours)
 
         Returns:
             dict with keys:
@@ -95,31 +131,33 @@ class MLSignalGenerator:
             "net_down": 0.5,
         }
 
-        # Extract features — supply zero defaults for live market data
+        # Failsafe: if ML signals are disabled, return no signal
+        if self._disabled:
+            return default
+
+        # Build external_data dict from explicit parameter
+        ext = dict(external_data or {})
+
+        regime_id = int(live_features.get("regime_id", 0))
+        regime_hours = live_features.get("regime_hours", 0.0)
+
+        # Extract features
         tabular = extract_tabular_features(
-            df_5m,
-            symbol,
-            btc_df_5m,
-            live_features.get("funding_rate", 0.0),
-            live_features.get("funding_score", 0.0),
-            live_features.get("ob_imbalance", 0.0),
-            live_features.get("spread_pct", 0.0),
-            live_features.get("bid_ask_wall_ratio", 0.0),
-            live_features.get("onchain_composite", 0.0),
-            live_features.get("exchange_reserve_trend", 0.0),
-            int(live_features.get("regime_id", 0)),
-            live_features.get("regime_hours", 0.0),
+            df_5m, symbol, btc_df_5m,
+            external_data=ext,
+            regime_id=regime_id,
+            regime_hours=regime_hours,
         )
         seq = build_lstm_sequence(df_5m)
 
-        # Check for insufficient data (all zeros)
+        # Check for insufficient data
         if np.all(tabular == 0) or np.all(seq == 0):
             return default
 
-        # Get LSTM embedding
-        embedding = self._lstm.embed_numpy(seq)  # (16,)
+        # Get embedding (works for both Transformer and LSTM — same interface)
+        embedding = self._embedder.embed_numpy(seq)  # (16,)
 
-        # Concatenate: 65 tabular + 16 embedding = 81 features
+        # Concatenate: 90 tabular + 16 embedding = 106 features
         combined = np.concatenate([tabular, embedding]).reshape(1, -1)
 
         # Run all 12 XGBoost models
@@ -132,9 +170,8 @@ class MLSignalGenerator:
                 probabilities.append(prob)
 
         # Compute net direction
-        # probabilities layout: [up_30m, down_30m, up_1h, down_1h, ...]
-        up_probs = [probabilities[i] for i in range(0, 12, 2)]  # indices 0,2,4,6,8,10
-        down_probs = [probabilities[i] for i in range(1, 12, 2)]  # indices 1,3,5,7,9,11
+        up_probs = [probabilities[i] for i in range(0, 12, 2)]
+        down_probs = [probabilities[i] for i in range(1, 12, 2)]
         net_up = float(np.mean(up_probs))
         net_down = float(np.mean(down_probs))
 

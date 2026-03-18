@@ -61,25 +61,47 @@ class TestMLSignalGenerator:
         with pytest.raises(FileNotFoundError):
             MLSignalGenerator(model_dir="/nonexistent/path")
 
-    def _make_generator(self, tmp_path):
+    def test_falls_back_to_lstm(self, tmp_path):
+        """When transformer.pt doesn't exist, should load lstm.pt."""
+        from bot.learning.ml_signal_generator import MLSignalGenerator
+        gen = self._make_generator(tmp_path, use_lstm=True)
+        df = _make_5m_candles(2000)
+        result = gen.predict(df, symbol="BTC-EUR")
+        assert "probabilities" in result
+
+    def test_disabled_returns_none_direction(self, tmp_path):
+        """When ML signals are disabled, predict() returns no signal."""
+        from bot.learning.ml_signal_generator import MLSignalGenerator
+        gen = self._make_generator(tmp_path)
+        gen._disabled = True
+        df = _make_5m_candles(2000)
+        result = gen.predict(df, symbol="BTC-EUR")
+        assert result["direction"] is None
+
+    def _make_generator(self, tmp_path, use_lstm=False):
         """Create a generator with dummy models for testing."""
         from bot.learning.ml_signal_generator import MLSignalGenerator
-        from bot.learning.lstm_embedder import LSTMEmbedder
         import xgboost as xgb
 
         model_dir = tmp_path / "ml_signals"
         model_dir.mkdir()
 
-        # Save dummy LSTM
-        lstm = LSTMEmbedder()
-        lstm.save(str(model_dir / "lstm.pt"))
+        if use_lstm:
+            from bot.learning.lstm_embedder import LSTMEmbedder
+            lstm = LSTMEmbedder()
+            lstm.save(str(model_dir / "lstm.pt"))
+        else:
+            from bot.learning.transformer_embedder import TransformerEmbedder
+            transformer = TransformerEmbedder()
+            transformer.save(str(model_dir / "transformer.pt"))
 
-        # Save 12 dummy XGBoost models
+        # Save 12 dummy XGBoost models — 106 features (90 tabular + 16 embed)
+        n_features = 106
         horizons = ["30m", "1h", "4h", "12h", "24h", "72h"]
         directions = ["up", "down"]
         for h in horizons:
             for d in directions:
-                X = np.random.randn(100, 81).astype(np.float32)
+                X = np.random.randn(100, n_features).astype(np.float32)
                 y = np.random.randint(0, 2, 100)
                 model = xgb.XGBClassifier(
                     n_estimators=5, max_depth=2, use_label_encoder=False,
@@ -89,7 +111,7 @@ class TestMLSignalGenerator:
                 model.save_model(str(model_dir / f"xgb_{h}_{d}.json"))
 
         # Save feature config
-        config = {"n_tabular": 65, "n_lstm_embed": 16, "horizons": horizons}
+        config = {"n_tabular": 90, "n_embed": 16, "horizons": horizons}
         (model_dir / "feature_config.json").write_text(json.dumps(config))
 
         return MLSignalGenerator(model_dir=str(model_dir))
