@@ -1,10 +1,9 @@
 """Tests for external data pipeline — fetching, caching, staleness."""
 from __future__ import annotations
 
-import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
