@@ -2,7 +2,7 @@
 
 This module provides three public functions used to feed the ML signal generator:
 
-  extract_tabular_features  — 65-element float32 vector per candle snapshot
+  extract_tabular_features  — 90-element float32 vector per candle snapshot
   build_lstm_sequence       — (96, 7) float32 array covering the last 8 hours
   extract_all_features      — batch extraction across an entire candle history
 """
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # Public constants
 # ---------------------------------------------------------------------------
 
-N_TABULAR: int = 65
+N_TABULAR: int = 90
 MIN_BARS_5M: int = 1500
 
 LSTM_WINDOW: int = 96
@@ -100,36 +100,24 @@ def extract_tabular_features(
     df_5m: pd.DataFrame,
     symbol: str,
     btc_df_5m: pd.DataFrame | None,
-    funding_rate: float,
-    funding_score: float,
-    ob_imbalance: float,
-    spread_pct: float,
-    bid_ask_wall_ratio: float,
-    onchain_composite: float,
-    exchange_reserve_trend: float,
-    regime_id: int,
-    regime_hours: float,
+    external_data: dict | None = None,
+    regime_id: int = 0,
+    regime_hours: float = 0.0,
 ) -> np.ndarray:
-    """Extract 65 tabular features from 5-minute candle data.
+    """Extract 90 tabular features from 5-minute candle data.
 
     Parameters
     ----------
-    df_5m               : DataFrame with open/high/low/close/volume, DatetimeIndex
-    symbol              : trading pair symbol (e.g. "ETHUSDT")
-    btc_df_5m           : BTC 5m candles for cross-asset features (may be None)
-    funding_rate        : current perpetual funding rate (0 in backtest)
-    funding_score       : aggregated funding signal (0 in backtest)
-    ob_imbalance        : order-book bid/ask imbalance (0 in backtest)
-    spread_pct          : bid-ask spread as pct of mid-price (0 in backtest)
-    bid_ask_wall_ratio  : ratio of bid walls to ask walls (0 in backtest)
-    onchain_composite   : on-chain composite signal (0 in backtest)
-    exchange_reserve_trend : exchange reserve trend signal (0 in backtest)
-    regime_id           : market regime class 0-4
-    regime_hours        : hours the bot has been in the current regime
+    df_5m          : DataFrame with open/high/low/close/volume, DatetimeIndex
+    symbol         : trading pair symbol (e.g. "ETHUSDT")
+    btc_df_5m      : BTC 5m candles for cross-asset features (may be None)
+    external_data  : dict of external/live market data (funding, OI, on-chain, macro, etc.)
+    regime_id      : market regime class 0-4
+    regime_hours   : hours the bot has been in the current regime
 
     Returns
     -------
-    np.ndarray of shape (65,) and dtype float32.
+    np.ndarray of shape (90,) and dtype float32.
     All zeros when len(df_5m) < MIN_BARS_5M.
     """
     features = np.zeros(N_TABULAR, dtype=np.float32)
@@ -377,21 +365,17 @@ def extract_tabular_features(
         features[54] = float(profile["is_btc"])
 
         # ================================================================
-        # 55-59  Funding / order-book (zero-filled in backtest)
+        # 55-61  External data (live) — zero-filled in backtest
         # ================================================================
 
-        features[55] = float(np.clip(funding_rate / 0.01, -1.0, 1.0))   # 1% = max
-        features[56] = float(np.clip(funding_score, -1.0, 1.0))
-        features[57] = float(np.clip(ob_imbalance, -1.0, 1.0))
-        features[58] = float(np.clip(spread_pct / 0.01, 0.0, 1.0))      # 1% = max
-        features[59] = float(np.clip(bid_ask_wall_ratio / 5.0, 0.0, 1.0))
-
-        # ================================================================
-        # 60-61  On-chain (zero-filled in backtest)
-        # ================================================================
-
-        features[60] = float(np.clip(onchain_composite, -1.0, 1.0))
-        features[61] = float(np.clip(exchange_reserve_trend, -1.0, 1.0))
+        ext = external_data or {}
+        features[55] = np.clip(ext.get("funding_rate", 0.0), -1.0, 1.0)
+        features[56] = np.clip(ext.get("funding_7d_avg", 0.0), -1.0, 1.0)
+        features[57] = np.clip(ext.get("oi_change_24h", 0.0), -1.0, 1.0)
+        features[58] = np.clip(ext.get("long_liq_24h", 0.0), -1.0, 1.0)
+        features[59] = np.clip(ext.get("short_liq_24h", 0.0), -1.0, 1.0)
+        features[60] = np.clip(ext.get("exchange_netflow", 0.0), -1.0, 1.0)
+        features[61] = np.clip(ext.get("active_addr_change", 0.0), -1.0, 1.0)
 
         # ================================================================
         # 62-64  Cross-asset (BTC)
@@ -411,6 +395,36 @@ def extract_tabular_features(
                     features[64] = float(np.clip(corr if math.isfinite(corr) else 0.0, -1.0, 1.0))
                 except Exception:
                     features[64] = 0.0
+
+        # ================================================================
+        # 65-89  Extended external features
+        # ================================================================
+
+        features[65] = np.clip(ext.get("fear_greed", 0.0), 0.0, 1.0)
+        features[66] = np.clip(ext.get("fear_greed_mom", 0.0), -1.0, 1.0)
+        features[67] = np.clip(ext.get("gtrends_bitcoin", 0.0), 0.0, 1.0)
+        features[68] = np.clip(ext.get("gtrends_crypto", 0.0), 0.0, 1.0)
+        features[69] = np.clip(ext.get("dxy_return", 0.0), -1.0, 1.0)
+        features[70] = np.clip(ext.get("sp500_return", 0.0), -1.0, 1.0)
+        features[71] = np.clip(ext.get("gold_return", 0.0), -1.0, 1.0)
+        features[72] = np.clip(ext.get("vix", 0.0), 0.0, 1.0)
+        features[73] = np.clip(ext.get("treasury_10y", 0.0), 0.0, 1.0)
+        features[74] = np.clip(ext.get("yield_spread", 0.0), -1.0, 1.0)
+        features[75] = np.clip(ext.get("nvt", 0.0), 0.0, 1.0)
+        features[76] = np.clip(ext.get("mvrv", 0.0), 0.0, 1.0)
+        features[77] = np.clip(ext.get("sopr", 0.0), -1.0, 1.0)
+        features[78] = np.clip(ext.get("puell", 0.0), 0.0, 1.0)
+        features[79] = np.clip(ext.get("hashrate", 0.0), -1.0, 1.0)
+        features[80] = np.clip(ext.get("eth_active_addr", 0.0), -1.0, 1.0)
+        features[81] = np.clip(ext.get("stable_supply_change", 0.0), -1.0, 1.0)
+        features[82] = np.clip(ext.get("tvl_change", 0.0), -1.0, 1.0)
+        features[83] = np.clip(ext.get("oi_change_7d", 0.0), -1.0, 1.0)
+        features[84] = np.clip(ext.get("liq_ratio", 0.0), 0.0, 1.0)
+        features[85] = np.clip(ext.get("taker_buy_ratio", 0.0), 0.0, 1.0)
+        features[86] = np.clip(ext.get("dvol", 0.0), 0.0, 1.0)
+        features[87] = np.clip(ext.get("funding_24h_avg", 0.0), -1.0, 1.0)
+        features[88] = np.clip(ext.get("btc_dom_change", 0.0), -1.0, 1.0)
+        features[89] = np.clip(ext.get("stable_btc_ratio", 0.0), 0.0, 1.0)
 
     except Exception as exc:
         logger.warning("extract_tabular_features failed for %s: %s", symbol, exc, exc_info=True)
@@ -687,22 +701,24 @@ def _batch_extract_tabular(
     symbol: str,
     btc_df_5m: pd.DataFrame | None,
     sample_indices: np.ndarray,
+    external_features: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Extract 65 tabular features at multiple sample points using precomputed indicators.
+    """Extract 90 tabular features at multiple sample points using precomputed indicators.
 
     Fully vectorized: indicators are computed once on the full DataFrame, then
     features for all sample points are assembled via numpy fancy-indexing.
 
     Parameters
     ----------
-    df_5m           : full 5m DataFrame
-    symbol          : trading pair symbol
-    btc_df_5m       : BTC 5m DataFrame (may be None)
-    sample_indices  : integer indices into df_5m (0-based)
+    df_5m              : full 5m DataFrame
+    symbol             : trading pair symbol
+    btc_df_5m          : BTC 5m DataFrame (may be None)
+    sample_indices     : integer indices into df_5m (0-based)
+    external_features  : optional (len(df_5m), 32) array of external data for training
 
     Returns
     -------
-    np.ndarray of shape (len(sample_indices), 65), dtype float32.
+    np.ndarray of shape (len(sample_indices), 90), dtype float32.
     """
     logger.info("Precomputing indicators on %d bars for %s...", len(df_5m), symbol)
     pc = _precompute_indicators(df_5m, btc_df_5m)
@@ -816,7 +832,13 @@ def _batch_extract_tabular(
     features[:, 53] = float(np.clip(profile["age"] / 16.0, 0.0, 1.0))
     features[:, 54] = float(profile["is_btc"])
 
-    # 55-61: Funding/OB/on-chain — all zeros in batch (no live data)
+    # ---- 55-61: External data (populated from external_features during training) ----
+    # ---- 65-89: Extended external features ----
+    if external_features is not None:
+        # external_features shape: (len(df_5m), 32) — 7 cols for indices 55-61 + 25 cols for 65-89
+        ext_at_samples = external_features[idx]  # (ns, 32)
+        features[:, 55:62] = ext_at_samples[:, :7]   # funding, OI, liq, netflow, active_addr
+        features[:, 65:90] = ext_at_samples[:, 7:32]  # 25 extended features
 
     # ---- 62-64: Cross-asset (BTC) ----
     features[:, 62] = g(pc["btc_return_1h"])
@@ -839,6 +861,7 @@ def extract_all_features(
     df_5m: pd.DataFrame,
     symbol: str,
     btc_df_5m: pd.DataFrame | None,
+    external_features: np.ndarray | None = None,
 ) -> Tuple[np.ndarray, np.ndarray, List]:
     """Batch feature extraction for training.
 
@@ -847,14 +870,15 @@ def extract_all_features(
 
     Parameters
     ----------
-    df_5m       : full history of 5-minute candles
-    symbol      : trading pair symbol
-    btc_df_5m   : BTC 5m candle history (may be None)
+    df_5m              : full history of 5-minute candles
+    symbol             : trading pair symbol
+    btc_df_5m          : BTC 5m candle history (may be None)
+    external_features  : optional (len(df_5m), 32) array of external data for training
 
     Returns
     -------
     Tuple of:
-        tabular_array   — shape (N, 65),  dtype float32
+        tabular_array   — shape (N, 90),  dtype float32
         sequence_array  — shape (N, 96, 7), dtype float32
         timestamps_list — list of N pandas Timestamps
     """
@@ -875,7 +899,7 @@ def extract_all_features(
         return empty
 
     # Vectorized tabular feature extraction (indicators computed once)
-    tabular = _batch_extract_tabular(df_5m, symbol, btc_df_5m, sample_indices)
+    tabular = _batch_extract_tabular(df_5m, symbol, btc_df_5m, sample_indices, external_features)
 
     # LSTM sequences (per-point — each uses a small 116-bar window, fast)
     sequence_list: List[np.ndarray] = []

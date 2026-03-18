@@ -33,26 +33,26 @@ def _make_5m_candles(bars: int = 2000) -> pd.DataFrame:
 class TestExtractTabularFeatures:
     """Tests for extract_tabular_features()."""
 
-    def test_output_shape_is_65(self):
+    def test_output_shape_is_90(self):
         from bot.learning.ml_features import extract_tabular_features, N_TABULAR
 
-        assert N_TABULAR == 65
+        assert N_TABULAR == 90
         df = _make_5m_candles(2000)
-        result = extract_tabular_features(df, "ETHUSDT", None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0)
-        assert result.shape == (65,), f"Expected (65,), got {result.shape}"
+        result = extract_tabular_features(df, "ETHUSDT", None, external_data={})
+        assert result.shape == (90,), f"Expected (90,), got {result.shape}"
 
     def test_output_dtype_float32(self):
         from bot.learning.ml_features import extract_tabular_features
 
         df = _make_5m_candles(2000)
-        result = extract_tabular_features(df, "ETHUSDT", None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0)
+        result = extract_tabular_features(df, "ETHUSDT", None, external_data={})
         assert result.dtype == np.float32, f"Expected float32, got {result.dtype}"
 
     def test_all_finite(self):
         from bot.learning.ml_features import extract_tabular_features
 
         df = _make_5m_candles(2000)
-        result = extract_tabular_features(df, "ETHUSDT", None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0)
+        result = extract_tabular_features(df, "ETHUSDT", None, external_data={})
         assert np.all(np.isfinite(result)), f"Non-finite values found: {result[~np.isfinite(result)]}"
 
     def test_different_symbols_change_coin_features(self):
@@ -60,8 +60,8 @@ class TestExtractTabularFeatures:
         from bot.learning.ml_features import extract_tabular_features
 
         df = _make_5m_candles(2000)
-        btc_features = extract_tabular_features(df, "BTCUSDT", None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0)
-        eth_features = extract_tabular_features(df, "ETHUSDT", None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0)
+        btc_features = extract_tabular_features(df, "BTCUSDT", None, external_data={})
+        eth_features = extract_tabular_features(df, "ETHUSDT", None, external_data={})
         # At minimum is_btc flag (index 54) should differ
         assert btc_features[54] != eth_features[54], "is_btc flag should differ between BTC and ETH"
 
@@ -70,7 +70,7 @@ class TestExtractTabularFeatures:
 
         # Use fewer bars than the minimum
         df = _make_5m_candles(MIN_BARS_5M - 1)
-        result = extract_tabular_features(df, "ETHUSDT", None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0)
+        result = extract_tabular_features(df, "ETHUSDT", None, external_data={})
         assert np.all(result == 0.0), "Should return all zeros for insufficient data"
 
     def test_live_features_zero_filled_funding_ob(self):
@@ -78,7 +78,7 @@ class TestExtractTabularFeatures:
         from bot.learning.ml_features import extract_tabular_features
 
         df = _make_5m_candles(2000)
-        result = extract_tabular_features(df, "ETHUSDT", None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0)
+        result = extract_tabular_features(df, "ETHUSDT", None, external_data={})
         assert np.all(result[55:60] == 0.0), f"Expected funding/OB features to be 0, got {result[55:60]}"
 
     def test_live_features_zero_filled_onchain(self):
@@ -86,7 +86,7 @@ class TestExtractTabularFeatures:
         from bot.learning.ml_features import extract_tabular_features
 
         df = _make_5m_candles(2000)
-        result = extract_tabular_features(df, "ETHUSDT", None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0)
+        result = extract_tabular_features(df, "ETHUSDT", None, external_data={})
         assert np.all(result[60:62] == 0.0), f"Expected on-chain features to be 0, got {result[60:62]}"
 
     def test_regime_one_hot_encoding(self):
@@ -95,7 +95,7 @@ class TestExtractTabularFeatures:
 
         df = _make_5m_candles(2000)
         # regime_id=2 should set index 31 to 1.0 (29+2)
-        result = extract_tabular_features(df, "ETHUSDT", None, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2, 5.0)
+        result = extract_tabular_features(df, "ETHUSDT", None, external_data={}, regime_id=2, regime_hours=5.0)
         regime_one_hot = result[29:34]
         assert regime_one_hot.sum() == 1.0, f"One-hot should sum to 1, got {regime_one_hot}"
         assert result[29 + 2] == 1.0, f"Expected index 31 to be 1, got {result[29 + 2]}"
@@ -106,7 +106,7 @@ class TestExtractTabularFeatures:
 
         df = _make_5m_candles(2000)
         btc_df = _make_5m_candles(2000)
-        result = extract_tabular_features(df, "ETHUSDT", btc_df, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0)
+        result = extract_tabular_features(df, "ETHUSDT", btc_df, external_data={})
         # BTC 1h return (index 62) should not be zero given random price data
         assert np.any(result[62:65] != 0.0), "Cross-asset features should be populated when BTC df provided"
 
@@ -196,13 +196,13 @@ class TestExtractAllFeatures:
             f"sequences={len(sequences)}, timestamps={len(timestamps)}"
         )
 
-    def test_tabular_shape_n_65(self):
+    def test_tabular_shape_n_90(self):
         from bot.learning.ml_features import extract_all_features
 
         df = _make_5m_candles(2000)
         tabular, sequences, timestamps = extract_all_features(df, "ETHUSDT", None)
         assert len(tabular) > 0, "Should produce at least one sample"
-        assert tabular.shape[1] == 65, f"Expected 65 tabular features, got {tabular.shape[1]}"
+        assert tabular.shape[1] == 90, f"Expected 90 tabular features, got {tabular.shape[1]}"
 
     def test_sequence_shape_n_96_7(self):
         from bot.learning.ml_features import extract_all_features
