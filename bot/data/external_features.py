@@ -139,7 +139,7 @@ def _fetch_macro_yfinance(start: datetime, end: datetime) -> dict[str, pd.DataFr
     try:
         import yfinance as yf
         tickers = {
-            "dxy": "DX-Y.NYB",
+            "dxy": "DX=F",
             "sp500": "^GSPC",
             "gold": "GC=F",
             "vix": "^VIX",
