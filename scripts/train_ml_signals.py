@@ -214,12 +214,16 @@ def main():
         ts_indices = [df.index.get_loc(ts) for ts in timestamps]
         label_rows = labels[ts_indices]
 
-        # Batch embedding extraction (faster than per-sequence)
+        # Batch embedding extraction in chunks (GPU memory limited)
         import torch
         device = next(lstm.parameters()).device
-        seq_tensor = torch.from_numpy(sequences).float().to(device)
+        EMB_BATCH = 4096
+        emb_parts = []
         with torch.no_grad():
-            embeddings = lstm.embed(seq_tensor).cpu().numpy()
+            for eb_start in range(0, len(sequences), EMB_BATCH):
+                chunk = torch.from_numpy(sequences[eb_start:eb_start + EMB_BATCH]).float().to(device)
+                emb_parts.append(lstm.embed(chunk).cpu().numpy())
+        embeddings = np.vstack(emb_parts)
 
         all_tabular.append(tabular)
         all_labels.append(label_rows)
