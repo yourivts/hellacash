@@ -676,7 +676,15 @@ class ExternalDataProvider:
                     if isinstance(btc_hist.columns, pd.MultiIndex):
                         btc_hist.columns = btc_hist.columns.get_level_values(0)
                     btc_mcap = btc_hist["Close"] * 19_800_000
-                    stable_aligned = stable_df["value"].reindex(btc_mcap.index, method="ffill").fillna(0)
+                    # Normalize index dtypes to avoid datetime64 resolution mismatch
+                    stable_vals = stable_df["value"].copy()
+                    if stable_vals.index.tz is None:
+                        stable_vals.index = stable_vals.index.tz_localize("UTC")
+                    if btc_mcap.index.tz is None:
+                        btc_mcap.index = btc_mcap.index.tz_localize("UTC")
+                    stable_vals.index = stable_vals.index.as_unit("ns")
+                    btc_mcap.index = btc_mcap.index.as_unit("ns")
+                    stable_aligned = stable_vals.reindex(btc_mcap.index, method="ffill").fillna(0)
                     ratio = (stable_aligned / btc_mcap.replace(0, np.nan)).fillna(0).clip(0, 1)
                     result["stable_btc_ratio"] = align_to_5m(ratio, idx_5m)
                 else:
