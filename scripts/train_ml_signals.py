@@ -333,24 +333,44 @@ def main():
 
     # Step 3: Build Transformer training data
     print("\n  Building Transformer training data...")
-    all_seqs = []
-    all_transformer_targets = []
     STRIDE = 6
     WINDOW_PAD = 300
+
+    # Pass 1: count total sequences to pre-allocate arrays (avoids MemoryError)
+    total_count = 0
+    pair_counts = {}
+    for pair, df in all_dfs.items():
+        n_pair = len(df) - TRANSFORMER_PREDICT_BARS
+        count = 0
+        for i in range(LSTM_MIN_BARS, n_pair, STRIDE):
+            count += 1
+        pair_counts[pair] = count
+        total_count += count
+    print(f"  Pre-allocating arrays for ~{total_count:,} sequences...")
+
+    # Pre-allocate contiguous arrays
+    seqs_arr = np.zeros((total_count, 96, 7), dtype=np.float32)
+    targets_arr = np.zeros((total_count, TRANSFORMER_PREDICT_BARS * 5), dtype=np.float32)
+    write_idx = 0
+    valid_count = 0
+
+    # Pass 2: fill arrays in-place
     for pair, df in all_dfs.items():
         targets = build_lstm_targets(df)
         n_pair = len(df) - TRANSFORMER_PREDICT_BARS
-        count_before = len(all_seqs)
+        count_before = valid_count
         for i in range(LSTM_MIN_BARS, n_pair, STRIDE):
             window_start = max(0, i + 1 - WINDOW_PAD)
             seq = build_lstm_sequence(df.iloc[window_start:i + 1])
             if not np.all(seq == 0):
-                all_seqs.append(seq)
-                all_transformer_targets.append(targets[i])
-        print(f"    {pair}: {len(all_seqs) - count_before:,} sequences ({len(all_seqs):,} total)")
+                seqs_arr[valid_count] = seq
+                targets_arr[valid_count] = targets[i]
+                valid_count += 1
+        print(f"    {pair}: {valid_count - count_before:,} sequences ({valid_count:,} total)")
 
-    seqs_arr = np.stack(all_seqs)
-    targets_arr = np.stack(all_transformer_targets)
+    # Trim to actual valid count
+    seqs_arr = seqs_arr[:valid_count]
+    targets_arr = targets_arr[:valid_count]
     print(f"  Total Transformer samples: {len(seqs_arr):,}")
 
     val_cutoff = int(len(seqs_arr) * 0.88)
