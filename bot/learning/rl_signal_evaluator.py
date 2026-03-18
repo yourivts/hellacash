@@ -21,7 +21,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-OBS_DIM = 32  # 12 market + 6 signal + 10 portfolio + 4 coin
+OBS_DIM = 30  # 12 ML predictions + 4 cross-horizon + 10 portfolio + 4 coin
 ACT_DIM = 3
 CONF_THRESHOLD = 0.3
 HIDDEN = 64
@@ -32,12 +32,6 @@ LR = 3e-4
 PPO_EPOCHS = 4
 ENTROPY_COEF = 0.01
 VALUE_COEF = 0.5
-
-# Strategy name -> normalized ID
-STRATEGY_IDS = {
-    "orderflow": 0, "funding_contrarian": 1, "range": 2, "squeeze": 3,
-    "breakout": 4, "trend_following": 5, "momentum": 6, "mean_reversion": 7,
-}
 
 # ---------------------------------------------------------------------------
 # Coin profile data (static features the model can use to distinguish coins)
@@ -92,6 +86,7 @@ class EvalResult:
     take_trade: bool = False
 
 
+# LEGACY: will be removed once ML signal path is fully wired
 def build_signal_obs(
     # Market context (from pre-computed arrays in the engine)
     rsi_1h: float = 50.0,
@@ -146,7 +141,11 @@ def build_signal_obs(
     # Signal info (6 features, indices 12-17)
     obs[12] = direction_sign
     obs[13] = np.clip(strength, 0.0, 1.0)
-    obs[14] = STRATEGY_IDS.get(strategy_name, 0) / 7.0
+    _strategy_ids = {
+        "orderflow": 0, "funding_contrarian": 1, "range": 2, "squeeze": 3,
+        "breakout": 4, "trend_following": 5, "momentum": 6, "mean_reversion": 7,
+    }
+    obs[14] = _strategy_ids.get(strategy_name, 0) / 7.0
     obs[15] = np.clip(tf_score / 3.0, 0.0, 1.0)
     obs[16] = np.clip(consecutive_confirms / 5.0, 0.0, 1.0)
     obs[17] = strength  # duplicate raw for the network to use freely
@@ -169,6 +168,72 @@ def build_signal_obs(
     obs[29] = coin["vol_class"] / 2.0         # volatility class (0-1)
     obs[30] = np.clip(coin["age"] / 16.0, 0.0, 1.0)  # coin maturity
     obs[31] = coin["is_btc"]                  # BTC flag (0 or 1)
+
+    return obs
+
+
+def build_ml_signal_obs(
+    # ML predictions (12 probabilities)
+    probabilities: list[float] | None = None,
+    # Portfolio state (10 features)
+    equity_ratio: float = 1.0,
+    drawdown_pct: float = 0.0,
+    open_pos_ratio: float = 0.0,
+    win_rate_recent: float = 0.5,
+    avg_pnl_recent: float = 0.0,
+    bars_since_trade: int = 100,
+    balance_ratio: float = 1.0,
+    recent_loss_streak: int = 0,
+    total_trades: int = 0,
+    recent_sharpe: float = 0.0,
+    # Coin markers
+    symbol: str = "BTC-EUR",
+) -> np.ndarray:
+    """Build a 30-dim observation vector from ML predictions + portfolio state.
+
+    Layout:
+        0-11:  ML predictions (prob_up/down × 6 horizons)
+        12-15: Cross-horizon features (max_prob, min_prob, horizon_agreement, trend_alignment)
+        16-25: Portfolio state
+        26-29: Coin markers
+    """
+    obs = np.zeros(OBS_DIM, dtype=np.float32)
+    probs = probabilities if probabilities is not None else [0.5] * 12
+
+    # ML predictions (12 features, indices 0-11)
+    for i in range(min(12, len(probs))):
+        obs[i] = np.clip(probs[i], 0.0, 1.0)
+
+    # Cross-horizon features (4 features, indices 12-15)
+    obs[12] = max(probs)                              # max_prob
+    obs[13] = min(probs)                              # min_prob
+    up_probs = [probs[i] for i in range(0, 12, 2)]
+    down_probs = [probs[i] for i in range(1, 12, 2)]
+    up_votes = sum(1 for p in up_probs if p > 0.5)
+    down_votes = sum(1 for p in down_probs if p > 0.5)
+    obs[14] = max(up_votes, down_votes) / 6.0         # horizon_agreement (0-1)
+    net_up = np.mean(up_probs)
+    net_down = np.mean(down_probs)
+    obs[15] = np.clip(net_up - net_down, -1.0, 1.0)   # trend_alignment
+
+    # Portfolio state (10 features, indices 16-25)
+    obs[16] = np.clip(equity_ratio, 0.0, 3.0) / 3.0
+    obs[17] = np.clip(drawdown_pct / 20.0, 0.0, 1.0)
+    obs[18] = np.clip(open_pos_ratio, 0.0, 1.0)
+    obs[19] = np.clip(win_rate_recent, 0.0, 1.0)
+    obs[20] = np.clip(avg_pnl_recent / 5.0, -1.0, 1.0)
+    obs[21] = np.clip(bars_since_trade / 500.0, 0.0, 1.0)
+    obs[22] = np.clip(balance_ratio, 0.0, 3.0) / 3.0
+    obs[23] = np.clip(recent_loss_streak / 10.0, 0.0, 1.0)
+    obs[24] = np.clip(total_trades / 500.0, 0.0, 1.0)
+    obs[25] = np.clip(recent_sharpe / 3.0, -1.0, 1.0)
+
+    # Coin markers (4 features, indices 26-29)
+    coin = get_coin_profile(symbol)
+    obs[26] = coin["cap_tier"] / 3.0
+    obs[27] = coin["vol_class"] / 2.0
+    obs[28] = np.clip(coin["age"] / 16.0, 0.0, 1.0)
+    obs[29] = coin["is_btc"]
 
     return obs
 
