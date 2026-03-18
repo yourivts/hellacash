@@ -49,20 +49,42 @@ Two modes of operation:
 - Live: in-memory dict with last-fetched timestamp per source
 - Cache is reused across training runs (skip fetch if parquet exists and covers the date range)
 
+### Data alignment rules
+- All external data is aligned to the 5m candle DatetimeIndex via `reindex(idx_5m, method='ffill')`
+- Daily data (Fear & Greed, macro, on-chain): value applies to all 5m bars on that UTC date
+- Weekly data (Google Trends): forward-filled across the week
+- 8-hourly data (funding rates): forward-filled to 5m
+- Macro market data (DXY, S&P, yields): uses previous trading day's close to avoid look-ahead bias (markets close at ~21:00 UTC)
+- Periods before a data source's inception: filled with 0.0 (XGBoost natively handles this as missing data)
+- Deribit DVOL: only available since March 2021; earlier periods filled with 0.0
+
+### Source reliability notes
+- **Google Trends (pytrends)**: Unreliable — frequently rate-limited (429 errors). Treated as optional in both training and live modes. Training retries up to 3 times with exponential backoff; on failure, features 67-68 are zero-filled. Live mode uses last cached weekly value (staleness threshold = 7 days).
+- **Coinalyze**: Requires free API key. Key stored in environment variable `COINALYZE_API_KEY`. If key is not configured, OI/liquidation features are zero-filled and a warning is logged. Training continues without this source.
+- **BGeometrics**: Lesser-known provider. If unavailable, fall back to Blockchain.com Charts API for hashrate/difficulty. NVT/MVRV/SOPR features zero-filled if both sources fail.
+- **BTC dominance (index 88)**: Computed as `BTC market cap / total crypto market cap` using CoinGecko `/global` endpoint. If unavailable, derived from yfinance BTC-USD market cap vs total crypto ETF proxies. Zero-filled on failure.
+
 ---
 
 ## 2. Extended Feature Engineering
 
 ### N_TABULAR: 65 → 90
 
-**Existing slots now populated during training (indices 55-61):**
-- 55: Funding rate current (Binance, scaled by 0.01)
-- 56: Funding rate 7d average
-- 57: OI change 24h (scaled)
-- 58: Long liquidations 24h (scaled)
-- 59: Short liquidations 24h (scaled)
-- 60: BTC exchange netflow (BGeometrics, scaled)
-- 61: Active addresses change 7d (CoinMetrics, scaled)
+**Existing slots redefined (indices 55-61):**
+
+The live bot currently passes funding_rate, funding_score, ob_imbalance, spread_pct, bid_ask_wall_ratio, onchain_composite, exchange_reserve_trend into these slots. The semantics change as follows:
+
+| Index | Old Meaning | New Meaning | Migration |
+|-------|-------------|-------------|-----------|
+| 55 | funding_rate (kept) | Funding rate current (Binance) | Same semantic, now populated in training too |
+| 56 | funding_score | Funding rate 7d average | Live bot updated to compute 7d avg |
+| 57 | ob_imbalance | OI change 24h | Live bot fetches from Binance/Coinalyze |
+| 58 | spread_pct | Long liquidations 24h | Live bot fetches from Binance |
+| 59 | bid_ask_wall_ratio | Short liquidations 24h | Live bot fetches from Binance |
+| 60 | onchain_composite | BTC exchange netflow | Live bot fetches from BGeometrics |
+| 61 | exchange_reserve_trend | Active addresses change 7d | Live bot fetches from CoinMetrics |
+
+The `extract_tabular_features()` function signature changes: the individual float params (funding_rate, funding_score, etc.) are replaced with a single `external_data: dict` parameter. The live bot's trading loop is updated to build this dict from the external data provider.
 
 **New features (indices 65-89):**
 
@@ -82,7 +104,7 @@ Two modes of operation:
 | 76 | BTC MVRV ratio | BGeometrics | 0-1 (scaled by 5) |
 | 77 | BTC SOPR | BGeometrics | -1 to 1 (centered at 1.0) |
 | 78 | BTC Puell Multiple | BGeometrics | 0-1 (scaled by 4) |
-| 79 | BTC hashrate change 30d | Blockchain.com | -1 to 1 |
+| 79 | BTC hashrate change 30d | BGeometrics (fallback: Blockchain.com) | -1 to 1 |
 | 80 | ETH active addresses change 7d | CoinMetrics | -1 to 1 |
 | 81 | USDT supply change 7d | DefiLlama | -1 to 1 |
 | 82 | DeFi total TVL change 7d | DefiLlama | -1 to 1 |
@@ -97,7 +119,7 @@ Two modes of operation:
 **Total XGBoost input: 90 tabular + 16 Transformer embeddings = 106 features.**
 
 ### Changes to existing code
-- `ml_features.py`: Update `N_TABULAR = 90`, extend `extract_tabular_features()` signature to accept external data dict, update `_precompute_indicators()` and `_batch_extract_tabular()` for training
+- `ml_features.py`: Update `N_TABULAR = 90`, extend `extract_tabular_features()` signature to accept `external_data: dict` parameter, update `_precompute_indicators()` and `_batch_extract_tabular()` to accept and merge external data arrays at the correct indices
 - `ml_signal_generator.py`: Pass external data to feature extraction
 - `trading_loop.py`: Fetch external data and pass to ML signal generator
 - All tests updated for new feature count
@@ -123,10 +145,12 @@ Input: (batch, 96, 7)
       dropout=0.1,
       batch_first=True,
     )
-  → MeanPooling(dim=1) → (batch, 64)        # aggregate
-  → Linear(64 → 16) + ReLU → embedding      # project to embed dim
-  → Linear(64 → 60)                          # prediction head (discarded after training)
+  → MeanPooling(dim=1) → (batch, 64)        # aggregate (h_pooled)
+  ┌─→ Linear(64 → 16) + ReLU → embedding    # embed branch (from h_pooled)
+  └─→ Linear(64 → 60)                       # predict branch (from h_pooled, discarded after training)
 ```
+
+Both the embedding projection and the prediction head branch from the same 64-dim mean-pooled output (`h_pooled`). The prediction head is only used during self-supervised training and is discarded afterward.
 
 **Design choices:**
 - d_model=64, 4 heads (16-dim per head) — fits 8GB VRAM
@@ -161,7 +185,7 @@ This tells XGBoost to penalize false negatives proportionally to class imbalance
 
 ### 4b. Threshold tuning
 
-Before XGBoost training, search for optimal thresholds per horizon:
+After Transformer training (embeddings needed for F1 evaluation), search for optimal thresholds per horizon:
 - For each horizon (30m, 1h, 4h, 12h, 24h, 72h), try thresholds from 50% to 150% of the current value in 10 steps
 - Compute labels with each threshold
 - Pick threshold that maximizes validation **F1 score** of a quick XGBoost run (100 estimators, no HPO)
@@ -171,13 +195,14 @@ Before XGBoost training, search for optimal thresholds per horizon:
 
 **Transformer HPO (20 trials):**
 - `d_model`: [32, 64, 128]
-- `n_heads`: [2, 4, 8]
+- `n_heads`: [2, 4, 8] (constrained: n_heads must divide d_model)
 - `n_layers`: [2, 3, 4, 6]
 - `dropout`: [0.05, 0.1, 0.15, 0.2, 0.3]
 - `lr`: [5e-4, 1e-3, 2e-3]
 - Objective: validation MSE loss
+- VRAM management: batch size is reduced proportionally for larger d_model configs (d_model=128 uses half the default batch size). Trials that OOM are pruned automatically via Optuna's `TrialPruned` exception.
 
-**XGBoost HPO (50 trials per model, or 30 shared + per-model fine-tune):**
+**XGBoost HPO (30 shared trials on 4h_up, then 10 fine-tune trials per model):**
 - `max_depth`: int [4, 10]
 - `learning_rate`: float [0.01, 0.2] (log scale)
 - `n_estimators`: int [200, 1000]
@@ -230,6 +255,15 @@ STALENESS_THRESHOLDS = {
 - Log alert: "ML signals disabled: {n}/{total} data sources stale"
 - Auto-re-enable when freshness recovers below 30%
 - Bot continues operating without ML signals (no trades from ML path)
+
+---
+
+## 6. Backward Compatibility & Rollback
+
+- **Model loading**: `ml_signal_generator.py` tries `transformer.pt` first, falls back to `lstm.pt`. This allows rolling back to the LSTM by simply deleting `transformer.pt`.
+- **Feature count**: `feature_config.json` stores `n_tabular` (90) and `n_embed` (16). The signal generator reads these at load time. Old models with `n_tabular=65` still load correctly — the generator checks the config and uses the matching feature extraction path.
+- **External data unavailable**: If the external data provider fails entirely at startup, the bot logs a warning and runs with zero-filled external features (indices 55-89). This matches training behavior for pre-inception periods.
+- **Config key**: `feature_config.json` uses `n_embed` (generic) instead of `n_lstm_embed` to be architecture-agnostic.
 
 ---
 
