@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-_OBS_DIM = 32           # 27 market features + 5 performance context
+_OBS_DIM = 30           # 27 market features + 3 performance context
 _PERF_DIM = 5           # cumulative performance features
 _BARS_PER_DAY = 288     # 24h * 60min / 5min
 _MIN_SEGMENT_BARS = 100 # minimum usable segment length
@@ -600,10 +600,10 @@ class GpuTradingVecEnv(VecEnv):
     # ------------------------------------------------------------------
 
     def _build_obs(self, env_idx: int, segment: int) -> np.ndarray:
-        """Build the 32-dim observation for *env_idx* at the given segment.
+        """Build the 30-dim observation for *env_idx* at the given segment.
 
         First 27 dims: market features from the pre-computed bank.
-        Last 5 dims: normalised cumulative performance context.
+        Last 3 dims: normalised cumulative performance context.
         """
         obs = np.zeros(_OBS_DIM, dtype=np.float32)
 

@@ -280,8 +280,8 @@ class TradingParamEnv(gymnasium.Env):
         self._validation_mode = validation_mode
         self._n_segments = n_segments
 
-        # Observation: 27 market features + 5 performance features (multi-step)
-        obs_dim = 32 if n_segments > 1 else 27
+        # Observation: 27 market features + 3 performance features (multi-step)
+        obs_dim = 30 if n_segments > 1 else 27
         self.observation_space = spaces.Box(
             low=-1.0, high=1.0, shape=(obs_dim,), dtype=np.float32,
         )
@@ -659,7 +659,7 @@ class TradingParamEnv(gymnasium.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        obs_dim = 32 if self._n_segments > 1 else 27
+        obs_dim = 30 if self._n_segments > 1 else 27
         if not self._windows:
             self._current_obs = np.zeros(obs_dim, dtype=np.float32)
             return self._current_obs, {}

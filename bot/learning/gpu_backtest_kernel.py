@@ -182,7 +182,7 @@ void backtest_kernel(
     #define STRAT_MOMENTUM  6
     #define STRAT_MEANREV   7
     #define WARMUP_BARS    60
-    #define SIGNAL_EVERY   12
+    #define SIGNAL_EVERY   6
     #define INITIAL_CAPITAL 10000.0
     #define SLIPPAGE_PCT   0.0005
 
