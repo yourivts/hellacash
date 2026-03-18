@@ -681,6 +681,13 @@ class TradingLoop:
         equity = portfolio.get_equity_eur()
         drawdown.update(equity)
 
+        # Refresh external data once per evaluation cycle (before symbol loop)
+        if self._ext_data_provider is not None:
+            try:
+                self._ext_data_provider.refresh_live()
+            except Exception as e:
+                logger.warning("External data refresh failed: %s", e)
+
         for symbol in list(tradeable_symbols):
             try:
                 df_5m = self.candle_cache.get_df(symbol, "5m")
@@ -779,13 +786,6 @@ class TradingLoop:
                     orderbook_imbalance=orderbook_imb,
                     market_regime=regime,
                 )
-
-                # Refresh external data (once per evaluation cycle)
-                if self._ext_data_provider is not None:
-                    try:
-                        self._ext_data_provider.refresh_live()
-                    except Exception as e:
-                        logger.warning("External data refresh failed: %s", e)
 
                 # --- ML signal path (replaces strategy router when ml_signal_generator is set) ---
                 if self._ml_signal_generator is not None:

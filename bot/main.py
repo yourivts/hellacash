@@ -307,7 +307,7 @@ def _get_ml_signal_generator():
         )
 
 
-_ext_data_provider = None
+_ext_data_provider: Optional[Any] = None
 
 def _get_ext_data_provider():
     """Initialize external data provider for live features."""
