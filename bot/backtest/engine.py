@@ -118,6 +118,9 @@ class BacktestEngine:
         target_strategy: Optional[str] = None,
         df: Optional[pd.DataFrame] = None,
         symbol: Optional[str] = None,
+        ml_signal_generator: Optional[Any] = None,
+        signal_evaluator: Optional[Any] = None,
+        online_learning: bool = False,
     ) -> None:
         # Accept either a raw candle list OR a pre-built DataFrame directly.
         # When df is provided the expensive _to_dataframe() / dict round-trip
@@ -185,6 +188,13 @@ class BacktestEngine:
         self._trade_regime: Dict[int, str] = {}  # pos id -> regime at entry
 
         self._router = StrategyRouter()
+
+        # ML signal generator (replaces strategy router when set)
+        self._ml_signal_generator = ml_signal_generator
+        self._signal_evaluator = signal_evaluator
+        self._online_learning = online_learning
+        self._loss_streak: int = 0
+        self._last_trade_close_bar_for_rl: int = -100
 
     # ------------------------------------------------------------------
     # Public API
@@ -413,6 +423,109 @@ class BacktestEngine:
                 equity_curve.append(current_equity)
                 continue
 
+            # --- ML signal path (replaces strategy router when ml_signal_generator is set) ---
+            if self._ml_signal_generator is not None:
+                # Build DataFrame window for ML prediction
+                ml_window_start = max(0, i - 2000)
+                ml_df = df.iloc[ml_window_start:i + 1]
+                ml_result = self._ml_signal_generator.predict(
+                    ml_df, symbol=symbol,
+                )
+                direction = ml_result.get("direction")
+                if direction is None or direction not in ("LONG", "SHORT"):
+                    equity_curve.append(current_equity)
+                    continue
+
+                if len(self.positions) >= self.max_open:
+                    equity_curve.append(current_equity)
+                    continue
+
+                self._signals_generated += 1
+
+                # RL Signal Evaluator: gate on ML predictions
+                if self._signal_evaluator is not None:
+                    from bot.learning.rl_signal_evaluator import build_ml_signal_obs
+                    _eq = self._equity(current_price)
+                    _eq_ratio = _eq / self.initial_capital if self.initial_capital > 0 else 1.0
+                    _dd_pct = ((self.peak_balance - _eq) / self.peak_balance * 100.0
+                               if self.peak_balance > 0 else 0.0)
+                    _wr, _aw, _al = self._trade_stats()
+                    _avg_pnl = (_aw - _al) * 100.0 if self.closed_trades else 0.0
+
+                    obs = build_ml_signal_obs(
+                        probabilities=ml_result.get("probabilities", [0.5] * 12),
+                        equity_ratio=_eq_ratio, drawdown_pct=_dd_pct,
+                        open_pos_ratio=len(self.positions) / max(self.max_open, 1),
+                        win_rate_recent=_wr, avg_pnl_recent=_avg_pnl,
+                        bars_since_trade=i - self._last_trade_close_bar_for_rl,
+                        balance_ratio=self.balance / self.initial_capital if self.initial_capital > 0 else 1.0,
+                        recent_loss_streak=self._loss_streak,
+                        total_trades=len(self.closed_trades),
+                        recent_sharpe=0.0,
+                        symbol=symbol,
+                    )
+                    rl_eval_result = self._signal_evaluator.evaluate(obs)
+                    if not rl_eval_result.take_trade:
+                        equity_curve.append(current_equity)
+                        continue
+
+                # --- Fill rate model ---
+                limit_price = current_price
+                if i + 1 < n:
+                    if direction == "LONG" and lows[i + 1] > limit_price:
+                        equity_curve.append(current_equity)
+                        continue
+                    elif direction == "SHORT" and highs[i + 1] < limit_price:
+                        equity_curve.append(current_equity)
+                        continue
+
+                self._signals_filled += 1
+
+                # --- Stop calculation ---
+                window_1h = df_1h.iloc[max(0, h1_idx - 100): h1_idx + 1]
+                sl, tp = initial_stops(
+                    current_price, window_1h, direction=direction,
+                    atr_multiplier=self._atr_multiplier,
+                    rr_ratio=self._rr_ratio,
+                    total_fee_pct=(MAKER_FEE_PCT + TAKER_FEE_PCT) * 100.0,
+                )
+
+                # --- Fee gate ---
+                tp_distance_pct = abs(tp - current_price) / current_price * 100.0 if current_price > 0 else 0.0
+                size_eur_est = self._compute_position_size(1.0, current_price, atr_pct=atr_pct)
+                fee_result = check_fee_gate(
+                    position_size=size_eur_est,
+                    tp_distance_pct=tp_distance_pct,
+                    is_short=(direction == "SHORT"),
+                    min_profit_multiple=self._strategy_params.get("min_profit_multiple", 3.0),
+                )
+                if not fee_result.approved:
+                    equity_curve.append(current_equity)
+                    continue
+
+                if atr_pct > 0:
+                    self._atr_pct_history.append(atr_pct)
+                    if len(self._atr_pct_history) > 200:
+                        self._atr_pct_history = self._atr_pct_history[-200:]
+
+                # Build a synthetic Signal object for _open_position
+                ml_signal = Signal(
+                    symbol=symbol,
+                    direction=direction,
+                    strength=max(ml_result.get("net_up", 0.5), ml_result.get("net_down", 0.5)),
+                    strategy_name="ml_signal",
+                )
+                self._open_position(
+                    ml_signal, current_price, current_time,
+                    window_1h, 1.0, bar_index=i,
+                    atr_pct=atr_pct,
+                    regime=regime,
+                )
+
+                equity_curve.append(current_equity)
+                continue
+
+            # --- existing strategy-based signal path (used when ml_signal_generator is None) ---
             strategies = self._router.get_strategies(regime)
             if self._target_strategy:
                 strategies = [s for s in strategies if s.name == self._target_strategy]
