@@ -35,7 +35,7 @@ from bot.learning.ml_features import (
 
 PAIRS = [
     "BTC-EUR", "ETH-EUR", "XRP-EUR", "SOL-EUR", "ADA-EUR",
-    "DOGE-EUR", "LINK-EUR", "AVAX-EUR", "DOT-EUR", "MATIC-EUR",
+    "DOGE-EUR", "LINK-EUR", "AVAX-EUR", "DOT-EUR", "POL-EUR",
     "SHIB-EUR", "UNI-EUR", "LTC-EUR", "ATOM-EUR", "NEAR-EUR",
     "FIL-EUR", "ARB-EUR", "OP-EUR", "APT-EUR", "SUI-EUR",
     "PEPE-EUR", "INJ-EUR", "FET-EUR", "RENDER-EUR", "TIA-EUR",
