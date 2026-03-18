@@ -371,9 +371,9 @@ def extract_tabular_features(
         # ================================================================
 
         profile = get_coin_profile(symbol)
-        features[51] = float(profile["cap_tier"])
-        features[52] = float(profile["vol_class"])
-        features[53] = float(profile["age"])
+        features[51] = float(profile["cap_tier"]) / 3.0
+        features[52] = float(profile["vol_class"]) / 2.0
+        features[53] = float(np.clip(profile["age"] / 16.0, 0.0, 1.0))
         features[54] = float(profile["is_btc"])
 
         # ================================================================
@@ -477,36 +477,24 @@ def build_lstm_sequence(df_5m: pd.DataFrame) -> np.ndarray:
 
         ref_close = close_w[0] if close_w[0] > 0 else 1.0
 
-        for i in range(LSTM_WINDOW):
-            c = float(close_w[i])
-            h = float(high_w[i])
-            lo = float(low_w[i])
-            o = float(open_w[i])
-
-            # 0: normalized close
-            result[i, 0] = float(np.clip((c - ref_close) / ref_close, -0.2, 0.2))
-
-            # 1: normalized volume (ratio to 20-bar avg, capped at 5)
-            result[i, 1] = float(np.clip(vol_ratio_w[i], 0.0, 5.0))
-
-            # 2: high-low range / close (capped at 0.05 = 5%)
-            if c > 0:
-                result[i, 2] = float(np.clip((h - lo) / c, 0.0, 0.05))
-
-            # 3: body direction
-            result[i, 3] = 1.0 if c >= o else -1.0
-
-            # 4: RSI scaled 0-1
-            r = float(rsi_w[i])
-            result[i, 4] = float(np.clip(r / 100.0, 0.0, 1.0)) if math.isfinite(r) else 0.5
-
-            # 5: EMA20 distance (%)
-            e20 = float(ema20_w[i])
-            if e20 > 0 and math.isfinite(e20):
-                result[i, 5] = float(np.clip((c - e20) / e20, -0.05, 0.05))
-
-            # 6: volume surge ratio (capped at 3)
-            result[i, 6] = float(np.clip(vsr_w[i], 0.0, 3.0))
+        # Vectorized channel computation
+        # 0: normalized close (% change from first bar)
+        result[:, 0] = np.clip((close_w - ref_close) / ref_close, -0.2, 0.2)
+        # 1: normalized volume (ratio to 20-bar avg, capped at 5)
+        result[:, 1] = np.clip(vol_ratio_w, 0.0, 5.0)
+        # 2: high-low range / close (capped at 0.05 = 5%)
+        safe_close = np.where(close_w > 0, close_w, 1.0)
+        result[:, 2] = np.clip((high_w - low_w) / safe_close, 0.0, 0.05)
+        # 3: body direction (+1 green, -1 red)
+        result[:, 3] = np.where(close_w >= open_w, 1.0, -1.0)
+        # 4: RSI scaled 0-1
+        rsi_clean = np.where(np.isfinite(rsi_w), rsi_w, 50.0)
+        result[:, 4] = np.clip(rsi_clean / 100.0, 0.0, 1.0)
+        # 5: close vs EMA20 distance (%)
+        ema_safe = np.where((ema20_w > 0) & np.isfinite(ema20_w), ema20_w, close_w)
+        result[:, 5] = np.clip((close_w - ema_safe) / ema_safe, -0.05, 0.05)
+        # 6: volume surge ratio (capped at 3)
+        result[:, 6] = np.clip(vsr_w, 0.0, 3.0)
 
     except Exception as exc:
         logger.warning("build_lstm_sequence failed: %s", exc, exc_info=True)
