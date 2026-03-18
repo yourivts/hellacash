@@ -49,6 +49,7 @@ from bot.strategy.router import StrategyRouter
 from bot.notifications.discord import DiscordNotifier
 from bot.strategy.adopted_universe import AdoptedUniverse, ALL_STRATEGIES
 from bot.trading_loop import TradingLoop
+from pathlib import Path
 
 _LOG_DIR = os.path.join(os.path.dirname(__file__), "..", "logs")
 _LOG_FILE = os.path.join(_LOG_DIR, "bot.log")
@@ -286,6 +287,22 @@ def _get_universe() -> AdoptedUniverse:
     return _universe
 
 
+def _get_ml_signal_generator():
+    """Load ML signal generator. Raises if models not found (per spec: no fallback)."""
+    model_dir = "models/ml_signals"
+    if Path(model_dir).exists() and (Path(model_dir) / "lstm.pt").exists():
+        from bot.learning.ml_signal_generator import MLSignalGenerator
+        ml_gen = MLSignalGenerator(model_dir=model_dir)
+        logger.info("ML Signal Generator loaded from %s", model_dir)
+        return ml_gen
+    else:
+        raise FileNotFoundError(
+            f"ML models not found at {model_dir}. "
+            f"Run 'python scripts/train_ml_signals.py' first. "
+            f"The bot requires trained ML models to start."
+        )
+
+
 def _get_trading_loop() -> TradingLoop:
     global _trading_loop
     if _trading_loop is None:
@@ -302,6 +319,7 @@ def _get_trading_loop() -> TradingLoop:
             settings=get_settings(),
             onchain=_get_onchain() if get_settings().onchain_enabled else None,
             orderbook=_get_orderbook() if get_settings().orderbook_enabled else None,
+            ml_signal_generator=_get_ml_signal_generator(),
         )
         _trading_loop._limit_mgr = _get_limit_mgr()
         _trading_loop._universe = _get_universe()
