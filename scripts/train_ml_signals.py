@@ -33,7 +33,13 @@ from bot.learning.ml_features import (
     LSTM_MIN_BARS,
 )
 
-PAIRS = ["BTC-EUR", "ETH-EUR", "XRP-EUR"]
+PAIRS = [
+    "BTC-EUR", "ETH-EUR", "XRP-EUR", "SOL-EUR", "ADA-EUR",
+    "DOGE-EUR", "LINK-EUR", "AVAX-EUR", "DOT-EUR", "MATIC-EUR",
+    "SHIB-EUR", "UNI-EUR", "LTC-EUR", "ATOM-EUR", "NEAR-EUR",
+    "FIL-EUR", "ARB-EUR", "OP-EUR", "APT-EUR", "SUI-EUR",
+    "PEPE-EUR", "INJ-EUR", "FET-EUR", "RENDER-EUR", "TIA-EUR",
+]
 YEARS = 5
 MODEL_DIR = "models/ml_signals"
 
@@ -112,7 +118,7 @@ def build_lstm_targets(df_5m: pd.DataFrame) -> np.ndarray:
 
 
 def optuna_transformer_hpo(train_seqs, train_targets, val_seqs, val_targets, n_trials=20):
-    """Search for best Transformer architecture using Optuna."""
+    """Search for best Transformer architecture using Optuna with MedianPruner."""
     import optuna
 
     def objective(trial):
@@ -136,6 +142,7 @@ def optuna_transformer_hpo(train_seqs, train_targets, val_seqs, val_targets, n_t
                 model, train_seqs, train_targets,
                 val_seqs=val_seqs, val_targets=val_targets,
                 epochs=15, batch_size=batch_size, lr=lr,
+                trial=trial,
             )
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             model.to(device)
@@ -143,8 +150,9 @@ def optuna_transformer_hpo(train_seqs, train_targets, val_seqs, val_targets, n_t
             with torch.no_grad():
                 vX = torch.from_numpy(val_seqs).float().to(device)
                 vY = torch.from_numpy(val_targets).float().to(device)
-                val_pred = model.predict_next(vX)
-                val_mse = float(torch.nn.functional.mse_loss(val_pred, vY).item())
+                with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                    val_pred = model.predict_next(vX)
+                    val_mse = float(torch.nn.functional.mse_loss(val_pred, vY).item())
             return val_mse
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
@@ -153,7 +161,10 @@ def optuna_transformer_hpo(train_seqs, train_targets, val_seqs, val_targets, n_t
                 raise optuna.TrialPruned()
             raise
 
-    study = optuna.create_study(direction="minimize")
+    study = optuna.create_study(
+        direction="minimize",
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=3),
+    )
     study.optimize(objective, n_trials=n_trials)
 
     print(f"  Best Transformer params: {study.best_params}")

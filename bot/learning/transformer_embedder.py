@@ -154,6 +154,7 @@ def train_transformer(
     epochs: int = 50,
     batch_size: int = 256,
     lr: float = 1e-3,
+    trial=None,
 ) -> list[float]:
     """Train the Transformer via self-supervised next-bar prediction.
 
@@ -164,18 +165,32 @@ def train_transformer(
         epochs: number of training epochs
         batch_size: mini-batch size
         lr: learning rate
+        trial: optional Optuna trial for pruning (reports val loss per epoch)
 
     Returns:
         List of per-epoch average training loss values.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp = device.type == "cuda"
     model.to(device)
-    model.train()
-    logger.info("Transformer training on %s", device)
+
+    # torch.compile JIT (PyTorch 2.0+)
+    compiled_model = model
+    if hasattr(torch, "compile"):
+        try:
+            compiled_model = torch.compile(model)
+            logger.info("torch.compile applied")
+        except Exception:
+            logger.info("torch.compile unavailable, continuing without")
+            compiled_model = model
+
+    compiled_model.train()
+    logger.info("Transformer training on %s (amp=%s)", device, use_amp)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.MSELoss()
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     X = torch.from_numpy(sequences).float().to(device)
     Y = torch.from_numpy(targets).float().to(device)
@@ -184,7 +199,7 @@ def train_transformer(
     loss_history: list[float] = []
 
     for epoch in range(epochs):
-        model.train()
+        compiled_model.train()
         perm = torch.randperm(n)
         total_loss = 0.0
         batches = 0
@@ -195,11 +210,14 @@ def train_transformer(
             y_batch = Y[idx]
 
             optimizer.zero_grad()
-            pred = model.predict_next(x_batch)
-            loss = criterion(pred, y_batch)
-            loss.backward()
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                pred = compiled_model.predict_next(x_batch)
+                loss = criterion(pred, y_batch)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             total_loss += loss.item()
             batches += 1
@@ -210,12 +228,13 @@ def train_transformer(
 
         # Validation
         if val_seqs is not None and val_targets is not None:
-            model.eval()
+            compiled_model.eval()
             with torch.no_grad():
                 vX = torch.from_numpy(val_seqs).float().to(device)
                 vY = torch.from_numpy(val_targets).float().to(device)
-                val_pred = model.predict_next(vX)
-                val_loss = criterion(val_pred, vY).item()
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    val_pred = compiled_model.predict_next(vX)
+                    val_loss = criterion(val_pred, vY).item()
             logger.info(
                 "Transformer epoch %d/%d — train_loss=%.6f, val_loss=%.6f, lr=%.2e",
                 epoch + 1,
@@ -224,6 +243,14 @@ def train_transformer(
                 val_loss,
                 scheduler.get_last_lr()[0],
             )
+
+            # Optuna pruning: report val loss per epoch
+            if trial is not None:
+                import optuna
+
+                trial.report(val_loss, epoch)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
         else:
             logger.info(
                 "Transformer epoch %d/%d — train_loss=%.6f",
