@@ -144,18 +144,25 @@ def optuna_transformer_hpo(train_seqs, train_targets, val_seqs, val_targets, n_t
                 epochs=15, batch_size=batch_size, lr=lr,
                 trial=trial,
             )
+            # Batched validation to avoid OOM
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             model.to(device)
             model.eval()
+            vX_cpu = torch.from_numpy(val_seqs).float()
+            vY_cpu = torch.from_numpy(val_targets).float()
+            val_loss_sum = 0.0
+            val_n = 0
             with torch.no_grad():
-                vX = torch.from_numpy(val_seqs).float().to(device)
-                vY = torch.from_numpy(val_targets).float().to(device)
-                with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                    val_pred = model.predict_next(vX)
-                    val_mse = float(torch.nn.functional.mse_loss(val_pred, vY).item())
-            return val_mse
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
+                for vs in range(0, len(vX_cpu), batch_size):
+                    vx = vX_cpu[vs:vs + batch_size].to(device)
+                    vy = vY_cpu[vs:vs + batch_size].to(device)
+                    with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                        vp = model.predict_next(vx)
+                        val_loss_sum += float(torch.nn.functional.mse_loss(vp, vy).item()) * len(vx)
+                    val_n += len(vx)
+            return val_loss_sum / max(val_n, 1)
+        except (RuntimeError, Exception) as e:
+            if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
                 import torch
                 torch.cuda.empty_cache()
                 raise optuna.TrialPruned()
