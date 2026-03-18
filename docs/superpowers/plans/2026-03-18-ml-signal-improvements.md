@@ -487,31 +487,91 @@ def _make_5m_index(days: int = 30) -> pd.DatetimeIndex:
 
 
 class TestExternalDataProvider:
-    """Tests for the ExternalDataProvider class."""
+    """Tests for the ExternalDataProvider class.
+
+    All tests mock fetch_all_training() to avoid real HTTP requests.
+    This ensures tests are fast, deterministic, and work offline/in CI.
+    """
+
+    def _make_mock_training_data(self, idx):
+        """Create a synthetic training data dict (same keys as fetch_all_training)."""
+        n = len(idx)
+        return {
+            "fear_greed": np.random.rand(n) * 0.5 + 0.25,
+            "fear_greed_mom": np.random.randn(n) * 0.1,
+            "gtrends_bitcoin": np.zeros(n),
+            "gtrends_crypto": np.zeros(n),
+            "dxy_return": np.random.randn(n) * 0.1,
+            "sp500_return": np.random.randn(n) * 0.1,
+            "gold_return": np.random.randn(n) * 0.1,
+            "vix": np.random.rand(n) * 0.5,
+            "treasury_10y": np.random.rand(n) * 0.5,
+            "yield_spread": np.random.randn(n) * 0.2,
+            "nvt": np.random.rand(n) * 0.5,
+            "mvrv": np.random.rand(n) * 0.5,
+            "sopr": np.random.randn(n) * 0.2,
+            "puell": np.random.rand(n) * 0.5,
+            "hashrate": np.random.randn(n) * 0.1,
+            "eth_active_addr": np.random.randn(n) * 0.1,
+            "stable_supply_change": np.random.randn(n) * 0.05,
+            "tvl_change": np.random.randn(n) * 0.05,
+            "oi_change_7d": np.zeros(n),
+            "liq_ratio": np.zeros(n),
+            "taker_buy_ratio": np.random.rand(n) * 0.3 + 0.35,
+            "dvol": np.random.rand(n) * 0.5,
+            "funding_24h_avg": np.random.randn(n) * 0.05,
+            "btc_dom_change": np.zeros(n),
+            "stable_btc_ratio": np.zeros(n),
+            "funding_rate_current": np.random.randn(n) * 0.05,
+            "funding_7d_avg": np.random.randn(n) * 0.03,
+            "oi_change_24h": np.zeros(n),
+            "long_liq_24h": np.zeros(n),
+            "short_liq_24h": np.zeros(n),
+            "exchange_netflow": np.random.randn(n) * 0.1,
+            "active_addr_change_7d": np.random.randn(n) * 0.1,
+        }
 
     def test_build_training_features_returns_correct_shape(self):
         """Training features should have 32 columns (7 for 55-61 + 25 for 65-89)."""
+        from unittest.mock import patch
         from bot.data.external_features import ExternalDataProvider
         provider = ExternalDataProvider(cache_dir=None)
         idx = _make_5m_index(30)
-        # Build with empty data (all zeros)
-        result = provider.build_training_features(idx)
+        mock_data = self._make_mock_training_data(idx)
+        with patch.object(provider, "fetch_all_training", return_value=mock_data):
+            result = provider.build_training_features(idx)
         assert isinstance(result, np.ndarray)
         assert result.shape == (len(idx), 32), f"Expected (N, 32), got {result.shape}"
 
     def test_build_training_features_dtype_float32(self):
+        from unittest.mock import patch
         from bot.data.external_features import ExternalDataProvider
         provider = ExternalDataProvider(cache_dir=None)
         idx = _make_5m_index(7)
-        result = provider.build_training_features(idx)
+        mock_data = self._make_mock_training_data(idx)
+        with patch.object(provider, "fetch_all_training", return_value=mock_data):
+            result = provider.build_training_features(idx)
         assert result.dtype == np.float32
 
     def test_build_training_features_all_finite(self):
+        from unittest.mock import patch
         from bot.data.external_features import ExternalDataProvider
         provider = ExternalDataProvider(cache_dir=None)
         idx = _make_5m_index(7)
-        result = provider.build_training_features(idx)
+        mock_data = self._make_mock_training_data(idx)
+        with patch.object(provider, "fetch_all_training", return_value=mock_data):
+            result = provider.build_training_features(idx)
         assert np.all(np.isfinite(result)), "Non-finite values in training features"
+
+    def test_build_training_features_empty_returns_zeros(self):
+        """When fetch_all_training returns empty dict, all features should be zero."""
+        from unittest.mock import patch
+        from bot.data.external_features import ExternalDataProvider
+        provider = ExternalDataProvider(cache_dir=None)
+        idx = _make_5m_index(7)
+        with patch.object(provider, "fetch_all_training", return_value={}):
+            result = provider.build_training_features(idx)
+        assert np.all(result == 0.0)
 
     def test_build_live_features_returns_correct_shape(self):
         from bot.data.external_features import ExternalDataProvider
@@ -1173,18 +1233,43 @@ class ExternalDataProvider:
         funding = self._cached_fetch("funding_rates", _fetch_funding_rates)
         if not funding.empty:
             result["funding_24h_avg"] = align_to_5m(funding["rate"].rolling(3).mean().clip(-0.01, 0.01) * 100, idx_5m)
+            # Indices 55-56: current funding rate and 7d average (for training)
+            result["funding_rate_current"] = align_to_5m(funding["rate"].clip(-0.01, 0.01) * 100, idx_5m)
+            result["funding_7d_avg"] = align_to_5m(funding["rate"].rolling(21).mean().clip(-0.01, 0.01) * 100, idx_5m)  # 21 × 8h = ~7d
         else:
             result["funding_24h_avg"] = np.zeros(len(idx_5m))
+            result["funding_rate_current"] = np.zeros(len(idx_5m))
+            result["funding_7d_avg"] = np.zeros(len(idx_5m))
 
-        # OI change (Coinalyze — optional, needs API key)
-        coinalyze_key = os.environ.get("COINALYZE_API_KEY")
-        if coinalyze_key:
-            result["oi_change_7d"] = np.zeros(len(idx_5m))  # Placeholder — implement with Coinalyze API
+        # Index 57: OI change 24h (Coinalyze — optional, needs free signup API key)
+        # Index 58-59: Long/short liquidations (Binance CSV — manual download)
+        # These are zero-filled when API key or data not available.
+        # The model learns to ignore zero-valued features via feature importance.
+        result["oi_change_24h"] = np.zeros(len(idx_5m))
+        result["long_liq_24h"] = np.zeros(len(idx_5m))
+        result["short_liq_24h"] = np.zeros(len(idx_5m))
+        logger.info("OI/liquidation features zero-filled (optional data sources)")
+
+        # Index 60: Exchange netflow (BGeometrics exchange-flows)
+        exflow = self._cached_fetch("bgeometrics_exchange-flows", lambda: _fetch_bgeometrics("exchange-flows"))
+        if not exflow.empty:
+            change = exflow["value"].pct_change(7).clip(-1, 1)
+            result["exchange_netflow"] = align_to_5m(change, idx_5m)
         else:
-            logger.info("COINALYZE_API_KEY not set, OI features zero-filled")
-            result["oi_change_7d"] = np.zeros(len(idx_5m))
+            result["exchange_netflow"] = np.zeros(len(idx_5m))
 
-        # Liquidation ratio — placeholder (Binance CSV data)
+        # Index 61: BTC active addresses change 7d (CoinMetrics)
+        btc_addr = self._cached_fetch("coinmetrics_btc_addr", lambda: _fetch_coinmetrics("btc", "AdrActCnt"))
+        if not btc_addr.empty:
+            change = btc_addr["value"].pct_change(7).clip(-1, 1)
+            result["active_addr_change_7d"] = align_to_5m(change, idx_5m)
+        else:
+            result["active_addr_change_7d"] = np.zeros(len(idx_5m))
+
+        # Index 83: OI change 7d (zero-filled without Coinalyze API key)
+        result["oi_change_7d"] = np.zeros(len(idx_5m))
+
+        # Index 84: Liquidation ratio (zero-filled without Binance CSV data)
         result["liq_ratio"] = np.zeros(len(idx_5m))
 
         # Taker buy ratio
@@ -1319,11 +1404,13 @@ class ExternalDataProvider:
 
         # Fear & Greed (daily source)
         try:
-            fng = _fetch_fear_greed(limit=2)
+            fng = _fetch_fear_greed(limit=8)  # 7 days + 1 to compute 7d momentum
             if not fng.empty:
                 val = float(fng["value"].iloc[-1]) / 100.0
                 self._live_cache["fear_greed"] = val
-                if len(fng) >= 2:
+                if len(fng) >= 7:
+                    self._live_cache["fear_greed_mom"] = (float(fng["value"].iloc[-1]) - float(fng["value"].iloc[-7])) / 100.0
+                elif len(fng) >= 2:
                     self._live_cache["fear_greed_mom"] = (float(fng["value"].iloc[-1]) - float(fng["value"].iloc[0])) / 100.0
                 self._last_fetched["fear_greed"] = now
         except Exception as e:
@@ -1400,6 +1487,72 @@ class ExternalDataProvider:
         except Exception as e:
             logger.warning("Live refresh taker_buy failed: %s", e)
 
+        # Yield spread (from macro data already fetched above)
+        # treasury_10y and yield_spread are populated in the macro block above
+
+        # Hashrate (BGeometrics)
+        try:
+            hr = _fetch_bgeometrics("hashrate")
+            if not hr.empty and len(hr) >= 31:
+                change = (float(hr["value"].iloc[-1]) - float(hr["value"].iloc[-31])) / max(float(hr["value"].iloc[-31]), 1)
+                self._live_cache["hashrate"] = np.clip(change, -1, 1)
+        except Exception as e:
+            logger.warning("Live refresh hashrate failed: %s", e)
+
+        # ETH active addresses (CoinMetrics)
+        try:
+            eth_addr = _fetch_coinmetrics("eth", "AdrActCnt")
+            if not eth_addr.empty and len(eth_addr) >= 8:
+                change = (float(eth_addr["value"].iloc[-1]) - float(eth_addr["value"].iloc[-8])) / max(float(eth_addr["value"].iloc[-8]), 1)
+                self._live_cache["eth_active_addr"] = np.clip(change, -1, 1)
+        except Exception as e:
+            logger.warning("Live refresh eth_active_addr failed: %s", e)
+
+        # Stablecoin supply change (DefiLlama)
+        try:
+            stable = _fetch_defillama_stablecoins()
+            if not stable.empty and len(stable) >= 8:
+                change = (float(stable["value"].iloc[-1]) - float(stable["value"].iloc[-8])) / max(float(stable["value"].iloc[-8]), 1)
+                self._live_cache["stable_supply_change"] = np.clip(change, -1, 1)
+        except Exception as e:
+            logger.warning("Live refresh stable_supply_change failed: %s", e)
+
+        # Yield spread (compute from macro if available)
+        try:
+            end_ys = now
+            start_ys = now - timedelta(days=7)
+            macro_ys = _fetch_macro_yfinance(start_ys, end_ys)
+            if "tnx" in macro_ys and "twoy" in macro_ys:
+                tnx_val = float(macro_ys["tnx"]["value"].iloc[-1]) if not macro_ys["tnx"].empty else 0
+                twoy_val = float(macro_ys["twoy"]["value"].iloc[-1]) if not macro_ys["twoy"].empty else 0
+                self._live_cache["yield_spread"] = np.clip((tnx_val - twoy_val) / 5.0, -1, 1)
+        except Exception as e:
+            logger.warning("Live refresh yield_spread failed: %s", e)
+
+        # BTC dominance change (CoinGecko — live only)
+        try:
+            btc_dom = _fetch_coingecko_btc_dominance()
+            if not btc_dom.empty:
+                # Store current value; change computed as delta from last cached value
+                current = float(btc_dom["value"].iloc[-1]) / 100.0
+                prev = self._live_cache.get("_btc_dom_prev", current)
+                self._live_cache["btc_dom_change"] = np.clip((current - prev) * 10, -1, 1)
+                self._live_cache["_btc_dom_prev"] = current
+        except Exception as e:
+            logger.warning("Live refresh btc_dom failed: %s", e)
+
+        # Google Trends — skipped in live mode (weekly data, rate-limited)
+        # gtrends_bitcoin and gtrends_crypto remain at 0.0 (acceptable per spec)
+
+        # stable_btc_ratio — requires BTC price + stablecoin supply; approximate from cached values
+        # This is a best-effort live approximation
+        try:
+            if "stable_supply_change" in self._live_cache:
+                # Use a simplified proxy: stable_supply_change as directional signal
+                self._live_cache["stable_btc_ratio"] = 0.0  # Zero-fill in live (training provides historical)
+        except Exception:
+            pass
+
     def _cached_fetch(self, name: str, fetch_fn) -> pd.DataFrame:
         """Fetch data with parquet cache."""
         if self._cache_dir:
@@ -1470,7 +1623,12 @@ def test_tabular_shape_n_90(self):
     assert tabular.shape[1] == 90, f"Expected 90 tabular features, got {tabular.shape[1]}"
 ```
 
-The full updated test file replaces every `extract_tabular_features(df, sym, btc, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0)` call with `extract_tabular_features(df, sym, btc, external_data={})`, and changes all `65` shape assertions to `90`.
+**Bulk find-and-replace across ALL test methods in the file:**
+
+1. Replace every call matching `extract_tabular_features(df, sym, btc, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0)` with `extract_tabular_features(df, sym, btc, external_data={})`.
+2. Replace every call matching `extract_tabular_features(df, sym, btc, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, N, M)` (where N and M are regime params) with `extract_tabular_features(df, sym, btc, external_data={}, regime_id=N, regime_hours=M)`.
+3. Change all `65` shape assertions to `90` (e.g., `assert result.shape == (65,)` → `assert result.shape == (90,)`, `assert N_TABULAR == 65` → `assert N_TABULAR == 90`, etc.).
+4. This applies to ALL 9 test methods in `TestExtractTabularFeatures` and all methods in `TestExtractAllFeatures`.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -1485,7 +1643,7 @@ Expected: FAIL — shape mismatch (still 65) and signature mismatch
 N_TABULAR: int = 90
 ```
 
-**3b.** Change `extract_tabular_features()` signature (line 99). Replace the 7 individual float params + regime params with a single `external_data` dict:
+**3b.** Change `extract_tabular_features()` signature (line 99). Replace the 7 individual float params with a single `external_data` dict, keeping `regime_id` and `regime_hours` as separate parameters:
 
 ```python
 def extract_tabular_features(
@@ -1877,13 +2035,11 @@ class MLSignalGenerator:
         if self._disabled:
             return default
 
-        # Build external_data dict from live_features (backward compat) and explicit external_data
+        # Build external_data dict from explicit parameter
         ext = dict(external_data or {})
-        # Merge legacy kwargs into external_data for backward compat
-        for key in ("funding_rate", "funding_score", "ob_imbalance", "spread_pct",
-                     "bid_ask_wall_ratio", "onchain_composite", "exchange_reserve_trend"):
-            if key in live_features and key not in ext:
-                ext[key] = live_features[key]
+        # Note: legacy kwargs (funding_score, ob_imbalance, etc.) are NOT mapped
+        # because the feature indices they targeted (55-61) now have different
+        # semantics. Callers should pass data via external_data dict instead.
 
         regime_id = int(live_features.get("regime_id", 0))
         regime_hours = live_features.get("regime_hours", 0.0)
@@ -1897,8 +2053,9 @@ class MLSignalGenerator:
         )
         seq = build_lstm_sequence(df_5m)
 
-        # Check for insufficient data (sequence is all zeros when < LSTM_MIN_BARS)
-        if np.all(seq == 0):
+        # Check for insufficient data: sequence is all zeros when < LSTM_MIN_BARS,
+        # tabular is all zeros when < MIN_BARS_5M. Either condition means no signal.
+        if np.all(tabular == 0) or np.all(seq == 0):
             return default
 
         # Get embedding (works for both Transformer and LSTM — same interface)
@@ -2016,6 +2173,7 @@ TRANSFORMER_EPOCHS = 50
 TRANSFORMER_BATCH = 256
 TRANSFORMER_LR = 1e-3
 TRANSFORMER_PREDICT_BARS = 12
+LSTM_PREDICT_BARS = TRANSFORMER_PREDICT_BARS  # alias — build_lstm_targets() uses this name
 
 # XGBoost base params (HPO will override most of these)
 XGB_BASE_PARAMS = {
@@ -2154,8 +2312,14 @@ def search_thresholds(X, close_prices, train_mask, val_mask, horizons):
 - [ ] **Step 4: Add Optuna XGBoost HPO function**
 
 ```python
-def optuna_xgboost_hpo(X_train, y_train, X_val, y_val, n_trials=30, scale_pos_weight=1.0):
-    """Search for best XGBoost hyperparameters using Optuna."""
+def optuna_xgboost_hpo(X_train, y_train, X_val, y_val, n_trials=30,
+                       scale_pos_weight=1.0, seed_params=None):
+    """Search for best XGBoost hyperparameters using Optuna.
+
+    Args:
+        seed_params: If provided, used as initial trial (enqueue) so the search
+                     starts from a known-good point (e.g. shared baseline params).
+    """
     import optuna
 
     def objective(trial):
@@ -2181,6 +2345,17 @@ def optuna_xgboost_hpo(X_train, y_train, X_val, y_val, n_trials=30, scale_pos_we
         return f1_score(y_val, preds, zero_division=0)
 
     study = optuna.create_study(direction="maximize")
+
+    # Seed the study with known-good params so fine-tuning starts from baseline
+    if seed_params:
+        study.enqueue_trial({
+            k: seed_params[k] for k in (
+                "max_depth", "learning_rate", "n_estimators",
+                "min_child_weight", "subsample", "colsample_bytree",
+                "reg_alpha", "reg_lambda",
+            ) if k in seed_params
+        })
+
     study.optimize(objective, n_trials=n_trials)
 
     print(f"  Best XGBoost params: max_depth={study.best_params['max_depth']}, "
@@ -2281,6 +2456,11 @@ def main():
     print(f"  HPO completed in {time.time() - t0:.0f}s")
 
     # ── Step 5: Train best Transformer ──
+    # Clean up VRAM from HPO trials before full training
+    import torch, gc
+    torch.cuda.empty_cache()
+    gc.collect()
+
     print("\n  Training Transformer with best params...")
     transformer = TransformerEmbedder(
         d_model=best_transformer_params["d_model"],
@@ -2289,10 +2469,15 @@ def main():
         dropout=best_transformer_params["dropout"],
     )
     t0 = time.time()
+    # Reduce batch size for large d_model (VRAM management on RTX 2060 SUPER)
+    final_batch = TRANSFORMER_BATCH
+    if best_transformer_params["d_model"] >= 128:
+        final_batch = TRANSFORMER_BATCH // 2
+
     train_transformer(
         transformer, train_seqs, train_targets,
         val_seqs=val_seqs, val_targets=val_targets,
-        epochs=TRANSFORMER_EPOCHS, batch_size=TRANSFORMER_BATCH,
+        epochs=TRANSFORMER_EPOCHS, batch_size=final_batch,
         lr=best_transformer_params["lr"],
     )
     print(f"  Transformer trained in {time.time() - t0:.0f}s")
@@ -2385,6 +2570,38 @@ def main():
     print("\n  Searching optimal thresholds per horizon...")
     optimal_thresholds = search_thresholds(X, close_prices, train_mask, val_mask, HORIZONS)
 
+    # ── Step 8b: Recompute labels with optimal thresholds ──
+    # CRITICAL: models must train on labels computed with the same thresholds
+    # that will be used for live inference (saved in feature_config.json).
+    print("  Recomputing labels with optimal thresholds...")
+    OPT_HORIZONS = [
+        (name, bars, optimal_thresholds.get(name, thresh))
+        for name, bars, thresh in HORIZONS
+    ]
+    # Rebuild y_all with optimal thresholds
+    all_labels = []
+    for pair, df in all_dfs.items():
+        n = len(df)
+        close = df["close"].values.astype(np.float64)
+        labels = np.full((n, 12), np.nan, dtype=np.float32)
+        for h_idx, (name, bars, threshold) in enumerate(OPT_HORIZONS):
+            threshold_frac = threshold / 100.0
+            valid = n - bars
+            if valid <= 0:
+                continue
+            future_close = close[bars:bars + valid]
+            current_close = close[:valid]
+            future_return = (future_close - current_close) / (current_close + 1e-12)
+            labels[:valid, h_idx * 2] = (future_return > threshold_frac).astype(np.float32)
+            labels[:valid, h_idx * 2 + 1] = (future_return < -threshold_frac).astype(np.float32)
+
+        from bot.learning.ml_features import MIN_BARS_5M, SIGNAL_EVERY
+        sample_indices = np.arange(MIN_BARS_5M, len(df), SIGNAL_EVERY)
+        all_labels.append(labels[sample_indices])
+
+    y_all = np.vstack(all_labels)
+    print(f"  Labels recomputed with optimal thresholds for {len(y_all):,} samples")
+
     # ── Step 9: Optuna XGBoost HPO (shared baseline on 4h_up) ──
     print("\n  Running Optuna XGBoost HPO (30 shared trials on 4h_up)...")
     h_idx_4h = 2  # 4h is index 2 in HORIZONS
@@ -2422,10 +2639,11 @@ def main():
             n_neg = float(len(y_train) - n_pos)
             scale_pos_weight = n_neg / max(n_pos, 1)
 
-            # Per-model fine-tune: 10 Optuna trials starting from shared params
+            # Per-model fine-tune: 10 Optuna trials seeded from shared baseline
             fine_tuned = optuna_xgboost_hpo(
                 X_train, y_train, X_val, y_val,
                 n_trials=10, scale_pos_weight=scale_pos_weight,
+                seed_params=shared_xgb_params,
             )
 
             # Merge fine-tuned params with base
