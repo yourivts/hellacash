@@ -189,33 +189,113 @@ def _fetch_google_trends(keywords: list[str]) -> dict[str, pd.DataFrame]:
         return {}
 
 
-def _fetch_bgeometrics(metric: str) -> pd.DataFrame:
-    """Fetch on-chain metrics from BGeometrics Charts API.
+def _fetch_coinmetrics_timeseries(metric: str, asset: str = "btc") -> pd.DataFrame:
+    """Fetch a single metric from CoinMetrics Community API (free tier)."""
+    import requests
+    try:
+        url = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
+        all_rows = []
+        next_page = None
+        for _ in range(50):  # max 50 pages
+            params = {"assets": asset, "metrics": metric, "frequency": "1d", "page_size": 10000}
+            if next_page:
+                params["next_page_token"] = next_page
+            resp = requests.get(url, params=params, timeout=30)
+            resp.raise_for_status()
+            body = resp.json()
+            data = body.get("data", [])
+            if not data:
+                break
+            for d in data:
+                ts = pd.to_datetime(d["time"])
+                val = float(d.get(metric, 0))
+                all_rows.append({"date": ts, "value": val})
+            next_page = body.get("next_page_token")
+            if not next_page:
+                break
+            time.sleep(0.2)
+        if not all_rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(all_rows).set_index("date").sort_index()
+        if df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        return df
+    except Exception as e:
+        logger.warning("CoinMetrics %s/%s fetch failed: %s", asset, metric, e)
+        return pd.DataFrame()
 
-    Falls back to Blockchain.com Charts API for hashrate if BGeometrics fails.
+
+def _fetch_onchain_mvrv() -> pd.DataFrame:
+    """Fetch MVRV from CoinMetrics Community API."""
+    return _fetch_coinmetrics_timeseries("CapMVRVCur", "btc")
+
+
+def _fetch_onchain_nvt_proxy() -> pd.DataFrame:
+    """Compute NVT proxy: MarketCap / (TxCount * Price).
+
+    True NVT (MarketCap / TransferValueUSD) requires paid API access.
+    This proxy uses tx count as a volume indicator instead.
     """
     import requests
     try:
-        url = f"https://charts.bgeometrics.com/api/{metric}"
-        resp = requests.get(url, timeout=30)
+        url = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
+        params = {
+            "assets": "btc",
+            "metrics": "CapMrktCurUSD,TxCnt",
+            "frequency": "1d",
+            "page_size": 10000,
+        }
+        resp = requests.get(url, params=params, timeout=30)
         resp.raise_for_status()
-        data = resp.json()
+        data = resp.json().get("data", [])
         if not data:
-            raise ValueError("Empty response")
+            return pd.DataFrame()
         rows = []
         for d in data:
-            ts = pd.to_datetime(d.get("date") or d.get("t"))
-            val = float(d.get("value") or d.get("v") or 0)
-            rows.append({"date": ts, "value": val})
+            ts = pd.to_datetime(d["time"])
+            mcap_raw = d.get("CapMrktCurUSD")
+            tx_raw = d.get("TxCnt")
+            if mcap_raw is None or tx_raw is None:
+                continue
+            mcap = float(mcap_raw)
+            tx_cnt = float(tx_raw)
+            nvt_proxy = mcap / max(tx_cnt, 1) / 1e6  # scale down
+            rows.append({"date": ts, "value": nvt_proxy})
         df = pd.DataFrame(rows).set_index("date").sort_index()
         if df.index.tz is None:
             df.index = df.index.tz_localize("UTC")
         return df
     except Exception as e:
-        logger.warning("BGeometrics %s fetch failed: %s", metric, e)
-        # Fallback for hashrate: try Blockchain.com Charts API
-        if metric == "hashrate":
-            return _fetch_blockchain_com_hashrate()
+        logger.warning("NVT proxy computation failed: %s", e)
+        return pd.DataFrame()
+
+
+def _fetch_onchain_hashrate() -> pd.DataFrame:
+    """Fetch BTC hashrate from CoinMetrics, fallback to Blockchain.com."""
+    df = _fetch_coinmetrics_timeseries("HashRate", "btc")
+    if not df.empty:
+        return df
+    return _fetch_blockchain_com_hashrate()
+
+
+def _fetch_blockchain_com_exchange_flows() -> pd.DataFrame:
+    """Fetch BTC estimated transaction volume from Blockchain.com as exchange flow proxy."""
+    import requests
+    try:
+        url = "https://api.blockchain.info/charts/estimated-transaction-volume-usd"
+        params = {"timespan": "5years", "format": "json", "rollingAverage": "7days"}
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json().get("values", [])
+        if not data:
+            return pd.DataFrame()
+        rows = []
+        for d in data:
+            ts = datetime.fromtimestamp(d["x"], tz=timezone.utc)
+            rows.append({"date": ts, "value": float(d["y"])})
+        return pd.DataFrame(rows).set_index("date").sort_index()
+    except Exception as e:
+        logger.warning("Blockchain.com tx volume fallback failed: %s", e)
         return pd.DataFrame()
 
 
@@ -278,8 +358,9 @@ def _fetch_defillama_stablecoins() -> pd.DataFrame:
             return pd.DataFrame()
         rows = []
         for d in data:
-            ts = datetime.fromtimestamp(d["date"], tz=timezone.utc)
-            val = float(d.get("totalCirculatingUSD", {}).get("peggedUSD", 0))
+            ts = datetime.fromtimestamp(int(d["date"]), tz=timezone.utc)
+            circ = d.get("totalCirculatingUSD", {})
+            val = float(circ.get("peggedUSD", 0)) if isinstance(circ, dict) else 0.0
             rows.append({"date": ts, "value": val})
         return pd.DataFrame(rows).set_index("date").sort_index()
     except Exception as e:
@@ -467,26 +548,35 @@ class ExternalDataProvider:
             result["treasury_10y"] = np.zeros(len(idx_5m))
             result["yield_spread"] = np.zeros(len(idx_5m))
 
-        # On-chain (BGeometrics)
-        for metric, key, scale_fn in [
-            ("nvt", "nvt", lambda s: np.clip(np.log1p(s) / np.log1p(200), 0, 1)),
-            ("mvrv", "mvrv", lambda s: np.clip(s / 5.0, 0, 1)),
-            ("sopr", "sopr", lambda s: np.clip((s - 1.0) * 5.0, -1, 1)),
-            ("puell-multiple", "puell", lambda s: np.clip(s / 4.0, 0, 1)),
-            ("hashrate", "hashrate", None),
-        ]:
-            df = self._cached_fetch(f"bgeometrics_{metric}", lambda m=metric: _fetch_bgeometrics(m))
-            if not df.empty:
-                vals = df["value"]
-                if key == "hashrate":
-                    # 30d change
-                    change = vals.pct_change(30).clip(-1, 1)
-                    result[key] = align_to_5m(change, idx_5m)
-                elif scale_fn is not None:
-                    aligned_raw = align_to_5m(vals, idx_5m)
-                    result[key] = scale_fn(aligned_raw)
-            else:
-                result[key] = np.zeros(len(idx_5m))
+        # On-chain: NVT proxy (CoinMetrics MarketCap / TxCount)
+        nvt_df = self._cached_fetch("coinmetrics_nvt_proxy", _fetch_onchain_nvt_proxy)
+        if not nvt_df.empty:
+            aligned_raw = align_to_5m(nvt_df["value"], idx_5m)
+            result["nvt"] = np.clip(np.log1p(aligned_raw) / np.log1p(200), 0, 1)
+        else:
+            result["nvt"] = np.zeros(len(idx_5m))
+
+        # On-chain: MVRV (CoinMetrics)
+        mvrv_df = self._cached_fetch("coinmetrics_mvrv", _fetch_onchain_mvrv)
+        if not mvrv_df.empty:
+            aligned_raw = align_to_5m(mvrv_df["value"], idx_5m)
+            result["mvrv"] = np.clip(aligned_raw / 5.0, 0, 1)
+        else:
+            result["mvrv"] = np.zeros(len(idx_5m))
+
+        # On-chain: SOPR — no free source available, zero-fill
+        result["sopr"] = np.zeros(len(idx_5m))
+
+        # On-chain: Puell Multiple — no free source available, zero-fill
+        result["puell"] = np.zeros(len(idx_5m))
+
+        # On-chain: Hashrate (CoinMetrics -> Blockchain.com fallback)
+        hr_df = self._cached_fetch("coinmetrics_hashrate", _fetch_onchain_hashrate)
+        if not hr_df.empty:
+            change = hr_df["value"].pct_change(30).clip(-1, 1)
+            result["hashrate"] = align_to_5m(change, idx_5m)
+        else:
+            result["hashrate"] = np.zeros(len(idx_5m))
 
         # CoinMetrics: active addresses
         for asset, key in [("eth", "eth_active_addr")]:
@@ -537,8 +627,8 @@ class ExternalDataProvider:
         result["short_liq_24h"] = np.zeros(len(idx_5m))
         logger.info("OI/liquidation features zero-filled (optional data sources)")
 
-        # Index 60: Exchange netflow (BGeometrics exchange-flows)
-        exflow = self._cached_fetch("bgeometrics_exchange-flows", lambda: _fetch_bgeometrics("exchange-flows"))
+        # Index 60: Exchange netflow (Blockchain.com tx volume as proxy)
+        exflow = self._cached_fetch("blockchain_com_txvol", _fetch_blockchain_com_exchange_flows)
         if not exflow.empty:
             change = exflow["value"].pct_change(7).clip(-1, 1)
             result["exchange_netflow"] = align_to_5m(change, idx_5m)
@@ -727,17 +817,14 @@ class ExternalDataProvider:
         except Exception as e:
             logger.warning("Live refresh funding failed: %s", e)
 
-        # On-chain (BGeometrics)
+        # On-chain (CoinMetrics)
         try:
-            for metric, key, transform in [
-                ("nvt", "nvt", lambda v: np.clip(np.log1p(v) / np.log1p(200), 0, 1)),
-                ("mvrv", "mvrv", lambda v: np.clip(v / 5.0, 0, 1)),
-                ("sopr", "sopr", lambda v: np.clip((v - 1.0) * 5.0, -1, 1)),
-                ("puell-multiple", "puell", lambda v: np.clip(v / 4.0, 0, 1)),
-            ]:
-                df = _fetch_bgeometrics(metric)
-                if not df.empty:
-                    self._live_cache[key] = float(transform(df["value"].iloc[-1]))
+            mvrv_df = _fetch_coinmetrics_timeseries("CapMVRVCur", "btc")
+            if not mvrv_df.empty:
+                self._live_cache["mvrv"] = float(np.clip(mvrv_df["value"].iloc[-1] / 5.0, 0, 1))
+            nvt_df = _fetch_onchain_nvt_proxy()
+            if not nvt_df.empty:
+                self._live_cache["nvt"] = float(np.clip(np.log1p(nvt_df["value"].iloc[-1]) / np.log1p(200), 0, 1))
             self._last_fetched["onchain"] = now
         except Exception as e:
             logger.warning("Live refresh onchain failed: %s", e)
@@ -770,9 +857,9 @@ class ExternalDataProvider:
         except Exception as e:
             logger.warning("Live refresh taker_buy failed: %s", e)
 
-        # Hashrate (BGeometrics)
+        # Hashrate (CoinMetrics -> Blockchain.com fallback)
         try:
-            hr = _fetch_bgeometrics("hashrate")
+            hr = _fetch_onchain_hashrate()
             if not hr.empty and len(hr) >= 31:
                 change = (float(hr["value"].iloc[-1]) - float(hr["value"].iloc[-31])) / max(float(hr["value"].iloc[-31]), 1)
                 self._live_cache["hashrate"] = np.clip(change, -1, 1)
