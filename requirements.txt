@@ -41,6 +41,8 @@ gymnasium>=0.29.0
 psycopg2-binary>=2.9.0
 numba>=0.59.0
 cupy-cuda12x>=13.0.0
+xgboost>=2.0.0
+torch>=2.0
 
 # ── Scheduling ────────────────────────────────────────────────────────────────
 apscheduler>=3.10.4
