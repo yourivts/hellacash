@@ -51,6 +51,7 @@ class TradingLoop:
         onchain: Any = None,
         orderbook: Any = None,
         ml_signal_generator: Any = None,
+        ext_data_provider: Any = None,
     ) -> None:
         self.candle_cache = candle_cache
         self.portfolio = portfolio
@@ -65,6 +66,7 @@ class TradingLoop:
         self.onchain = onchain
         self.orderbook = orderbook
         self._ml_signal_generator = ml_signal_generator
+        self._ext_data_provider = ext_data_provider
 
         self._pending_orders: set[str] = set()
         self._limit_mgr = None  # Will be set by main.py (Task 17)
@@ -778,11 +780,45 @@ class TradingLoop:
                     market_regime=regime,
                 )
 
+                # Refresh external data (once per evaluation cycle)
+                if self._ext_data_provider is not None:
+                    try:
+                        self._ext_data_provider.refresh_live()
+                    except Exception as e:
+                        logger.warning("External data refresh failed: %s", e)
+
                 # --- ML signal path (replaces strategy router when ml_signal_generator is set) ---
                 if self._ml_signal_generator is not None:
+                    # Check failsafe: is external data critically stale?
+                    if self._ext_data_provider is not None:
+                        if self._ext_data_provider.is_critically_stale():
+                            self._ml_signal_generator._disabled = True
+                            logger.warning("ML signals disabled: external data critically stale")
+                        else:
+                            self._ml_signal_generator._disabled = False
+
                     ml_window_start = max(0, len(df_5m) - 2000)
                     ml_df = df_5m.iloc[ml_window_start:]
-                    ml_result = self._ml_signal_generator.predict(ml_df, symbol=symbol)
+
+                    # Build external data dict for live inference
+                    ext_data = {}
+                    if self._ext_data_provider is not None:
+                        live_features = self._ext_data_provider.build_live_features()
+                        # Map 25-element array to dict keys matching extract_tabular_features
+                        ext_keys = [
+                            "fear_greed", "fear_greed_mom", "gtrends_bitcoin", "gtrends_crypto",
+                            "dxy_return", "sp500_return", "gold_return", "vix",
+                            "treasury_10y", "yield_spread", "nvt", "mvrv", "sopr", "puell",
+                            "hashrate", "eth_active_addr", "stable_supply_change", "tvl_change",
+                            "oi_change_7d", "liq_ratio", "taker_buy_ratio", "dvol",
+                            "funding_24h_avg", "btc_dom_change", "stable_btc_ratio",
+                        ]
+                        for i, key in enumerate(ext_keys):
+                            ext_data[key] = float(live_features[i])
+
+                    ml_result = self._ml_signal_generator.predict(
+                        ml_df, symbol=symbol, external_data=ext_data,
+                    )
                     ml_direction = ml_result.get("direction")
                     if ml_direction is None or ml_direction not in ("LONG", "SHORT"):
                         continue

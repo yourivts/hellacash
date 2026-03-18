@@ -290,7 +290,11 @@ def _get_universe() -> AdoptedUniverse:
 def _get_ml_signal_generator():
     """Load ML signal generator. Raises if models not found (per spec: no fallback)."""
     model_dir = "models/ml_signals"
-    if Path(model_dir).exists() and (Path(model_dir) / "lstm.pt").exists():
+    model_path = Path(model_dir)
+    has_transformer = (model_path / "transformer.pt").exists()
+    has_lstm = (model_path / "lstm.pt").exists()
+
+    if model_path.exists() and (has_transformer or has_lstm):
         from bot.learning.ml_signal_generator import MLSignalGenerator
         ml_gen = MLSignalGenerator(model_dir=model_dir)
         logger.info("ML Signal Generator loaded from %s", model_dir)
@@ -301,6 +305,18 @@ def _get_ml_signal_generator():
             f"Run 'python scripts/train_ml_signals.py' first. "
             f"The bot requires trained ML models to start."
         )
+
+
+_ext_data_provider = None
+
+def _get_ext_data_provider():
+    """Initialize external data provider for live features."""
+    global _ext_data_provider
+    if _ext_data_provider is None:
+        from bot.data.external_features import ExternalDataProvider
+        _ext_data_provider = ExternalDataProvider(cache_dir="data/external_cache")
+        logger.info("External data provider initialized")
+    return _ext_data_provider
 
 
 def _get_trading_loop() -> TradingLoop:
@@ -320,6 +336,7 @@ def _get_trading_loop() -> TradingLoop:
             onchain=_get_onchain() if get_settings().onchain_enabled else None,
             orderbook=_get_orderbook() if get_settings().orderbook_enabled else None,
             ml_signal_generator=_get_ml_signal_generator(),
+            ext_data_provider=_get_ext_data_provider(),
         )
         _trading_loop._limit_mgr = _get_limit_mgr()
         _trading_loop._universe = _get_universe()
