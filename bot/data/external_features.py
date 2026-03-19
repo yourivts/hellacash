@@ -506,31 +506,22 @@ def _fetch_coinalyze_long_short_ratio(symbol: str = "BTCUSDT_PERP.A") -> pd.Data
 
 
 def _fetch_bgeometrics_sopr() -> pd.DataFrame:
-    """Fetch historical SOPR from BGeometrics free API (daily, back to 2015)."""
+    """Fetch historical SOPR from BGeometrics free API (daily, back to 2010)."""
     import requests
     try:
-        all_rows = []
-        page = 0
-        while True:
-            resp = requests.get(
-                "https://bitcoin-data.com/v1/sopr",
-                params={"startday": "2015-01-01", "size": 1000, "page": page},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if not data:
-                break
-            for item in data:
-                ts = datetime.fromtimestamp(int(item["unixTs"]), tz=timezone.utc)
-                all_rows.append({"date": ts, "value": float(item["sopr"])})
-            if len(data) < 1000:
-                break
-            page += 1
-            time.sleep(0.5)
-        if not all_rows:
+        resp = requests.get(
+            "https://bitcoin-data.com/v1/sopr",
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not data:
             return pd.DataFrame()
-        return pd.DataFrame(all_rows).set_index("date").sort_index()
+        rows = []
+        for item in data:
+            ts = datetime.fromtimestamp(int(item["unixTs"]), tz=timezone.utc)
+            rows.append({"date": ts, "value": float(item["sopr"])})
+        return pd.DataFrame(rows).set_index("date").sort_index()
     except Exception as e:
         logger.warning("BGeometrics SOPR fetch failed: %s", e)
         return pd.DataFrame()

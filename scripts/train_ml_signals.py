@@ -17,6 +17,9 @@ import sys, os, json, time
 sys.stdout.reconfigure(line_buffering=True)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
