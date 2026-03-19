@@ -518,6 +518,71 @@ def build_lstm_sequence(df_5m: pd.DataFrame) -> np.ndarray:
     return result.astype(np.float32)
 
 
+def build_lstm_sequences_batch(
+    df_5m: pd.DataFrame, indices: np.ndarray,
+) -> np.ndarray:
+    """Build (N, 96, 7) LSTM sequences for all indices at once.
+
+    Fully vectorized: precomputes indicators once, then uses advanced indexing
+    to build all windows in a single operation. No Python loops.
+    """
+    n = len(df_5m)
+    close = df_5m["close"].values.astype(np.float64)
+    high = df_5m["high"].values.astype(np.float64)
+    low = df_5m["low"].values.astype(np.float64)
+    open_ = df_5m["open"].values.astype(np.float64)
+    volume = df_5m["volume"].values.astype(np.float64)
+
+    # Precompute indicators once on full series
+    rsi_vals = rsi(df_5m["close"]).values.astype(np.float64)
+    rsi_vals = np.where(np.isfinite(rsi_vals), rsi_vals, 50.0)
+
+    ema20_vals = ema(df_5m["close"], 20).values.astype(np.float64)
+
+    vol_avg = df_5m["volume"].rolling(20).mean().replace(0.0, np.nan).fillna(1.0).values.astype(np.float64)
+    vol_ratio_arr = np.where(vol_avg > 0, volume / vol_avg, 1.0)
+
+    vsr_vals = volume_surge_ratio(df_5m["volume"]).values.astype(np.float64)
+
+    # Filter valid indices (need LSTM_WINDOW bars behind them)
+    valid = indices[(indices >= LSTM_WINDOW - 1) & (indices < n)]
+    N = len(valid)
+
+    # Build (N, 96) index matrix: each row is [idx-95, idx-94, ..., idx]
+    offsets = np.arange(-(LSTM_WINDOW - 1), 1)  # [-95, -94, ..., 0]
+    win_idx = valid[:, None] + offsets[None, :]  # (N, 96)
+
+    # Gather all windows at once via advanced indexing
+    c = close[win_idx]       # (N, 96)
+    h = high[win_idx]        # (N, 96)
+    lo = low[win_idx]        # (N, 96)
+    o = open_[win_idx]       # (N, 96)
+    vr = vol_ratio_arr[win_idx]
+    rs = rsi_vals[win_idx]
+    em = ema20_vals[win_idx]
+    vs = vsr_vals[win_idx]
+
+    # ref_close = first bar in each window
+    ref_close = c[:, 0:1]  # (N, 1) for broadcasting
+    ref_close = np.where(ref_close > 0, ref_close, 1.0)
+
+    safe_c = np.where(c > 0, c, 1.0)
+    ema_safe = np.where((em > 0) & np.isfinite(em), em, c)
+
+    # Build result: (N, 96, 7) — fully vectorized
+    result = np.zeros((N, LSTM_WINDOW, LSTM_CHANNELS), dtype=np.float32)
+    result[:, :, 0] = np.clip((c - ref_close) / ref_close, -0.2, 0.2)
+    result[:, :, 1] = np.clip(vr, 0.0, 5.0)
+    result[:, :, 2] = np.clip((h - lo) / safe_c, 0.0, 0.05)
+    result[:, :, 3] = np.where(c >= o, 1.0, -1.0)
+    result[:, :, 4] = np.clip(rs / 100.0, 0.0, 1.0)
+    result[:, :, 5] = np.clip((c - ema_safe) / ema_safe, -0.05, 0.05)
+    result[:, :, 6] = np.clip(vs, 0.0, 3.0)
+
+    result = np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Batch precomputation (compute all indicators once, then index)
 # ---------------------------------------------------------------------------
@@ -901,16 +966,13 @@ def extract_all_features(
     # Vectorized tabular feature extraction (indicators computed once)
     tabular = _batch_extract_tabular(df_5m, symbol, btc_df_5m, sample_indices, external_features)
 
-    # LSTM sequences (per-point — each uses a small 116-bar window, fast)
-    sequence_list: List[np.ndarray] = []
-    for i in sample_indices:
-        seq = build_lstm_sequence(df_5m.iloc[max(0, i - LSTM_WINDOW - 20):i])
-        sequence_list.append(seq)
+    # Batch LSTM sequence builder (vectorized, indicators computed once)
+    sequences = build_lstm_sequences_batch(df_5m, sample_indices)
 
     timestamps = [df_5m.index[i - 1] for i in sample_indices]
 
     return (
         tabular,
-        np.array(sequence_list, dtype=np.float32),
+        sequences,
         timestamps,
     )

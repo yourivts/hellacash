@@ -3,17 +3,34 @@
 Loads trained Transformer + XGBoost models and runs a realistic backtest
 across all pairs, reporting per-pair and aggregate P&L, Sharpe, drawdown,
 and yearly breakdown.
+
+Batch ML inference: features are extracted once per pair (vectorized), then
+Transformer + XGBoost run in batch. A lookup wrapper provides instant signal
+retrieval during the backtest engine loop.
 """
-import sys, os, time, statistics
+import sys, os, time, statistics, gc
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict
+
+import numpy as np
+import torch
+import xgboost as xgb
 
 sys.stdout.reconfigure(line_buffering=True)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bot.exchange.bitvavo_client import BitvavoClient
+import pandas as pd
+
+from bot.data.candle_store import CandleStore
+from bot.data.external_features import ExternalDataProvider
 from bot.backtest.engine import BacktestEngine
-from bot.learning.ml_signal_generator import MLSignalGenerator
+from bot.learning.ml_signal_generator import MLSignalGenerator, HORIZONS, DIRECTIONS, MIN_SIGNAL_PROB
+from bot.learning.ml_features import (
+    _batch_extract_tabular,
+    build_lstm_sequences_batch,
+    MIN_BARS_5M,
+)
+from bot.config import get_settings
 
 # Use same pairs as training
 PAIRS = [
@@ -38,19 +55,142 @@ PARAMS = {
     "max_hold_hours": 72,
 }
 
+# BacktestEngine signal cadence
+ENGINE_WARMUP = 60
+ENGINE_SIGNAL_EVERY = 12
 
-def fetch_candles(pair, days):
-    client = BitvavoClient(api_key="", api_secret="", paper_trading=True)
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=days)
-    print(f"  Fetching {pair}...", end="", flush=True)
-    candles = client.get_candles_range(pair, interval="5m", start=start, end=end)
-    if candles:
-        actual_days = (candles[-1].timestamp - candles[0].timestamp).days
-        print(f" {len(candles):,} candles ({actual_days} days)", flush=True)
-    else:
-        print(" FAILED", flush=True)
-    return candles
+
+def load_candles_db(candle_store, pair, start, end):
+    """Load 5m candles from PostgreSQL (much faster than API)."""
+    print(f"  Loading {pair} from DB...", end="", flush=True)
+    df = candle_store.get_candles(pair, start, end, resample="5m")
+    if df.empty:
+        print(" NO DATA", flush=True)
+        return None
+    actual_days = (df.index[-1] - df.index[0]).days
+    print(f" {len(df):,} candles ({actual_days} days)", flush=True)
+    return df
+
+
+class PrecomputedMLSignals:
+    """Lookup wrapper — returns pre-computed ML predictions by DataFrame length.
+
+    The backtest engine calls predict(df_window, symbol) where df_window is
+    df.iloc[max(0, i-2000):i+1]. We identify the candle index from len(df_window)
+    offset by the window start, but the simplest approach is to key on the original
+    DataFrame index of the last candle in the window.
+    """
+
+    def __init__(self, signal_map):
+        """signal_map: dict mapping candle_index -> prediction dict"""
+        self._signals = signal_map
+        self._disabled = False
+
+    def predict(self, df_5m, symbol="BTC-EUR", **kwargs):
+        """Look up pre-computed prediction for the last candle in df_5m."""
+        default = {
+            "probabilities": [0.5] * 12,
+            "direction": None,
+            "net_up": 0.5,
+            "net_down": 0.5,
+        }
+        if self._disabled:
+            return default
+
+        # The engine passes df.iloc[max(0, i-2000):i+1]
+        # The last timestamp in this window identifies the signal point
+        last_ts = df_5m.index[-1]
+        result = self._signals.get(last_ts)
+        if result is not None:
+            return result
+        return default
+
+
+def precompute_ml_signals(ml_gen, df, pair, btc_df=None, external_features=None):
+    """Batch-compute all ML signals for a pair's full DataFrame.
+
+    Args:
+        btc_df: BTC-EUR 5m DataFrame for cross-asset features (features 62-64)
+        external_features: (len(df), 32) array of external data (features 55-61, 65-89)
+
+    Returns a dict mapping timestamp -> prediction result.
+    """
+    n = len(df)
+    # Engine evaluates at indices where (i - WARMUP) % SIGNAL_EVERY == 0
+    # and i >= MIN_BARS_5M (features need enough history)
+    first_signal = max(ENGINE_WARMUP, MIN_BARS_5M)
+    # Align to engine cadence
+    remainder = (first_signal - ENGINE_WARMUP) % ENGINE_SIGNAL_EVERY
+    if remainder != 0:
+        first_signal += ENGINE_SIGNAL_EVERY - remainder
+
+    sample_indices = np.arange(first_signal, n, ENGINE_SIGNAL_EVERY)
+    if len(sample_indices) == 0:
+        return {}
+
+    print(f"    Extracting {len(sample_indices):,} feature vectors...", end="", flush=True)
+    t0 = time.time()
+
+    # 1. Batch tabular features (indicators computed once, vectorized indexing)
+    # Pass BTC data for cross-asset features and external data
+    btc_for_features = btc_df if pair != "BTC-EUR" else None
+    tabular = _batch_extract_tabular(df, pair, btc_for_features, sample_indices, external_features)
+
+    # 2. Batch LSTM/Transformer sequences
+    sequences = build_lstm_sequences_batch(df, sample_indices)
+    print(f" {time.time()-t0:.1f}s", flush=True)
+
+    # 3. Batch Transformer embedding
+    print(f"    Transformer embedding ({len(sequences)} sequences)...", end="", flush=True)
+    t0 = time.time()
+    device = next(ml_gen._embedder.parameters()).device
+    ml_gen._embedder.eval()
+    embeddings = []
+    batch_size = 4096
+    with torch.no_grad():
+        for start_idx in range(0, len(sequences), batch_size):
+            batch = torch.from_numpy(sequences[start_idx:start_idx + batch_size]).float().to(device)
+            emb = ml_gen._embedder.embed(batch)
+            embeddings.append(emb.cpu().numpy())
+    embeddings = np.concatenate(embeddings, axis=0)  # (N, 16)
+    print(f" {time.time()-t0:.1f}s", flush=True)
+
+    # 4. Concatenate features: 90 tabular + 16 embedding = 106
+    combined = np.concatenate([tabular, embeddings], axis=1).astype(np.float32)  # (N, 106)
+
+    # 5. Batch XGBoost predictions (all 12 models)
+    print(f"    XGBoost batch inference ({len(combined):,} samples x 12 models)...", end="", flush=True)
+    t0 = time.time()
+    all_probs = np.zeros((len(combined), 12), dtype=np.float32)
+    dmat = xgb.DMatrix(combined)
+    for model_idx, (h, d) in enumerate([(h, d) for h in HORIZONS for d in DIRECTIONS]):
+        key = f"{h}_{d}"
+        model = ml_gen._xgb_models[key]
+        booster = model.get_booster()
+        raw_preds = booster.predict(dmat)
+        all_probs[:, model_idx] = raw_preds
+    print(f" {time.time()-t0:.1f}s", flush=True)
+
+    # 6. Build signal map: timestamp -> prediction dict
+    signal_map = {}
+    for j, idx in enumerate(sample_indices):
+        probs = all_probs[j].tolist()
+        up_probs = [probs[i] for i in range(0, 12, 2)]
+        down_probs = [probs[i] for i in range(1, 12, 2)]
+        net_up = float(np.mean(up_probs))
+        net_down = float(np.mean(down_probs))
+        direction = None
+        if max(net_up, net_down) >= MIN_SIGNAL_PROB:
+            direction = "LONG" if net_up > net_down else "SHORT"
+        ts = df.index[idx]
+        signal_map[ts] = {
+            "probabilities": probs,
+            "direction": direction,
+            "net_up": net_up,
+            "net_down": net_down,
+        }
+
+    return signal_map
 
 
 def analyze_trades(trade_log):
@@ -134,11 +274,11 @@ def print_strategy_report(name, data, total_capital=CAPITAL_PER_PAIR):
 
 def main():
     print("=" * 90)
-    print(f"  ML SIGNAL GENERATOR: {YEARS}-YEAR BACKTEST")
+    print(f"  ML SIGNAL GENERATOR: {YEARS}-YEAR BACKTEST (BATCH MODE)")
     print(f"  Transformer + XGBoost | Capital: EUR {CAPITAL_PER_PAIR:,.0f}/pair | 5m candles")
     print("=" * 90, flush=True)
 
-    # Load ML signal generator
+    # Load ML signal generator (for model weights)
     print("\n  Loading ML models...", end="", flush=True)
     try:
         ml_gen = MLSignalGenerator(model_dir="models/ml_signals")
@@ -146,6 +286,25 @@ def main():
     except FileNotFoundError as e:
         print(f" FAILED: {e}")
         sys.exit(1)
+
+    # Load candles from PostgreSQL
+    settings = get_settings()
+    candle_store = CandleStore(db_url=settings.database_url)
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=DAYS)
+
+    # Load BTC-EUR first (needed for cross-asset features on all other pairs)
+    print("\n  Loading BTC-EUR for cross-asset features...", end="", flush=True)
+    btc_df = candle_store.get_candles("BTC-EUR", start, end, resample="5m")
+    print(f" {len(btc_df):,} candles", flush=True)
+
+    # Load external data (funding rates, OI, on-chain, macro — 32 features)
+    print("  Loading external data...", end="", flush=True)
+    ext_provider = ExternalDataProvider(cache_dir="data/external_cache", db_url=settings.database_url)
+    btc_idx = btc_df.index if btc_df.index.tz is not None else btc_df.index.tz_localize("UTC")
+    ext_features_full = ext_provider.build_training_features(btc_idx)
+    ext_df = pd.DataFrame(ext_features_full, index=btc_idx)
+    print(f" {ext_features_full.shape}", flush=True)
 
     # Aggregate tracking
     agg_strats = defaultdict(lambda: {
@@ -158,26 +317,45 @@ def main():
     pair_results = []
 
     for pair in PAIRS:
-        candles = fetch_candles(pair, DAYS)
-        if not candles or len(candles) < 10000:
-            print(f"  {pair}: insufficient data ({len(candles) if candles else 0}), skipping")
+        df = load_candles_db(candle_store, pair, start, end)
+        if df is None or len(df) < 10000:
+            print(f"  {pair}: insufficient data ({len(df) if df is not None else 0}), skipping")
             continue
 
-        actual_days = (candles[-1].timestamp - candles[0].timestamp).days
+        actual_days = (df.index[-1] - df.index[0]).days
 
+        # Align external features to this pair's index
+        pair_idx = df.index if df.index.tz is not None else df.index.tz_localize("UTC")
+        pair_ext = ext_df.reindex(pair_idx, method="ffill").values.astype(np.float32)
+
+        # Pre-compute all ML signals in batch (with BTC + external features)
+        t0 = time.time()
+        signal_map = precompute_ml_signals(ml_gen, df, pair, btc_df=btc_df, external_features=pair_ext)
+        precomp_time = time.time() - t0
+
+        n_signals = sum(1 for v in signal_map.values() if v["direction"] is not None)
+        print(f"    Pre-computed {len(signal_map):,} predictions "
+              f"({n_signals:,} with direction) in {precomp_time:.1f}s", flush=True)
+
+        # Create lookup wrapper
+        lookup = PrecomputedMLSignals(signal_map)
+
+        # Run backtest with instant signal lookup
         t0 = time.time()
         engine = BacktestEngine(
-            candles,
+            df=df,
+            symbol=pair,
             initial_capital=CAPITAL_PER_PAIR,
             max_open_positions=3,
             strategy_params=PARAMS,
-            ml_signal_generator=ml_gen,
+            ml_signal_generator=lookup,
         )
         result = engine.run()
-        elapsed = time.time() - t0
+        bt_time = time.time() - t0
 
         print(f"\n{'='*90}")
-        print(f"  {pair} ({actual_days} days, {len(candles):,} candles, {elapsed:.0f}s)")
+        print(f"  {pair} ({actual_days} days, {len(df):,} candles)")
+        print(f"  Precompute: {precomp_time:.0f}s | Backtest: {bt_time:.0f}s | Total: {precomp_time+bt_time:.0f}s")
         print(f"  P&L=EUR{result.total_pnl:+,.2f} | Trades={result.total_trades} | "
               f"WR={result.win_rate:.0%} | Sharpe={result.sharpe_ratio:.2f} | "
               f"MaxDD={result.max_drawdown_pct:.1f}% | Fees=EUR{result.total_fees_paid:.2f}")
@@ -212,7 +390,9 @@ def main():
                 a["exit_reasons"][k] += v
             a["hold_times"].extend(data["hold_times"])
 
-        time.sleep(1)
+        # Free memory
+        del signal_map, lookup, df
+        gc.collect()
 
     # === PAIR SUMMARY TABLE ===
     print(f"\n\n{'='*90}")

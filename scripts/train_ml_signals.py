@@ -14,6 +14,7 @@ Pipeline:
     11. Save all models to models/ml_signals/
 """
 import sys, os, json, time
+os.environ["PYTHONUNBUFFERED"] = "1"
 sys.stdout.reconfigure(line_buffering=True)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -34,8 +35,8 @@ from bot.data.candle_store import CandleStore
 from bot.data.external_features import ExternalDataProvider
 from bot.learning.transformer_embedder import TransformerEmbedder, train_transformer
 from bot.learning.ml_features import (
-    extract_all_features, build_lstm_sequence, N_TABULAR, LSTM_WINDOW, LSTM_CHANNELS,
-    LSTM_MIN_BARS,
+    extract_all_features, build_lstm_sequence, build_lstm_sequences_batch,
+    N_TABULAR, LSTM_WINDOW, LSTM_CHANNELS, LSTM_MIN_BARS,
 )
 
 PAIRS = [
@@ -59,7 +60,7 @@ HORIZONS = [
 
 # Transformer training params
 TRANSFORMER_EPOCHS = 50
-TRANSFORMER_BATCH = 256
+TRANSFORMER_BATCH = 2048
 TRANSFORMER_LR = 1e-3
 TRANSFORMER_PREDICT_BARS = 12
 LSTM_PREDICT_BARS = TRANSFORMER_PREDICT_BARS  # alias — build_lstm_targets() uses this name
@@ -131,17 +132,20 @@ def optuna_transformer_hpo(train_seqs, train_targets, val_seqs, val_targets, n_t
     import optuna
 
     def objective(trial):
-        d_model = trial.suggest_categorical("d_model", [32, 64, 128])
+        d_model = trial.suggest_categorical("d_model", [64, 128])
         nhead = trial.suggest_categorical("nhead", [2, 4, 8])
         if d_model % nhead != 0:
             raise optuna.TrialPruned()
-        n_layers = trial.suggest_categorical("n_layers", [2, 3, 4, 6])
-        dropout = trial.suggest_categorical("dropout", [0.05, 0.1, 0.15, 0.2, 0.3])
-        lr = trial.suggest_categorical("lr", [5e-4, 1e-3, 2e-3])
+        n_layers = trial.suggest_categorical("n_layers", [2, 3, 4])
+        dropout = trial.suggest_categorical("dropout", [0.1, 0.15, 0.2])
+        lr = trial.suggest_categorical("lr", [1e-3, 2e-3])
 
+        # Scale batch size by model size to avoid OOM on 8GB GPU
         batch_size = TRANSFORMER_BATCH
-        if d_model >= 128:
-            batch_size = batch_size // 2
+        if d_model >= 128 and n_layers >= 4:
+            batch_size = TRANSFORMER_BATCH // 4
+        elif d_model >= 128:
+            batch_size = TRANSFORMER_BATCH // 2
 
         model = TransformerEmbedder(d_model=d_model, nhead=nhead, num_layers=n_layers, dropout=dropout)
 
@@ -150,7 +154,7 @@ def optuna_transformer_hpo(train_seqs, train_targets, val_seqs, val_targets, n_t
             losses = train_transformer(
                 model, train_seqs, train_targets,
                 val_seqs=val_seqs, val_targets=val_targets,
-                epochs=15, batch_size=batch_size, lr=lr,
+                epochs=8, batch_size=batch_size, lr=lr,
                 trial=trial,
             )
             # Batched validation to avoid OOM
@@ -170,16 +174,17 @@ def optuna_transformer_hpo(train_seqs, train_targets, val_seqs, val_targets, n_t
                         val_loss_sum += float(torch.nn.functional.mse_loss(vp, vy).item()) * len(vx)
                     val_n += len(vx)
             return val_loss_sum / max(val_n, 1)
-        except (RuntimeError, Exception) as e:
-            if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
-                import torch
-                torch.cuda.empty_cache()
+        except BaseException as e:
+            import torch
+            torch.cuda.empty_cache()
+            err_msg = str(e).lower()
+            if "out of memory" in err_msg or "cuda" in err_msg or "accelerator" in err_msg:
                 raise optuna.TrialPruned()
             raise
 
     study = optuna.create_study(
         direction="minimize",
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=3),
+        pruner=optuna.pruners.SuccessiveHalvingPruner(min_resource=2, reduction_factor=3),
     )
     study.optimize(objective, n_trials=n_trials)
 
@@ -293,6 +298,12 @@ def optuna_xgboost_hpo(X_train, y_train, X_val, y_val, n_trials=30,
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--skip-transformer", action="store_true",
+                        help="Skip Transformer HPO+training, load saved model")
+    args = parser.parse_args()
+
     print("=" * 80)
     print("  ML SIGNAL GENERATOR TRAINING PIPELINE v2")
     print("  Transformer + External Data + Optuna HPO + Class Weights")
@@ -379,86 +390,133 @@ def main():
     else:
         ext_features_full = None
 
-    # Step 3: Build Transformer training data
-    print("\n  Building Transformer training data...")
-    STRIDE = 6
-    WINDOW_PAD = 300
-
-    # Pass 1: count total sequences to pre-allocate arrays (avoids MemoryError)
-    total_count = 0
-    pair_counts = {}
-    for pair, df in all_dfs.items():
-        n_pair = len(df) - TRANSFORMER_PREDICT_BARS
-        count = 0
-        for i in range(LSTM_MIN_BARS, n_pair, STRIDE):
-            count += 1
-        pair_counts[pair] = count
-        total_count += count
-    print(f"  Pre-allocating arrays for ~{total_count:,} sequences...")
-
-    # Pre-allocate contiguous arrays
-    seqs_arr = np.zeros((total_count, 96, 7), dtype=np.float32)
-    targets_arr = np.zeros((total_count, TRANSFORMER_PREDICT_BARS * 5), dtype=np.float32)
-    write_idx = 0
-    valid_count = 0
-
-    # Pass 2: fill arrays in-place
-    for pair, df in all_dfs.items():
-        targets = build_lstm_targets(df)
-        n_pair = len(df) - TRANSFORMER_PREDICT_BARS
-        count_before = valid_count
-        for i in range(LSTM_MIN_BARS, n_pair, STRIDE):
-            window_start = max(0, i + 1 - WINDOW_PAD)
-            seq = build_lstm_sequence(df.iloc[window_start:i + 1])
-            if not np.all(seq == 0):
-                seqs_arr[valid_count] = seq
-                targets_arr[valid_count] = targets[i]
-                valid_count += 1
-        print(f"    {pair}: {valid_count - count_before:,} sequences ({valid_count:,} total)")
-
-    # Trim to actual valid count
-    seqs_arr = seqs_arr[:valid_count]
-    targets_arr = targets_arr[:valid_count]
-    print(f"  Total Transformer samples: {len(seqs_arr):,}")
-
-    val_cutoff = int(len(seqs_arr) * 0.88)
-    train_seqs, val_seqs = seqs_arr[:val_cutoff], seqs_arr[val_cutoff:]
-    train_targets, val_targets = targets_arr[:val_cutoff], targets_arr[val_cutoff:]
-    print(f"  Transformer train: {len(train_seqs):,}, val: {len(val_seqs):,}")
-
-    # Step 4: Optuna Transformer HPO
-    print("\n  Running Optuna Transformer HPO (20 trials)...")
-    t0 = time.time()
-    best_transformer_params = optuna_transformer_hpo(
-        train_seqs, train_targets, val_seqs, val_targets, n_trials=20,
-    )
-    print(f"  HPO completed in {time.time() - t0:.0f}s")
-
-    # Step 5: Train best Transformer
     import torch, gc
-    torch.cuda.empty_cache()
-    gc.collect()
 
-    print("\n  Training Transformer with best params...")
-    transformer = TransformerEmbedder(
-        d_model=best_transformer_params["d_model"],
-        nhead=best_transformer_params["nhead"],
-        num_layers=best_transformer_params["n_layers"],
-        dropout=best_transformer_params["dropout"],
-    )
-    t0 = time.time()
-    final_batch = TRANSFORMER_BATCH
-    if best_transformer_params["d_model"] >= 128:
-        final_batch = TRANSFORMER_BATCH // 2
+    if args.skip_transformer:
+        # Load existing Transformer model
+        print("\n  Loading pre-trained Transformer (--skip-transformer)...")
+        # Load config to get architecture params
+        config_path = model_dir / "feature_config.json"
+        if config_path.exists():
+            saved_config = json.loads(config_path.read_text())
+            best_transformer_params = saved_config.get("transformer_params", {})
+        else:
+            best_transformer_params = {"d_model": 128, "nhead": 2, "n_layers": 3, "dropout": 0.15, "lr": 0.001}
+        transformer = TransformerEmbedder(
+            d_model=best_transformer_params.get("d_model", 128),
+            nhead=best_transformer_params.get("nhead", 2),
+            num_layers=best_transformer_params.get("n_layers", 3),
+            dropout=best_transformer_params.get("dropout", 0.15),
+        )
+        transformer.load(str(model_dir / "transformer.pt"))
+        print(f"  Loaded Transformer: {best_transformer_params}")
+    else:
+        # Step 3: Build Transformer training data
+        print("\n  Building Transformer training data...")
+        STRIDE = 6
+        WINDOW_PAD = 300
 
-    train_transformer(
-        transformer, train_seqs, train_targets,
-        val_seqs=val_seqs, val_targets=val_targets,
-        epochs=TRANSFORMER_EPOCHS, batch_size=final_batch,
-        lr=best_transformer_params["lr"],
-    )
-    print(f"  Transformer trained in {time.time() - t0:.0f}s")
-    transformer.save(str(model_dir / "transformer.pt"))
+        # Pass 1: count total sequences to pre-allocate arrays (avoids MemoryError)
+        total_count = 0
+        pair_indices = {}
+        for pair, df in all_dfs.items():
+            n_pair = len(df) - TRANSFORMER_PREDICT_BARS
+            indices = np.arange(LSTM_MIN_BARS, n_pair, STRIDE)
+            pair_indices[pair] = indices
+            total_count += len(indices)
+        print(f"  Pre-allocating arrays for ~{total_count:,} sequences...")
+
+        # Pre-allocate contiguous arrays
+        seqs_arr = np.zeros((total_count, 96, 7), dtype=np.float32)
+        targets_arr = np.zeros((total_count, TRANSFORMER_PREDICT_BARS * 5), dtype=np.float32)
+        valid_count = 0
+
+        # Pass 2: batch-build sequences per pair (indicators computed once per pair)
+        for pair, df in all_dfs.items():
+            targets = build_lstm_targets(df)
+            indices = pair_indices[pair]
+
+            # Batch build all sequences for this pair at once
+            batch_seqs = build_lstm_sequences_batch(df, indices)
+
+            # Filter out all-zero sequences
+            nonzero_mask = np.any(batch_seqs != 0, axis=(1, 2))
+            n_valid = int(nonzero_mask.sum())
+            count_before = valid_count
+
+            seqs_arr[valid_count:valid_count + n_valid] = batch_seqs[nonzero_mask]
+            targets_arr[valid_count:valid_count + n_valid] = targets[indices[nonzero_mask]]
+            valid_count += n_valid
+            print(f"    {pair}: {valid_count - count_before:,} sequences ({valid_count:,} total)")
+
+        # Trim to actual valid count
+        seqs_arr = seqs_arr[:valid_count]
+        targets_arr = targets_arr[:valid_count]
+        print(f"  Total Transformer samples: {len(seqs_arr):,}")
+
+        val_cutoff = int(len(seqs_arr) * 0.88)
+        train_seqs, val_seqs = seqs_arr[:val_cutoff], seqs_arr[val_cutoff:]
+        train_targets, val_targets = targets_arr[:val_cutoff], targets_arr[val_cutoff:]
+        print(f"  Transformer train: {len(train_seqs):,}, val: {len(val_seqs):,}")
+
+        # Step 4: Optuna Transformer HPO
+        print("\n  Running Optuna Transformer HPO (12 trials)...")
+        t0 = time.time()
+        best_transformer_params = optuna_transformer_hpo(
+            train_seqs, train_targets, val_seqs, val_targets, n_trials=12,
+        )
+        print(f"  HPO completed in {time.time() - t0:.0f}s")
+
+        # Step 5: Train best Transformer
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        print("\n  Training Transformer with best params...")
+        transformer = TransformerEmbedder(
+            d_model=best_transformer_params["d_model"],
+            nhead=best_transformer_params["nhead"],
+            num_layers=best_transformer_params["n_layers"],
+            dropout=best_transformer_params["dropout"],
+        )
+        t0 = time.time()
+        final_batch = TRANSFORMER_BATCH
+        d = best_transformer_params["d_model"]
+        nl = best_transformer_params["n_layers"]
+        if d >= 128 and nl >= 4:
+            final_batch = TRANSFORMER_BATCH // 4
+        elif d >= 128:
+            final_batch = TRANSFORMER_BATCH // 2
+
+        # OOM retry: if batch_size OOMs, halve and retry
+        for attempt in range(3):
+            try:
+                train_transformer(
+                    transformer, train_seqs, train_targets,
+                    val_seqs=val_seqs, val_targets=val_targets,
+                    epochs=TRANSFORMER_EPOCHS, batch_size=final_batch,
+                    lr=best_transformer_params["lr"],
+                )
+                break
+            except BaseException as e:
+                torch.cuda.empty_cache()
+                if "out of memory" in str(e).lower() or "cuda" in str(e).lower() or "accelerator" in str(e).lower():
+                    final_batch = final_batch // 2
+                    print(f"  OOM — retrying with batch_size={final_batch} (attempt {attempt + 2}/3)")
+                    transformer = TransformerEmbedder(
+                        d_model=best_transformer_params["d_model"],
+                        nhead=best_transformer_params["nhead"],
+                        num_layers=best_transformer_params["n_layers"],
+                        dropout=best_transformer_params["dropout"],
+                    )
+                else:
+                    raise
+        print(f"  Transformer trained in {time.time() - t0:.0f}s")
+        transformer.save(str(model_dir / "transformer.pt"))
+
+        # Free Transformer training data (~4GB) before feature extraction
+        del seqs_arr, targets_arr, train_seqs, val_seqs, train_targets, val_targets
+        del pair_indices
+        gc.collect()
 
     # Step 6: Extract features + embeddings for XGBoost
     print("\n  Extracting tabular features + Transformer embeddings...")
@@ -473,18 +531,20 @@ def main():
     all_timestamps_flat = []
     processed_pairs = []
 
+    # Pre-build external features aligned to each pair's index (reindex once, not re-fetch)
+    ext_cache = {}
+    if ext_features_full is not None:
+        btc_idx = btc_df.index if btc_df.index.tz is not None else btc_df.index.tz_localize("UTC")
+        ext_df = pd.DataFrame(ext_features_full, index=btc_idx)
+        for pair, df in all_dfs.items():
+            pair_idx = df.index if df.index.tz is not None else df.index.tz_localize("UTC")
+            ext_cache[pair] = ext_df.reindex(pair_idx, method="ffill").values.astype(np.float32)
+
     for pair, df in all_dfs.items():
         print(f"    {pair}: extracting features...", end="", flush=True)
         t0 = time.time()
 
-        pair_ext = None
-        if ext_features_full is not None and pair == "BTC-EUR":
-            pair_ext = ext_features_full
-        elif ext_features_full is not None:
-            pair_idx = df.index
-            if pair_idx.tz is None:
-                pair_idx = pair_idx.tz_localize("UTC")
-            pair_ext = ext_provider.build_training_features(pair_idx)
+        pair_ext = ext_cache.get(pair)
 
         tabular, sequences, timestamps = extract_all_features(
             df, symbol=pair,
@@ -584,72 +644,86 @@ def main():
         n_trials=30, scale_pos_weight=spw,
     )
 
-    # Step 10: Train 12 XGBoost models
+    # Step 10: Train 12 XGBoost models (up/down pairs in parallel per horizon)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+    print_lock = threading.Lock()
+
     print("\n  Training 12 XGBoost models (shared params + 10 fine-tune trials each)...")
     importances = {}
-    for h_idx, (h_name, bars, threshold) in enumerate(HORIZONS):
-        for d_idx, d_name in enumerate(["up", "down"]):
-            col = h_idx * 2 + d_idx
-            y = y_all[:, col]
 
-            train_valid = train_mask & ~np.isnan(y)
-            val_valid = val_mask & ~np.isnan(y)
-            test_valid = test_mask & ~np.isnan(y)
+    def _train_one_xgb(h_idx, h_name, bars, d_idx, d_name):
+        col = h_idx * 2 + d_idx
+        y = y_all[:, col]
 
-            X_train, y_train = X[train_valid], y[train_valid]
-            X_val, y_val = X[val_valid], y[val_valid]
-            X_test, y_test = X[test_valid], y[test_valid]
+        train_valid = train_mask & ~np.isnan(y)
+        val_valid = val_mask & ~np.isnan(y)
+        test_valid = test_mask & ~np.isnan(y)
 
-            n_pos = float(y_train.sum())
-            n_neg = float(len(y_train) - n_pos)
-            scale_pos_weight = n_neg / max(n_pos, 1)
+        X_train, y_train = X[train_valid], y[train_valid]
+        X_val, y_val = X[val_valid], y[val_valid]
+        X_test, y_test = X[test_valid], y[test_valid]
 
-            fine_tuned = optuna_xgboost_hpo(
-                X_train, y_train, X_val, y_val,
-                n_trials=10, scale_pos_weight=scale_pos_weight,
-                seed_params=shared_xgb_params,
-            )
+        n_pos = float(y_train.sum())
+        n_neg = float(len(y_train) - n_pos)
+        spw = n_neg / max(n_pos, 1)
 
-            model_params = {
-                **XGB_BASE_PARAMS,
-                **{k: fine_tuned[k] for k in fine_tuned
-                   if k in ("max_depth", "learning_rate", "n_estimators",
-                            "min_child_weight", "subsample", "colsample_bytree",
-                            "reg_alpha", "reg_lambda")},
-                "scale_pos_weight": scale_pos_weight,
-            }
+        fine_tuned = optuna_xgboost_hpo(
+            X_train, y_train, X_val, y_val,
+            n_trials=10, scale_pos_weight=spw,
+            seed_params=shared_xgb_params,
+        )
 
-            model = xgb.XGBClassifier(**model_params)
-            model.fit(
-                X_train, y_train,
-                eval_set=[(X_val, y_val)],
-                verbose=False,
-            )
+        model_params = {
+            **XGB_BASE_PARAMS,
+            **{k: fine_tuned[k] for k in fine_tuned
+               if k in ("max_depth", "learning_rate", "n_estimators",
+                        "min_child_weight", "subsample", "colsample_bytree",
+                        "reg_alpha", "reg_lambda")},
+            "scale_pos_weight": spw,
+        }
 
-            test_pred = model.predict(X_test)
-            test_prob = model.predict_proba(X_test)[:, 1]
+        mdl = xgb.XGBClassifier(**model_params)
+        mdl.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
 
-            acc = float(np.mean(test_pred == y_test))
-            pos_rate = float(y_test.mean())
-            f1 = f1_score(y_test, test_pred, zero_division=0)
-            prec = precision_score(y_test, test_pred, zero_division=0)
-            rec = recall_score(y_test, test_pred, zero_division=0)
-            try:
-                auc = roc_auc_score(y_test, test_prob)
-            except ValueError:
-                auc = 0.0
+        test_pred = mdl.predict(X_test)
+        test_prob = mdl.predict_proba(X_test)[:, 1]
 
-            fi = model.feature_importances_
-            top_feat = int(fi.argmax())
-            max_fi = float(fi.max())
-            importances[f"{h_name}_{d_name}"] = fi.tolist()
+        acc = float(np.mean(test_pred == y_test))
+        pos_rate = float(y_test.mean())
+        f1 = f1_score(y_test, test_pred, zero_division=0)
+        prec = precision_score(y_test, test_pred, zero_division=0)
+        rec = recall_score(y_test, test_pred, zero_division=0)
+        try:
+            auc = roc_auc_score(y_test, test_prob)
+        except ValueError:
+            auc = 0.0
 
+        fi = mdl.feature_importances_
+        top_feat = int(fi.argmax())
+        max_fi = float(fi.max())
+
+        mdl.save_model(str(model_dir / f"xgb_{h_name}_{d_name}.json"))
+
+        with print_lock:
             print(f"    xgb_{h_name}_{d_name}: F1={f1:.3f}, prec={prec:.3f}, "
                   f"rec={rec:.3f}, acc={acc:.3f}, AUC={auc:.3f}, "
-                  f"pos_rate={pos_rate:.3f}, spw={scale_pos_weight:.1f}, "
+                  f"pos_rate={pos_rate:.3f}, spw={spw:.1f}, "
                   f"top_feat={top_feat}({max_fi:.1%})")
 
-            model.save_model(str(model_dir / f"xgb_{h_name}_{d_name}.json"))
+        return f"{h_name}_{d_name}", fi.tolist()
+
+    # Run up/down pairs in parallel (2 at a time to share GPU)
+    futures = []
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        for h_idx, (h_name, bars, threshold) in enumerate(HORIZONS):
+            for d_idx, d_name in enumerate(["up", "down"]):
+                futures.append(pool.submit(
+                    _train_one_xgb, h_idx, h_name, bars, d_idx, d_name
+                ))
+        for fut in as_completed(futures):
+            key, fi_list = fut.result()
+            importances[key] = fi_list
 
     (model_dir / "feature_importances.json").write_text(json.dumps(importances, indent=2))
 

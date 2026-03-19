@@ -49,7 +49,18 @@ class MLSignalGenerator:
 
         if transformer_path.exists():
             from bot.learning.transformer_embedder import TransformerEmbedder
-            self._embedder = TransformerEmbedder()
+            # Read architecture params from feature_config to match saved weights
+            config_path = self._model_dir / "feature_config.json"
+            tp = {}
+            if config_path.exists():
+                with open(config_path) as f:
+                    tp = json.load(f).get("transformer_params", {})
+            self._embedder = TransformerEmbedder(
+                d_model=tp.get("d_model", 64),
+                nhead=tp.get("nhead", 4),
+                num_layers=tp.get("n_layers", 4),
+                dropout=tp.get("dropout", 0.1),
+            )
             self._embedder.load(str(transformer_path))
             self._embedder.to(device)
             self._embedder.eval()

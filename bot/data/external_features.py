@@ -104,16 +104,15 @@ def _fetch_fear_greed(limit: int = 0) -> pd.DataFrame:
 
 
 def _fetch_funding_rates(symbol: str = "BTCUSDT", limit: int = 1000) -> pd.DataFrame:
-    """Fetch funding rates from Binance Futures."""
+    """Fetch funding rates from Binance Futures (back to 2019)."""
     import requests
     try:
         url = "https://fapi.binance.com/fapi/v1/fundingRate"
         all_rows = []
-        start_time = None
-        for _ in range(50):  # max 50 pages
-            params = {"symbol": symbol, "limit": limit}
-            if start_time:
-                params["startTime"] = start_time
+        # Start from Sep 2019 (Binance Futures launch)
+        start_time = int(datetime(2019, 9, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        for _ in range(500):  # ~8 years at 1000 per page (3x/day)
+            params = {"symbol": symbol, "limit": limit, "startTime": start_time}
             resp = requests.get(url, params=params, timeout=30)
             resp.raise_for_status()
             data = resp.json()

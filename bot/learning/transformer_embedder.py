@@ -152,7 +152,7 @@ def train_transformer(
     val_seqs: np.ndarray | None = None,
     val_targets: np.ndarray | None = None,
     epochs: int = 50,
-    batch_size: int = 256,
+    batch_size: int = 2048,
     lr: float = 1e-3,
     trial=None,
 ) -> list[float]:
@@ -174,15 +174,8 @@ def train_transformer(
     use_amp = device.type == "cuda"
     model.to(device)
 
-    # torch.compile JIT — only for final training (not HPO trials)
+    # Skip torch.compile — causes OOM on 8GB GPUs with d_model>=128
     compiled_model = model
-    if trial is None and hasattr(torch, "compile"):
-        try:
-            compiled_model = torch.compile(model)
-            logger.info("torch.compile applied")
-        except Exception:
-            logger.info("torch.compile unavailable, continuing without")
-            compiled_model = model
 
     compiled_model.train()
     logger.info("Transformer training on %s (amp=%s, n=%d)", device, use_amp, len(sequences))
@@ -192,10 +185,17 @@ def train_transformer(
     criterion = nn.MSELoss()
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    # Keep data on CPU, load batches to GPU on-the-fly to avoid OOM
-    X_cpu = torch.from_numpy(sequences).float()
-    Y_cpu = torch.from_numpy(targets).float()
+    # Keep data on CPU with pinned memory for fast async GPU transfers
+    X_cpu = torch.from_numpy(sequences).float().pin_memory()
+    Y_cpu = torch.from_numpy(targets).float().pin_memory()
     n = len(X_cpu)
+
+    # Pre-convert validation data once (not every epoch)
+    vX_cpu = None
+    vY_cpu = None
+    if val_seqs is not None and val_targets is not None:
+        vX_cpu = torch.from_numpy(val_seqs).float().pin_memory()
+        vY_cpu = torch.from_numpy(val_targets).float().pin_memory()
 
     loss_history: list[float] = []
 
@@ -207,10 +207,10 @@ def train_transformer(
 
         for start in range(0, n - batch_size + 1, batch_size):
             idx = perm[start : start + batch_size]
-            x_batch = X_cpu[idx].to(device)
-            y_batch = Y_cpu[idx].to(device)
+            x_batch = X_cpu[idx].to(device, non_blocking=True)
+            y_batch = Y_cpu[idx].to(device, non_blocking=True)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=use_amp):
                 pred = compiled_model.predict_next(x_batch)
                 loss = criterion(pred, y_batch)
@@ -228,16 +228,14 @@ def train_transformer(
         loss_history.append(avg_loss)
 
         # Validation (batch to avoid OOM on large val sets)
-        if val_seqs is not None and val_targets is not None:
+        if vX_cpu is not None:
             compiled_model.eval()
             val_loss_sum = 0.0
             val_batches = 0
-            vX_cpu = torch.from_numpy(val_seqs).float()
-            vY_cpu = torch.from_numpy(val_targets).float()
             with torch.no_grad():
                 for vs in range(0, len(vX_cpu), batch_size):
-                    vx = vX_cpu[vs:vs + batch_size].to(device)
-                    vy = vY_cpu[vs:vs + batch_size].to(device)
+                    vx = vX_cpu[vs:vs + batch_size].to(device, non_blocking=True)
+                    vy = vY_cpu[vs:vs + batch_size].to(device, non_blocking=True)
                     with torch.amp.autocast("cuda", enabled=use_amp):
                         vp = compiled_model.predict_next(vx)
                         val_loss_sum += criterion(vp, vy).item()
