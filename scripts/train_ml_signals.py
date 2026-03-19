@@ -309,16 +309,23 @@ def main():
     from bot.exchange.bitvavo_client import _api_get, _API_BASE
 
     async def _topup():
-        """Fetch candles from the last stored timestamp to now for each pair."""
-        print("\n  Topping up DB with recent candles from Bitvavo API...")
+        """Ensure all pairs have data in DB, then fetch recent candles."""
+        print("\n  Syncing candle data to DB...")
         loop = asyncio.get_running_loop()
         now_ms = int(time.time() * 1000)
         for pair in PAIRS:
             last_ts = candle_store._get_last_timestamp(pair)
             if last_ts is None:
-                print(f"    {pair}: no data in DB, skipping top-up (needs bulk_download)")
-                continue
-            cursor_ms = int(last_ts.timestamp() * 1000) + 60_000  # 1min after last
+                # Full download for pairs with no DB data
+                print(f"    {pair}: no data in DB, downloading full history...", flush=True)
+                await candle_store._download_symbol(pair)
+                span = candle_store._get_data_span_days(pair)
+                print(f"    {pair}: downloaded {span or 0} days")
+                last_ts = candle_store._get_last_timestamp(pair)
+                if last_ts is None:
+                    continue
+            # Top-up: fetch from last stored to now
+            cursor_ms = int(last_ts.timestamp() * 1000) + 60_000
             stored = 0
             while cursor_ms < now_ms:
                 page_end = min(cursor_ms + 1440 * 60_000, now_ms)
