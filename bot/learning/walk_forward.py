@@ -112,21 +112,31 @@ class WalkForwardOptimizer:
     def _should_adopt(self, windows: List[WFWindow]) -> bool:
         if len(windows) < MIN_WINDOWS:
             return False
-        sharpes = [w.sharpe for w in windows]
-        pnls = [w.pnl for w in windows]
-        ppfs = [w.profit_per_fee for w in windows]
+
+        # Separate windows that produced trades from idle ones
+        active = [w for w in windows if w.pnl != 0.0 or w.sharpe != 0.0]
+        if not active:
+            return False  # no trades at all
+
+        sharpes = [w.sharpe for w in active]
+        pnls = [w.pnl for w in active]
+        ppfs = [w.profit_per_fee for w in active]
 
         median_sharpe = statistics.median(sharpes)
         profitable = sum(1 for p in pnls if p > 0)
         sharpe_std = statistics.stdev(sharpes) if len(sharpes) > 1 else 999
         avg_ppf = statistics.mean(ppfs) if ppfs else 0.0
 
+        # Require at least 2 active windows to have a meaningful signal
+        if len(active) < 2:
+            return False
+
         return (
             median_sharpe > 0.3
-            and profitable >= len(windows) * 0.70
+            and profitable >= len(active) * 0.50  # 50% of *active* windows profitable
             and statistics.mean(pnls) > 0
-            and sharpe_std < 1.5
-            and avg_ppf > 1.5
+            and sharpe_std < 2.5
+            and avg_ppf > 1.0
         )
 
     def _run_rl_window(self, train_candles_5m, test_candles_5m,
@@ -166,6 +176,18 @@ class WalkForwardOptimizer:
 
         # Predict parameters
         params = self._rl_optimizer.predict(features, target_strategy or "orderflow")
+        logger.debug(
+            "Walk-forward RL params [%s]: signal_strength_min=%.2f, "
+            "consecutive_confirms=%s, min_profit_multiple=%.2f, "
+            "tf_weights=(%.2f, %.2f, %.2f)",
+            target_strategy,
+            params.get("signal_strength_min", 0.0),
+            params.get("consecutive_confirms", 1),
+            params.get("min_profit_multiple", 3.0),
+            params.get("tf_weight_1h", 1.0),
+            params.get("tf_weight_4h", 1.0),
+            params.get("tf_weight_1d", 1.0),
+        )
 
         # Run backtest on test candles (OOS validation)
         try:

@@ -110,14 +110,24 @@ class BacktestEngine:
 
     def __init__(
         self,
-        candles: List[CandleData | Dict[str, Any]],
+        candles: Optional[List[CandleData | Dict[str, Any]]] = None,
         initial_capital: float = 10_000.0,
         max_open_positions: int = 10,
         slippage_pct: float = 0.001,
         strategy_params: Optional[Dict[str, Any]] = None,
         target_strategy: Optional[str] = None,
+        df: Optional[pd.DataFrame] = None,
+        symbol: Optional[str] = None,
+        ml_signal_generator: Optional[Any] = None,
+        signal_evaluator: Optional[Any] = None,
+        online_learning: bool = False,
     ) -> None:
-        self._raw_candles = candles
+        # Accept either a raw candle list OR a pre-built DataFrame directly.
+        # When df is provided the expensive _to_dataframe() / dict round-trip
+        # is skipped entirely.
+        self._raw_candles = candles or []
+        self._direct_df = df          # pre-built DataFrame (may be None)
+        self._direct_symbol = symbol  # symbol string when df is provided
         self._strategy_params = strategy_params or {}
         self._target_strategy = target_strategy
         self.initial_capital = initial_capital
@@ -179,6 +189,13 @@ class BacktestEngine:
 
         self._router = StrategyRouter()
 
+        # ML signal generator (replaces strategy router when set)
+        self._ml_signal_generator = ml_signal_generator
+        self._signal_evaluator = signal_evaluator
+        self._online_learning = online_learning
+        self._loss_streak: int = 0
+        self._last_trade_close_bar_for_rl: int = -100
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -187,18 +204,39 @@ class BacktestEngine:
     # Stops are still checked every candle for safety.
     SIGNAL_EVERY = 12  # every 12 x 5m = 1h (matches 1h strategy evaluation)
 
-    def run(self) -> BacktestResult:
-        """Execute the full backtest and return the result summary."""
-        df = self._to_dataframe(self._raw_candles)
+    def run(self, precomputed: Optional[Dict[str, Any]] = None) -> BacktestResult:
+        """Execute the full backtest and return the result summary.
+
+        Parameters
+        ----------
+        precomputed:
+            Optional dict produced by :py:meth:`_preload_signals_for_symbol`.
+            When provided, all indicator computation and resampling is skipped
+            and the pre-built arrays are sliced to the window covered by the
+            current DataFrame via ``searchsorted`` offsets.  When *None* the
+            engine computes everything from scratch (original behaviour).
+        """
+        # ------------------------------------------------------------------ #
+        # Build the working 5m DataFrame
+        # ------------------------------------------------------------------ #
+        if self._direct_df is not None:
+            # Fast path: caller handed us a DataFrame directly — no round-trip
+            df = self._direct_df
+            symbol = self._direct_symbol or df.attrs.get("symbol", "BTC-EUR")
+        else:
+            df = self._to_dataframe(self._raw_candles)
+            symbol = df.attrs.get("symbol", "BTC-EUR")
+
         if len(df) < self.WARMUP:
             logger.warning("Not enough candles for backtest (%d < %d)", len(df), self.WARMUP)
             return BacktestResult()
 
-        # Pre-compute multi-timeframe candles once
-        df_1h = self._resample_1h(df)
-        df_4h = self._resample_4h(df)
-        df_1d = self._resample_1d(df)
-        symbol = df.attrs.get("symbol", "BTC-EUR")
+        # ------------------------------------------------------------------ #
+        # NUMBA FAST PATH: when we have precomputed signals AND a target
+        # strategy, delegate the entire bar loop to the JIT-compiled kernel.
+        # ------------------------------------------------------------------ #
+        if precomputed is not None and self._target_strategy:
+            return self._run_numba(df, precomputed)
 
         n = len(df)
 
@@ -208,28 +246,91 @@ class BacktestEngine:
         lows = df["low"].values
         timestamps = df.index
 
-        # Pre-compute 1h ATR for trailing stops (5m ATR is too tight)
-        atr_1h_series = compute_atr(df_1h["high"], df_1h["low"], df_1h["close"]).values
+        # ------------------------------------------------------------------ #
+        # Indicator / resampling — use pre-computed cache when available
+        # ------------------------------------------------------------------ #
+        if precomputed is not None:
+            # Recover resampled DataFrames from the cache
+            df_1h = precomputed["df_1h"]
+            df_4h = precomputed["df_4h"]
+            df_1d = precomputed["df_1d"]
 
-        # --- Pre-compute ALL indicator signals for the full series ---
-        # This replaces ~2000+ per-step pandas computations with a single batch
-        precomp_5m = self._precompute_signals(df, symbol)
-        precomp_1h = self._precompute_signals(df_1h, symbol)
-        precomp_4h = self._precompute_signals(df_4h, symbol)
-        precomp_1d = self._precompute_signals(df_1d, symbol)
+            # Full-history pre-computed signal arrays
+            precomp_5m = precomputed["signals_5m"]
+            precomp_1h = precomputed["signals_1h"]
+            precomp_4h = precomputed["signals_4h"]
+            precomp_1d = precomputed["signals_1d"]
 
-        # Pre-compute 4h regime arrays (regime detection uses 4h data)
-        from bot.indicators.trend import adx as compute_adx
-        regime_adx_4h = compute_adx(df_4h["high"], df_4h["low"], df_4h["close"]).values
-        regime_atr_4h = compute_atr(df_4h["high"], df_4h["low"], df_4h["close"]).values
-        regime_close_4h = df_4h["close"].values
-        # Also keep 1h arrays for ATR% (used in position sizing)
-        regime_atr_1h = compute_atr(df_1h["high"], df_1h["low"], df_1h["close"]).values
-        regime_close_1h = df_1h["close"].values
+            # Regime / ATR arrays (full-history)
+            regime_adx_4h  = precomputed["regime_adx_4h"]
+            regime_atr_4h  = precomputed["regime_atr_4h"]
+            regime_close_4h = precomputed["regime_close_4h"]
+            regime_atr_1h  = precomputed["regime_atr_1h"]
+            regime_close_1h = precomputed["regime_close_1h"]
+            atr_1h_series  = precomputed["atr_1h_series"]
 
-        h1_timestamps = df_1h.index
-        h4_timestamps = df_4h.index
-        h1d_timestamps = df_1d.index
+            h1_timestamps  = df_1h.index
+            h4_timestamps  = df_4h.index
+            h1d_timestamps = df_1d.index
+
+            # -------------------------------------------------------------- #
+            # Compute searchsorted offsets so that idx lookups into the
+            # full-history arrays are correctly shifted to our window.
+            # -------------------------------------------------------------- #
+            window_start_ts = timestamps[0]
+
+            full_5m_ts = precomputed["5m_timestamps"]
+            offset_5m  = int(full_5m_ts.searchsorted(window_start_ts, side="left"))
+
+            full_1h_ts = precomputed["1h_timestamps"]
+            offset_1h  = int(full_1h_ts.searchsorted(window_start_ts, side="left"))
+
+            full_4h_ts = precomputed["4h_timestamps"]
+            offset_4h  = int(full_4h_ts.searchsorted(window_start_ts, side="left"))
+
+            full_1d_ts = precomputed["1d_timestamps"]
+            offset_1d  = int(full_1d_ts.searchsorted(window_start_ts, side="left"))
+
+        else:
+            # Original path: compute everything from the window DataFrame
+            offset_5m = offset_1h = offset_4h = offset_1d = 0
+
+            df_1h = self._resample_1h(df)
+            df_4h = self._resample_4h(df)
+            df_1d = self._resample_1d(df)
+
+            # Pre-compute 1h ATR for trailing stops (5m ATR is too tight)
+            atr_1h_series = compute_atr(df_1h["high"], df_1h["low"], df_1h["close"]).values
+
+            # --- Pre-compute ALL indicator signals for the full series ---
+            precomp_5m = self._precompute_signals(df, symbol)
+            precomp_1h = self._precompute_signals(df_1h, symbol)
+            precomp_4h = self._precompute_signals(df_4h, symbol)
+            precomp_1d = self._precompute_signals(df_1d, symbol)
+
+            # Pre-compute 4h regime arrays (regime detection uses 4h data)
+            from bot.indicators.trend import adx as compute_adx
+            regime_adx_4h  = compute_adx(df_4h["high"], df_4h["low"], df_4h["close"]).values
+            regime_atr_4h  = compute_atr(df_4h["high"], df_4h["low"], df_4h["close"]).values
+            regime_close_4h = df_4h["close"].values
+            # Also keep 1h arrays for ATR% (used in position sizing)
+            regime_atr_1h  = compute_atr(df_1h["high"], df_1h["low"], df_1h["close"]).values
+            regime_close_1h = df_1h["close"].values
+
+            h1_timestamps  = df_1h.index
+            h4_timestamps  = df_4h.index
+            h1d_timestamps = df_1d.index
+
+        # ------------------------------------------------------------------ #
+        # When using pre-computed cache, precomp_5m covers the FULL symbol
+        # history.  The loop variable `i` is 0-based within the window slice,
+        # so all precomp_5m array lookups must be shifted by offset_5m.
+        # The 1h/4h/1d lookups are performed via searchsorted against the
+        # full-history timestamp index, so h1_idx / h4_idx / h1d_idx already
+        # point to the correct position in those full-history arrays — no
+        # additional offset is needed there.
+        # When precomputed is None, all offsets are 0 (no-op).
+        # ------------------------------------------------------------------ #
 
         equity_curve: List[float] = []
         last_trade_close_bar = -self._cooldown_bars  # allow first trade immediately
@@ -240,6 +341,9 @@ class BacktestEngine:
         for i in range(self.WARMUP, n):
             current_price = closes[i]
             current_time = str(timestamps[i])
+
+            # Absolute index into full-history precomp_5m arrays
+            abs_i = i + offset_5m
 
             # --- check stops on existing positions (every candle) ---
             if self.positions:
@@ -254,7 +358,7 @@ class BacktestEngine:
                     current_price, highs[i], lows[i], current_time, atr_val,
                     current_bar=i,
                     precomp_5m=precomp_5m if has_range else None,
-                    idx_5m=i if has_range else 0,
+                    idx_5m=abs_i if has_range else 0,
                 )
                 if len(self.closed_trades) > prev_closed:
                     last_trade_close_bar = i
@@ -319,6 +423,109 @@ class BacktestEngine:
                 equity_curve.append(current_equity)
                 continue
 
+            # --- ML signal path (replaces strategy router when ml_signal_generator is set) ---
+            if self._ml_signal_generator is not None:
+                # Build DataFrame window for ML prediction
+                ml_window_start = max(0, i - 2000)
+                ml_df = df.iloc[ml_window_start:i + 1]
+                ml_result = self._ml_signal_generator.predict(
+                    ml_df, symbol=symbol,
+                )
+                direction = ml_result.get("direction")
+                if direction is None or direction not in ("LONG", "SHORT"):
+                    equity_curve.append(current_equity)
+                    continue
+
+                if len(self.positions) >= self.max_open:
+                    equity_curve.append(current_equity)
+                    continue
+
+                self._signals_generated += 1
+
+                # RL Signal Evaluator: gate on ML predictions
+                if self._signal_evaluator is not None:
+                    from bot.learning.rl_signal_evaluator import build_ml_signal_obs
+                    _eq = self._equity(current_price)
+                    _eq_ratio = _eq / self.initial_capital if self.initial_capital > 0 else 1.0
+                    _dd_pct = ((self.peak_balance - _eq) / self.peak_balance * 100.0
+                               if self.peak_balance > 0 else 0.0)
+                    _wr, _aw, _al = self._trade_stats()
+                    _avg_pnl = (_aw - _al) * 100.0 if self.closed_trades else 0.0
+
+                    obs = build_ml_signal_obs(
+                        probabilities=ml_result.get("probabilities", [0.5] * 12),
+                        equity_ratio=_eq_ratio, drawdown_pct=_dd_pct,
+                        open_pos_ratio=len(self.positions) / max(self.max_open, 1),
+                        win_rate_recent=_wr, avg_pnl_recent=_avg_pnl,
+                        bars_since_trade=i - self._last_trade_close_bar_for_rl,
+                        balance_ratio=self.balance / self.initial_capital if self.initial_capital > 0 else 1.0,
+                        recent_loss_streak=self._loss_streak,
+                        total_trades=len(self.closed_trades),
+                        recent_sharpe=0.0,
+                        symbol=symbol,
+                    )
+                    rl_eval_result = self._signal_evaluator.evaluate(obs)
+                    if not rl_eval_result.take_trade:
+                        equity_curve.append(current_equity)
+                        continue
+
+                # --- Fill rate model ---
+                limit_price = current_price
+                if i + 1 < n:
+                    if direction == "LONG" and lows[i + 1] > limit_price:
+                        equity_curve.append(current_equity)
+                        continue
+                    elif direction == "SHORT" and highs[i + 1] < limit_price:
+                        equity_curve.append(current_equity)
+                        continue
+
+                self._signals_filled += 1
+
+                # --- Stop calculation ---
+                window_1h = df_1h.iloc[max(0, h1_idx - 100): h1_idx + 1]
+                sl, tp = initial_stops(
+                    current_price, window_1h, direction=direction,
+                    atr_multiplier=self._atr_multiplier,
+                    rr_ratio=self._rr_ratio,
+                    total_fee_pct=(MAKER_FEE_PCT + TAKER_FEE_PCT) * 100.0,
+                )
+
+                # --- Fee gate ---
+                tp_distance_pct = abs(tp - current_price) / current_price * 100.0 if current_price > 0 else 0.0
+                size_eur_est = self._compute_position_size(1.0, current_price, atr_pct=atr_pct)
+                fee_result = check_fee_gate(
+                    position_size=size_eur_est,
+                    tp_distance_pct=tp_distance_pct,
+                    is_short=(direction == "SHORT"),
+                    min_profit_multiple=self._strategy_params.get("min_profit_multiple", 3.0),
+                )
+                if not fee_result.approved:
+                    equity_curve.append(current_equity)
+                    continue
+
+                if atr_pct > 0:
+                    self._atr_pct_history.append(atr_pct)
+                    if len(self._atr_pct_history) > 200:
+                        self._atr_pct_history = self._atr_pct_history[-200:]
+
+                # Build a synthetic Signal object for _open_position
+                ml_signal = Signal(
+                    symbol=symbol,
+                    direction=direction,
+                    strength=max(ml_result.get("net_up", 0.5), ml_result.get("net_down", 0.5)),
+                    strategy_name="ml_signal",
+                )
+                self._open_position(
+                    ml_signal, current_price, current_time,
+                    window_1h, 1.0, bar_index=i,
+                    atr_pct=atr_pct,
+                    regime=regime,
+                )
+
+                equity_curve.append(current_equity)
+                continue
+
+            # --- existing strategy-based signal path (used when ml_signal_generator is None) ---
             strategies = self._router.get_strategies(regime)
             if self._target_strategy:
                 strategies = [s for s in strategies if s.name == self._target_strategy]
@@ -327,8 +534,10 @@ class BacktestEngine:
                     continue
 
             # Look up pre-computed signal scores and run strategy evaluate_1h()
+            # Use abs_i for precomp_5m (full-history array); h1/h4/h1d indices
+            # already point into full-history arrays via searchsorted.
             best_signal = self._evaluate_precomputed(
-                strategies, symbol, current_price, i, h1_idx,
+                strategies, symbol, current_price, abs_i, h1_idx,
                 precomp_5m, precomp_1h, regime,
                 h4_idx=h4_idx, h1d_idx=h1d_idx,
                 precomp_4h=precomp_4h, precomp_1d=precomp_1d,
@@ -424,6 +633,213 @@ class BacktestEngine:
                 self._close_position(pos, last_price, last_time, "end_of_data")
 
         return self._compile_result(equity_curve)
+
+    # ------------------------------------------------------------------
+    # Numba fast path
+    # ------------------------------------------------------------------
+
+    def _run_numba(self, df: pd.DataFrame, precomputed: dict) -> BacktestResult:
+        """Run the backtest using the Numba-JIT compiled kernel."""
+        from bot.backtest.numba_loop import (
+            STRATEGY_NAME_TO_ID, EXIT_REASON_NAMES,
+            build_timeframe_maps, _backtest_kernel,
+        )
+
+        n = len(df)
+        closes = df["close"].values.astype(np.float64)
+        highs = df["high"].values.astype(np.float64)
+        lows = df["low"].values.astype(np.float64)
+        timestamps = df.index
+
+        # Recover pre-computed data
+        h1_timestamps = precomputed["1h_timestamps"]
+        h4_timestamps = precomputed["4h_timestamps"]
+        h1d_timestamps = precomputed["1d_timestamps"]
+        full_5m_ts = precomputed["5m_timestamps"]
+
+        # Compute searchsorted offset for 5m
+        window_start_ts = timestamps[0]
+        offset_5m = int(full_5m_ts.searchsorted(window_start_ts, side="left"))
+
+        # Pre-compute bar index mappings (done once, outside Numba)
+        h1_map, h4_map, h1d_map = build_timeframe_maps(
+            timestamps, h1_timestamps, h4_timestamps, h1d_timestamps,
+        )
+
+        # Extract signal arrays (ensure float64)
+        def _arr(signals, key, fallback_len=0):
+            a = signals.get(key)
+            if a is None:
+                return np.zeros(fallback_len, dtype=np.float64)
+            if hasattr(a, 'values'):
+                return a.values.astype(np.float64)
+            return np.asarray(a, dtype=np.float64)
+
+        precomp_1h = precomputed["signals_1h"]
+        precomp_4h = precomputed["signals_4h"]
+        precomp_1d = precomputed["signals_1d"]
+        precomp_5m = precomputed["signals_5m"]
+        n_1h = len(precomp_1h.get("rsi", []))
+        n_4h = len(precomp_4h.get("adx", []))
+        n_1d = len(precomp_1d.get("ema200", []))
+        n_5m = len(precomp_5m.get("rsi", []))
+
+        strategy_id = STRATEGY_NAME_TO_ID.get(self._target_strategy, -1)
+        if strategy_id < 0:
+            # Unknown strategy — fall back to Python path
+            return self._run_python_fallback(df, precomputed)
+
+        # Call the Numba kernel
+        result = _backtest_kernel(
+            closes, highs, lows,
+            h1_map, h4_map, h1d_map,
+            offset_5m,
+            # 1h signals
+            _arr(precomp_1h, "rsi", n_1h),
+            _arr(precomp_1h, "macd_hist", n_1h),
+            _arr(precomp_1h, "bb_lower", n_1h),
+            _arr(precomp_1h, "bb_upper", n_1h),
+            _arr(precomp_1h, "bb_mid", n_1h),
+            _arr(precomp_1h, "bb_bandwidth", n_1h),
+            _arr(precomp_1h, "vsr", n_1h),
+            _arr(precomp_1h, "cmf", n_1h),
+            _arr(precomp_1h, "obv", n_1h),
+            _arr(precomp_1h, "open", n_1h),
+            _arr(precomp_1h, "high", n_1h),
+            _arr(precomp_1h, "low", n_1h),
+            _arr(precomp_1h, "close", n_1h),
+            # 4h signals
+            _arr(precomp_4h, "adx", n_4h),
+            _arr(precomp_4h, "ema50", n_4h),
+            _arr(precomp_4h, "rsi", n_4h),
+            # 1d signals
+            _arr(precomp_1d, "ema200", n_1d),
+            _arr(precomp_1d, "ema50", n_1d),
+            # 5m signals
+            _arr(precomp_5m, "rsi", n_5m),
+            # Regime / ATR
+            np.asarray(precomputed["regime_adx_4h"], dtype=np.float64),
+            np.asarray(precomputed["regime_atr_4h"], dtype=np.float64),
+            np.asarray(precomputed["regime_close_4h"], dtype=np.float64),
+            np.asarray(precomputed["regime_atr_1h"], dtype=np.float64),
+            np.asarray(precomputed["regime_close_1h"], dtype=np.float64),
+            np.asarray(precomputed["atr_1h_series"], dtype=np.float64),
+            # Strategy params
+            strategy_id,
+            self._atr_multiplier,
+            self._rr_ratio,
+            self._base_risk_pct,
+            self._signal_strength_min,
+            self._tf_weight_1h,
+            self._tf_weight_4h,
+            self._tf_weight_1d,
+            self._confidence_size_scaling,
+            self._ema200_filter_pct,
+            self._volatile_atr_threshold,
+            int(self._consecutive_confirms),
+            self._confluence_boost,
+            self._drawdown_scale_pct,
+            self._max_position_pct,
+            self._trail_activation_mult,
+            self._max_hold_bars,
+            self._range_max_hold_bars,
+            self._min_atr_pct,
+            self._strategy_params.get("quiet_atr_threshold", 1.0),
+            self._strategy_params.get("regime_adx_threshold", 24.0),
+            self._strategy_params.get("ranging_adx_threshold", 20.0),
+            self._strategy_params.get("min_profit_multiple", 3.0),
+            # Engine constants
+            self.WARMUP,
+            self.SIGNAL_EVERY,
+            self.max_open,
+            self.initial_capital,
+            self.slippage_pct,
+        )
+
+        (equity_curve, t_pnl, t_pnl_pct, t_size, t_dir, t_reason,
+         t_entry, t_exit, t_strat,
+         total_fees, sig_gen, sig_fill, quiet_skip) = result
+
+        # Build BacktestResult from kernel output
+        num_trades = len(t_pnl)
+        total_pnl = float(t_pnl.sum()) if num_trades > 0 else 0.0
+        total_return = (total_pnl / self.initial_capital * 100.0) if self.initial_capital else 0.0
+
+        wins_mask = t_pnl > 0
+        n_wins = int(wins_mask.sum())
+        n_losses = num_trades - n_wins
+        win_rate = (n_wins / num_trades * 100.0) if num_trades > 0 else 0.0
+        avg_win = float(t_pnl_pct[wins_mask].mean()) if n_wins > 0 else 0.0
+        avg_loss = float(t_pnl_pct[~wins_mask].mean()) if n_losses > 0 else 0.0
+
+        gross_wins = float(t_pnl[wins_mask].sum()) if n_wins > 0 else 0.0
+        gross_losses = abs(float(t_pnl[~wins_mask].sum())) if n_losses > 0 else 0.0
+        profit_factor = (gross_wins / gross_losses) if gross_losses > 0 else (0.0 if gross_wins == 0 else 5.0)
+        profit_per_fee = (total_pnl / total_fees) if total_fees > 0 else 0.0
+        fill_rate = (sig_fill / sig_gen * 100.0) if sig_gen > 0 else 0.0
+
+        # Sharpe (vectorized)
+        sharpe = 0.0
+        if len(equity_curve) > 1:
+            prev = equity_curve[:-1]
+            mask = prev > 0
+            if mask.any():
+                returns = (equity_curve[1:][mask] / prev[mask]) - 1.0
+                returns = returns[np.isfinite(returns)]
+                if len(returns) > 0:
+                    mean_r = returns.mean()
+                    std_r = returns.std()
+                    if std_r > 0:
+                        sharpe = float((mean_r / std_r) * math.sqrt(105_120))
+
+        # Max drawdown (vectorized)
+        max_dd = 0.0
+        if len(equity_curve) > 0:
+            running_max = np.maximum.accumulate(equity_curve)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                dd_arr = np.where(running_max > 0,
+                                  (running_max - equity_curve) / running_max * 100.0,
+                                  0.0)
+            max_dd = float(dd_arr.max())
+
+        # Build trade log (lightweight — only used during validation, not RL step)
+        trade_log = []
+        for k in range(num_trades):
+            trade_log.append(TradeRecord(
+                symbol=self._direct_symbol or "UNKNOWN",
+                direction="SHORT" if t_dir[k] == -1 else "LONG",
+                entry_price=float(t_entry[k]),
+                exit_price=float(t_exit[k]),
+                entry_time="",
+                exit_time="",
+                size_eur=float(t_size[k]),
+                pnl_eur=round(float(t_pnl[k]), 4),
+                pnl_pct=round(float(t_pnl_pct[k]), 4),
+                exit_reason=EXIT_REASON_NAMES.get(int(t_reason[k]), "unknown"),
+                strategy=self._target_strategy or "unknown",
+            ))
+
+        return BacktestResult(
+            total_pnl=round(total_pnl, 2),
+            total_return_pct=round(total_return, 2),
+            win_rate=round(win_rate, 2),
+            total_trades=num_trades,
+            winning_trades=n_wins,
+            losing_trades=n_losses,
+            sharpe_ratio=round(sharpe, 2),
+            max_drawdown_pct=round(max_dd, 2),
+            avg_win_pct=round(avg_win, 2),
+            avg_loss_pct=round(avg_loss, 2),
+            trade_log=trade_log,
+            profit_factor=round(profit_factor, 2),
+            total_fees_paid=round(float(total_fees), 4),
+            profit_per_fee=round(profit_per_fee, 2),
+            signals_generated=int(sig_gen),
+            signals_filled=int(sig_fill),
+            fill_rate=round(fill_rate, 2),
+            quiet_hours_skipped=int(quiet_skip),
+            regime_pnl={},
+        )
 
     # ------------------------------------------------------------------
     # Pre-computation helpers (batch indicator calculation)
@@ -632,6 +1048,61 @@ class BacktestEngine:
                         volume_surge, ema50_slope,
                     )
 
+                elif strat.name == "breakout":
+                    if idx_1h < 21:
+                        continue
+                    price = current_price
+                    recent_high = max(precomp_1h["high"][idx_1h - 20:idx_1h])
+                    recent_low = min(precomp_1h["low"][idx_1h - 20:idx_1h])
+                    volume_surge = precomp_1h["vsr"][idx_1h] if idx_1h < len(precomp_1h["vsr"]) else 1.0
+                    atr_pct_val = atr_pct
+
+                    direction, strength = strat.evaluate_1h(
+                        price, recent_high, recent_low, volume_surge, atr_pct_val,
+                    )
+
+                elif strat.name == "trend_following":
+                    if idx_1h < 2:
+                        continue
+                    ema_fast = precomp_1h["ema20"][idx_1h] if idx_1h < len(precomp_1h["ema20"]) else current_price
+                    ema_slow = precomp_1h["ema50"][idx_1h] if idx_1h < len(precomp_1h["ema50"]) else current_price
+                    ema_fast_prev = precomp_1h["ema20"][idx_1h - 1] if idx_1h > 0 and idx_1h < len(precomp_1h["ema20"]) else ema_fast
+                    ema_slow_prev = precomp_1h["ema50"][idx_1h - 1] if idx_1h > 0 and idx_1h < len(precomp_1h["ema50"]) else ema_slow
+                    adx_val = precomp_4h["adx"][h4_idx] if precomp_4h and 0 <= h4_idx < len(precomp_4h["adx"]) else 20.0
+                    macd_hist = precomp_1h["macd_hist"][idx_1h] if idx_1h < len(precomp_1h["macd_hist"]) else 0.0
+
+                    direction, strength = strat.evaluate_1h(
+                        ema_fast, ema_slow, ema_fast_prev, ema_slow_prev,
+                        adx_val, macd_hist,
+                    )
+
+                elif strat.name == "momentum":
+                    if idx_1h < 2:
+                        continue
+                    rsi_1h = precomp_1h["rsi"][idx_1h] if idx_1h < len(precomp_1h["rsi"]) else 50.0
+                    rsi_1h_prev = precomp_1h["rsi"][idx_1h - 1] if idx_1h > 0 and idx_1h < len(precomp_1h["rsi"]) else 50.0
+                    macd_hist = precomp_1h["macd_hist"][idx_1h] if idx_1h < len(precomp_1h["macd_hist"]) else 0.0
+                    macd_hist_prev = precomp_1h["macd_hist"][idx_1h - 1] if idx_1h > 0 and idx_1h < len(precomp_1h["macd_hist"]) else 0.0
+                    volume_surge = precomp_1h["vsr"][idx_1h] if idx_1h < len(precomp_1h["vsr"]) else 1.0
+
+                    direction, strength = strat.evaluate_1h(
+                        rsi_1h, rsi_1h_prev, macd_hist, macd_hist_prev, volume_surge,
+                    )
+
+                elif strat.name == "mean_reversion":
+                    if idx_1h < 2:
+                        continue
+                    price = current_price
+                    ema50 = precomp_1h["ema50"][idx_1h] if idx_1h < len(precomp_1h["ema50"]) else price
+                    rsi_1h = precomp_1h["rsi"][idx_1h] if idx_1h < len(precomp_1h["rsi"]) else 50.0
+                    adx_val = precomp_4h["adx"][h4_idx] if precomp_4h and 0 <= h4_idx < len(precomp_4h["adx"]) else 25.0
+                    bb_lower = precomp_1h["bb_lower"][idx_1h] if idx_1h < len(precomp_1h["bb_lower"]) else price
+                    bb_upper = precomp_1h["bb_upper"][idx_1h] if idx_1h < len(precomp_1h["bb_upper"]) else price
+
+                    direction, strength = strat.evaluate_1h(
+                        price, ema50, rsi_1h, adx_val, bb_lower, bb_upper,
+                    )
+
                 else:
                     continue
 
@@ -711,7 +1182,8 @@ class BacktestEngine:
                     tf_score += self._tf_weight_1d
         total = self._tf_weight_1h + self._tf_weight_4h + self._tf_weight_1d
         if total > 0:
-            strength *= tf_score / total
+            # Floor at 0.5 so higher-TF disagreement dampens but never kills
+            strength *= max(tf_score / total, 0.5)
         return strength
 
     # ------------------------------------------------------------------
@@ -1045,29 +1517,32 @@ class BacktestEngine:
         # Fill rate
         fill_rate = (self._signals_filled / self._signals_generated * 100.0) if self._signals_generated > 0 else 0.0
 
-        # Sharpe ratio (annualised, from per-bar equity returns)
+        # Sharpe ratio (annualised, from per-bar equity returns) — vectorized
         sharpe = 0.0
         if len(equity_curve) > 1:
-            returns = []
-            for j in range(1, len(equity_curve)):
-                if equity_curve[j - 1] > 0:
-                    returns.append(equity_curve[j] / equity_curve[j - 1] - 1)
-            if returns:
-                mean_r = sum(returns) / len(returns)
-                std_r = (sum((r - mean_r) ** 2 for r in returns) / len(returns)) ** 0.5
-                if std_r > 0:
-                    # Annualise assuming 5m bars (~105,120 bars/year)
-                    sharpe = (mean_r / std_r) * math.sqrt(105_120)
+            eq_arr = np.asarray(equity_curve, dtype=np.float64)
+            prev = eq_arr[:-1]
+            mask = prev > 0
+            if mask.any():
+                returns = (eq_arr[1:][mask] / prev[mask]) - 1.0
+                returns = returns[np.isfinite(returns)]
+                if len(returns) > 0:
+                    mean_r = returns.mean()
+                    std_r = returns.std()
+                    if std_r > 0:
+                        # Annualise assuming 5m bars (~105,120 bars/year)
+                        sharpe = float((mean_r / std_r) * math.sqrt(105_120))
 
-        # Max drawdown
+        # Max drawdown — vectorized
         max_dd = 0.0
-        peak = 0.0
-        for eq in equity_curve:
-            if eq > peak:
-                peak = eq
-            dd = ((peak - eq) / peak * 100.0) if peak > 0 else 0.0
-            if dd > max_dd:
-                max_dd = dd
+        if equity_curve:
+            eq_arr = np.asarray(equity_curve, dtype=np.float64)
+            running_max = np.maximum.accumulate(eq_arr)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                dd_arr = np.where(running_max > 0,
+                                  (running_max - eq_arr) / running_max * 100.0,
+                                  0.0)
+            max_dd = float(dd_arr.max()) if len(dd_arr) > 0 else 0.0
 
         return BacktestResult(
             total_pnl=round(total_pnl, 2),

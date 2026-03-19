@@ -307,6 +307,7 @@ class BitvavoClient:
         all_candles: List[CandleData] = []
         cursor_ms = int(start.timestamp() * 1000)
         end_ms = int(end.timestamp() * 1000)
+        consecutive_empty = 0
 
         while cursor_ms < end_ms:
             page_end = min(cursor_ms + step_ms, end_ms)
@@ -315,7 +316,17 @@ class BitvavoClient:
                 raw = _api_get(url)
                 candles = self._parse_candles(symbol, interval, raw)
                 if not candles:
-                    break
+                    if all_candles:
+                        break  # End of data (had candles before)
+                    # Skip forward faster when searching for first data
+                    consecutive_empty += 1
+                    skip_ms = step_ms * 30  # ~150 days per skip
+                    cursor_ms = min(cursor_ms + skip_ms, end_ms)
+                    if cursor_ms >= end_ms:
+                        break
+                    _time.sleep(0.1)
+                    continue
+                consecutive_empty = 0
                 all_candles.extend(candles)
                 # Move cursor past the last candle we got
                 last_ts = max(int(c.timestamp.timestamp() * 1000) for c in candles)

@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 
+from bot.indicators.divergence import rsi_divergence, volume_divergence
 from bot.indicators.momentum import rsi, stochastic, cci
 from bot.indicators.trend import ema, macd, adx, supertrend
 from bot.indicators.volatility import bollinger_bands, atr
@@ -16,14 +17,16 @@ logger = logging.getLogger(__name__)
 
 # Default weights for each indicator signal (tunable by the learning system)
 DEFAULT_WEIGHTS: Dict[str, float] = {
-    "rsi": 0.20,
-    "macd": 0.20,
-    "bollinger": 0.15,
-    "ema_trend": 0.15,
+    "rsi": 0.15,
+    "macd": 0.15,
+    "bollinger": 0.10,
+    "ema_trend": 0.10,
     "supertrend": 0.10,
     "adx": 0.05,      # trend strength modifier, not direction
-    "volume": 0.10,
+    "volume": 0.05,
     "cci": 0.05,
+    "rsi_divergence": 0.15,     # leading: RSI divergence
+    "volume_divergence": 0.10,  # leading: volume divergence
 }
 
 
@@ -175,6 +178,22 @@ def compute(df: pd.DataFrame, weights: Optional[Dict[str, float]] = None) -> Sig
             scores["cci"] = 0.0
     except Exception:
         scores["cci"] = 0.0
+
+    # ── RSI divergence (leading) ────────────────────────────────────────────
+    try:
+        rd = rsi_divergence(close).iloc[-1]
+        values["rsi_divergence"] = rd
+        scores["rsi_divergence"] = rd  # already -1 to +1
+    except Exception:
+        scores["rsi_divergence"] = 0.0
+
+    # ── Volume divergence (leading) ──────────────────────────────────────────
+    try:
+        vd = volume_divergence(close, volume).iloc[-1]
+        values["volume_divergence"] = vd
+        scores["volume_divergence"] = vd  # already -1 to +1
+    except Exception:
+        scores["volume_divergence"] = 0.0
 
     # ── Weighted composite ────────────────────────────────────────────────────
     total_weight = sum(w.get(k, 0) for k in scores if k != "adx")

@@ -5,6 +5,7 @@ import json
 import logging
 import time
 import urllib.request
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -138,3 +139,41 @@ class OnchainProvider:
                 if self._failure_count >= 3:
                     self._disabled_until = time.time() + 600
                     logger.warning("On-chain circuit breaker: disabled for 10 min")
+
+    async def save_snapshots(self) -> None:
+        """Persist current funding rate + OI data for future backtesting."""
+        if not self._cache:
+            return
+        try:
+            from bot.data.database import get_session
+            from bot.data.models import FundingRateSnapshot
+
+            now = datetime.now(timezone.utc)
+            async with get_session() as session:
+                for symbol, metrics in self._cache.items():
+                    funding_score = metrics.get("funding", 0.0)
+                    oi_score = metrics.get("oi", 0.0)
+                    oi_val = self._prev_oi.get(symbol)
+                    prev_oi = self._prev_oi.get(symbol, 0)
+                    oi_change = ((oi_val - prev_oi) / prev_oi * 100) if prev_oi and oi_val else None
+
+                    # Reverse-engineer the raw funding rate from the score
+                    raw_rate = 0.0
+                    if funding_score < 0:
+                        raw_rate = 0.0002  # positive funding
+                    elif funding_score > 0:
+                        raw_rate = -0.0002  # negative funding
+
+                    snapshot = FundingRateSnapshot(
+                        symbol=symbol,
+                        funding_rate=raw_rate,
+                        funding_score=funding_score,
+                        open_interest=oi_val,
+                        oi_change_pct=oi_change,
+                        recorded_at=now,
+                    )
+                    session.add(snapshot)
+                await session.commit()
+                logger.debug("Saved funding rate snapshots for %d symbols", len(self._cache))
+        except Exception as e:
+            logger.warning("Failed to save funding snapshots: %s", e)

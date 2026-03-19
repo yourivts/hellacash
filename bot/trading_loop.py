@@ -50,6 +50,8 @@ class TradingLoop:
         settings: Any,
         onchain: Any = None,
         orderbook: Any = None,
+        ml_signal_generator: Any = None,
+        ext_data_provider: Any = None,
     ) -> None:
         self.candle_cache = candle_cache
         self.portfolio = portfolio
@@ -63,6 +65,8 @@ class TradingLoop:
         self.settings = settings
         self.onchain = onchain
         self.orderbook = orderbook
+        self._ml_signal_generator = ml_signal_generator
+        self._ext_data_provider = ext_data_provider
 
         self._pending_orders: set[str] = set()
         self._limit_mgr = None  # Will be set by main.py (Task 17)
@@ -677,6 +681,13 @@ class TradingLoop:
         equity = portfolio.get_equity_eur()
         drawdown.update(equity)
 
+        # Refresh external data once per evaluation cycle (before symbol loop)
+        if self._ext_data_provider is not None:
+            try:
+                self._ext_data_provider.refresh_live()
+            except Exception as e:
+                logger.warning("External data refresh failed: %s", e)
+
         for symbol in list(tradeable_symbols):
             try:
                 df_5m = self.candle_cache.get_df(symbol, "5m")
@@ -775,6 +786,156 @@ class TradingLoop:
                     orderbook_imbalance=orderbook_imb,
                     market_regime=regime,
                 )
+
+                # --- ML signal path (replaces strategy router when ml_signal_generator is set) ---
+                if self._ml_signal_generator is not None:
+                    # Check failsafe: is external data critically stale?
+                    if self._ext_data_provider is not None:
+                        if self._ext_data_provider.is_critically_stale():
+                            self._ml_signal_generator._disabled = True
+                            logger.warning("ML signals disabled: external data critically stale")
+                        else:
+                            self._ml_signal_generator._disabled = False
+
+                    ml_window_start = max(0, len(df_5m) - 2000)
+                    ml_df = df_5m.iloc[ml_window_start:]
+
+                    # Build external data dict for live inference
+                    ext_data = {}
+                    if self._ext_data_provider is not None:
+                        live_features = self._ext_data_provider.build_live_features()
+                        # Map 25-element array to dict keys matching extract_tabular_features
+                        ext_keys = [
+                            "fear_greed", "fear_greed_mom", "gtrends_bitcoin", "gtrends_crypto",
+                            "dxy_return", "sp500_return", "gold_return", "vix",
+                            "treasury_10y", "yield_spread", "nvt", "mvrv", "sopr", "puell",
+                            "hashrate", "eth_active_addr", "stable_supply_change", "tvl_change",
+                            "oi_change_7d", "liq_ratio", "taker_buy_ratio", "dvol",
+                            "funding_24h_avg", "btc_dom_change", "stable_btc_ratio",
+                        ]
+                        for i, key in enumerate(ext_keys):
+                            ext_data[key] = float(live_features[i])
+
+                    ml_result = self._ml_signal_generator.predict(
+                        ml_df, symbol=symbol, external_data=ext_data,
+                    )
+                    ml_direction = ml_result.get("direction")
+                    if ml_direction is None or ml_direction not in ("LONG", "SHORT"):
+                        continue
+
+                    # Optionally gate with RL signal evaluator
+                    if self.signal_eval is not None:
+                        from bot.learning.rl_signal_evaluator import build_ml_signal_obs
+                        _eq = portfolio.get_equity_eur()
+                        _eq_ratio = _eq / equity if equity > 0 else 1.0
+                        _dd_pct = drawdown.current_drawdown_pct(equity)
+                        obs = build_ml_signal_obs(
+                            probabilities=ml_result.get("probabilities", [0.5] * 12),
+                            equity_ratio=_eq_ratio,
+                            drawdown_pct=_dd_pct,
+                            open_pos_ratio=portfolio.open_position_count() / max(self.settings.max_open_positions if hasattr(self.settings, 'max_open_positions') else 5, 1),
+                            symbol=symbol,
+                        )
+                        eval_result = self.signal_eval.evaluate(obs)
+                        if not eval_result.take_trade:
+                            continue
+
+                    direction = ml_direction
+                    strategy_name = "ml_signal"
+                    entry_price = ctx.current_price
+                    if entry_price <= 0:
+                        continue
+
+                    strat_params = CHAMPION_DEFAULTS
+
+                    stop_loss, take_profit = initial_stops(
+                        entry_price, df_1h, direction=direction,
+                        atr_multiplier=strat_params["atr_multiplier"],
+                        rr_ratio=strat_params["rr_ratio"],
+                    )
+                    stop_distance_pct = max(0.1, abs(entry_price - stop_loss) / entry_price * 100.0)
+                    tp_distance_pct = abs(take_profit - entry_price) / entry_price * 100.0 if entry_price > 0 else 0.0
+
+                    atr_series = compute_atr(df_1h["high"], df_1h["low"], df_1h["close"])
+                    current_atr = float(atr_series.iloc[-1]) if len(atr_series) > 0 else 0.0
+                    atr_pct = max((current_atr / entry_price * 100.0) if entry_price > 0 else 1.5, 0.1)
+                    atr_50 = atr_series.iloc[-50:] if len(atr_series) >= 50 else atr_series
+                    median_atr = float(atr_50.median()) if len(atr_50) > 0 else current_atr
+                    median_atr_pct = max((median_atr / entry_price * 100.0) if entry_price > 0 else atr_pct, 0.1)
+
+                    size_eur = fixed_fractional_size(
+                        equity=equity,
+                        base_risk_pct=strat_params["base_risk_pct"],
+                        stop_distance_pct=stop_distance_pct,
+                        atr_pct=atr_pct,
+                        median_atr_pct=median_atr_pct,
+                    )
+                    size_eur *= drawdown.position_size_multiplier(equity)
+                    amount_base = size_eur / entry_price
+
+                    fee_result = check_fee_gate(
+                        position_size=size_eur,
+                        tp_distance_pct=tp_distance_pct,
+                        is_short=(direction == "SHORT"),
+                        min_profit_multiple=strat_params["min_profit_multiple"],
+                    )
+                    if not fee_result.approved:
+                        continue
+
+                    _, taker_pct = get_trading_fees(symbol)
+                    side = "buy" if direction == "LONG" else "sell"
+                    decision = risk_engine.approve(
+                        symbol=symbol,
+                        side=side,
+                        position_size_eur=size_eur,
+                        signal_confidence=ml_result.get("net_up", 0.5) if direction == "LONG" else ml_result.get("net_down", 0.5),
+                        expected_roi_pct=stop_distance_pct * 2.0,
+                        portfolio_equity_eur=equity,
+                        open_position_count=portfolio.open_position_count(),
+                        daily_loss_eur=drawdown.daily_realized_loss_eur(),
+                        current_drawdown_pct=drawdown.current_drawdown_pct(equity),
+                        taker_fee_pct=taker_pct,
+                    )
+                    if not decision.approved:
+                        continue
+
+                    logger.info(
+                        "ML Signal ACCEPTED %s %s — size EUR%.2f, net_up=%.3f, net_down=%.3f",
+                        direction, symbol, size_eur,
+                        ml_result.get("net_up", 0.5), ml_result.get("net_down", 0.5),
+                    )
+
+                    self._pending_orders.add(symbol)
+                    try:
+                        journal_data = {
+                            "ml_result": ml_result,
+                            "market_regime": regime,
+                            "candle_data": df_5m.tail(100).to_dict("records") if len(df_5m) > 0 else [],
+                        }
+                        if direction == "SHORT":
+                            order_id = await order_mgr.submit_sell(
+                                symbol, amount_base, strategy_name, extra_data=journal_data,
+                            )
+                        else:
+                            order_id = await order_mgr.submit_buy(
+                                symbol, amount_base, strategy_name, extra_data=journal_data,
+                            )
+
+                        if order_id:
+                            await portfolio.add_position(
+                                symbol=symbol,
+                                strategy_name=strategy_name,
+                                entry_price=entry_price,
+                                quantity=amount_base,
+                                stop_loss=stop_loss,
+                                take_profit=take_profit,
+                                entry_order_id=order_id,
+                                paper_trade=settings.paper_trading,
+                                direction=direction,
+                            )
+                    finally:
+                        self._pending_orders.discard(symbol)
+                    continue  # skip strategy router
 
                 # Run strategies and pick strongest signal
                 best_signal = None

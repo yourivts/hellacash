@@ -57,10 +57,11 @@ def test_train_predict_pipeline(tmp_path):
     model_dir = str(tmp_path / "models")
     os.makedirs(model_dir)
 
-    # Train a tiny model (100 timesteps for speed)
-    env = DummyVecEnv([lambda: TradingParamEnv(store, ["BTC-EUR"], "squeeze")])
-    model = PPO("MlpPolicy", env, n_steps=32, batch_size=32, verbose=0)
-    model.learn(total_timesteps=64)
+    # Train a tiny model (multi-step: n_segments=3 = 3 steps per episode)
+    env = DummyVecEnv([lambda: TradingParamEnv(store, ["BTC-EUR"], "squeeze",
+                                                n_segments=3)])
+    model = PPO("MlpPolicy", env, n_steps=33, batch_size=33, verbose=0)
+    model.learn(total_timesteps=66)
 
     # Save model
     model_path = os.path.join(model_dir, "squeeze_ppo.zip")
@@ -76,11 +77,11 @@ def test_train_predict_pipeline(tmp_path):
     features = np.clip(features, -1.0, 1.0)
     params = optimizer.predict(features, "squeeze")
 
-    # Verify all expected params are present and within bounds
+    # Verify all expected params are present and within bounds (squeeze ranges)
     assert isinstance(params, dict)
-    assert params["atr_multiplier"] >= 1.0 and params["atr_multiplier"] <= 15.0
-    assert params["rr_ratio"] >= 1.0 and params["rr_ratio"] <= 8.0
-    assert params["base_risk_pct"] >= 1.0 and params["base_risk_pct"] <= 8.0
+    assert params["atr_multiplier"] >= 2.0 and params["atr_multiplier"] <= 6.0
+    assert params["rr_ratio"] >= 2.0 and params["rr_ratio"] <= 5.0
+    assert params["base_risk_pct"] >= 1.0 and params["base_risk_pct"] <= 4.0
     assert "range_max_hold_hours" not in params  # squeeze, not range
     assert isinstance(params["max_hold_hours"], int)
     assert isinstance(params["consecutive_confirms"], int)
@@ -88,16 +89,19 @@ def test_train_predict_pipeline(tmp_path):
 
 def test_action_to_params_all_strategies_all_bounds():
     """All action values produce valid parameter ranges for all strategies."""
+    from bot.learning.rl_environment import get_param_table
     for strategy in ["orderflow", "range", "squeeze", "funding_contrarian"]:
-        n = 22 if strategy == "range" else 21
+        table = get_param_table(strategy)
+        n = len(table)
         for val in [-1.0, 0.0, 1.0]:
             action = np.full(n, val, dtype=np.float32)
             params = action_to_params(action, strategy)
-            assert params["atr_multiplier"] >= 1.0
-            assert params["atr_multiplier"] <= 15.0
+            # Verify all params are within their strategy-specific bounds
+            for name, lo, hi, is_int in table:
+                assert params[name] >= lo - 0.01, f"{strategy}/{name}: {params[name]} < {lo}"
+                assert params[name] <= hi + 0.01, f"{strategy}/{name}: {params[name]} > {hi}"
             if strategy == "range":
                 assert "range_max_hold_hours" in params
-                assert 6 <= params["range_max_hold_hours"] <= 168
 
 
 def test_optimizer_fallback_without_models():

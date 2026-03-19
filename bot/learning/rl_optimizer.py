@@ -34,7 +34,7 @@ class RLOptimizer:
                 strategy = fname.replace("_ppo.zip", "")
                 path = os.path.join(self._model_dir, fname)
                 try:
-                    self._models[strategy] = PPO.load(path)
+                    self._models[strategy] = PPO.load(path, device="cpu")
                     loaded += 1
                     logger.info("Loaded RL model for %s", strategy)
                 except Exception as e:
@@ -44,8 +44,10 @@ class RLOptimizer:
             logger.warning("RLOptimizer: no models loaded, will use CHAMPION_DEFAULTS")
 
     def predict(self, features: np.ndarray, strategy: str) -> Dict[str, Any]:
-        """Predict parameters from 27-element feature vector.
+        """Predict parameters from feature vector.
 
+        Accepts 27-dim (market features only) or 32-dim (market + performance).
+        If 27-dim, pads with zero performance context for multi-step models.
         Returns parameter dict. Falls back to CHAMPION_DEFAULTS if model not loaded.
         """
         model = self._models.get(strategy)
@@ -54,7 +56,13 @@ class RLOptimizer:
             return dict(CHAMPION_DEFAULTS)
 
         try:
-            action, _ = model.predict(features, deterministic=True)
+            obs = features
+            # Pad 27-dim features to 32-dim if model expects multi-step obs
+            expected_dim = model.observation_space.shape[0]
+            if len(obs) < expected_dim:
+                padding = np.zeros(expected_dim - len(obs), dtype=np.float32)
+                obs = np.concatenate([obs, padding])
+            action, _ = model.predict(obs, deterministic=True)
             return action_to_params(action, strategy)
         except Exception as e:
             logger.warning("Prediction failed for %s: %s", strategy, e)

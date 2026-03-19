@@ -63,3 +63,45 @@ class TrendFollowingStrategy(BaseStrategy):
                 "confirming_count": 3 if direction != "NEUTRAL" else 0,
             },
         )
+
+    # ------------------------------------------------------------------
+    # 1-hour pre-computed evaluation
+    # ------------------------------------------------------------------
+    def evaluate_1h(
+        self,
+        ema_fast: float,
+        ema_slow: float,
+        ema_fast_prev: float,
+        ema_slow_prev: float,
+        adx_val: float,
+        macd_hist: float,
+    ) -> tuple[str, float]:
+        """Evaluate trend-following signal from pre-computed 1h indicator values.
+
+        Returns (direction, strength) where direction is one of
+        ``"LONG"``, ``"SHORT"``, or ``"NEUTRAL"``.
+        """
+        cross_up = ema_fast > ema_slow and ema_fast_prev <= ema_slow_prev
+        cross_down = ema_fast < ema_slow and ema_fast_prev >= ema_slow_prev
+
+        direction = "NEUTRAL"
+        strength = 0.0
+
+        if adx_val > 20:
+            if cross_up and macd_hist > 0:
+                direction = "LONG"
+                strength = min(adx_val / 50.0 + 0.2, 1.0)
+            elif cross_down and macd_hist < 0:
+                direction = "SHORT"
+                strength = min(adx_val / 50.0 + 0.2, 1.0)
+
+        # Weaker continuation signal (no crossover required)
+        if direction == "NEUTRAL" and adx_val > 30:
+            if ema_fast > ema_slow and macd_hist > 0:
+                direction = "LONG"
+                strength = 0.3
+            elif ema_fast < ema_slow and macd_hist < 0:
+                direction = "SHORT"
+                strength = 0.3
+
+        return direction, strength

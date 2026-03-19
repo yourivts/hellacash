@@ -14,6 +14,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -350,3 +351,13 @@ class Candle1m(Base):
     low: Mapped[float] = mapped_column(Float, nullable=False)
     close: Mapped[float] = mapped_column(Float, nullable=False)
     volume: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class ExternalDataCache(Base):
+    """Cached external API data (parquet bytes) with staleness tracking."""
+    __tablename__ = "external_data_cache"
+
+    source: Mapped[str] = mapped_column(String(64), primary_key=True)
+    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    row_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

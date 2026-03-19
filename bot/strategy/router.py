@@ -11,6 +11,10 @@ from bot.strategy.orderflow import OrderFlowStrategy
 from bot.strategy.funding_contrarian import FundingContrarianStrategy
 from bot.strategy.range_trading import RangeStrategy
 from bot.strategy.squeeze import SqueezeStrategy
+from bot.strategy.breakout import BreakoutStrategy
+from bot.strategy.trend_following import TrendFollowingStrategy
+from bot.strategy.momentum import MomentumStrategy
+from bot.strategy.mean_reversion import MeanReversionStrategy
 
 
 class Regime(str, Enum):
@@ -64,21 +68,29 @@ class StrategyRouter:
         self._funding = FundingContrarianStrategy()
         self._range = RangeStrategy()
         self._squeeze = SqueezeStrategy()
+        self._breakout = BreakoutStrategy()
+        self._trend = TrendFollowingStrategy()
+        self._momentum = MomentumStrategy()
+        self._mean_rev = MeanReversionStrategy()
 
     def get_strategies(self, regime: Regime) -> List[BaseStrategy]:
         if regime == Regime.QUIET:
-            return []
+            return [self._mean_rev]  # low-vol mean reversion can still work
         elif regime == Regime.VOLATILE:
-            return [self._funding, self._squeeze]
+            return [self._funding, self._squeeze, self._breakout, self._momentum]
         elif regime == Regime.TRENDING:
-            return [self._orderflow, self._funding, self._squeeze]
+            return [self._orderflow, self._trend, self._momentum, self._breakout, self._squeeze]
         elif regime == Regime.RANGING:
-            return [self._range, self._orderflow, self._funding]
+            return [self._range, self._mean_rev, self._funding, self._orderflow]
         else:  # NEUTRAL
-            return [self._funding, self._orderflow]
+            return [self._funding, self._orderflow, self._momentum, self._mean_rev]
 
     def update_params(self, **kwargs) -> None:
-        for strat in [self._orderflow, self._funding, self._range, self._squeeze]:
+        all_strats = [
+            self._orderflow, self._funding, self._range, self._squeeze,
+            self._breakout, self._trend, self._momentum, self._mean_rev,
+        ]
+        for strat in all_strats:
             for key, val in kwargs.items():
                 if hasattr(strat, key):
                     setattr(strat, key, val)

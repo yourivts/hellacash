@@ -16,17 +16,17 @@ function initPriceChart() {
   el.innerHTML = '';
   chart = LightweightCharts.createChart(el, {
     width: el.clientWidth,
-    height: 320,
-    layout: { background: { color: '#1a1d27' }, textColor: '#94a3b8' },
-    grid: { vertLines: { color: '#1e2235' }, horzLines: { color: '#1e2235' } },
+    height: 340,
+    layout: { background: { color: '#0c0c0f' }, textColor: '#71717a' },
+    grid: { vertLines: { color: '#18181b' }, horzLines: { color: '#18181b' } },
     crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
-    rightPriceScale: { borderColor: '#2d3148' },
-    timeScale: { borderColor: '#2d3148', timeVisible: true },
+    rightPriceScale: { borderColor: '#1e1e22' },
+    timeScale: { borderColor: '#1e1e22', timeVisible: true },
   });
   candleSeries = chart.addCandlestickSeries({
-    upColor: '#10b981', downColor: '#ef4444',
-    borderUpColor: '#10b981', borderDownColor: '#ef4444',
-    wickUpColor: '#10b981', wickDownColor: '#ef4444',
+    upColor: '#22c55e', downColor: '#ef4444',
+    borderUpColor: '#22c55e', borderDownColor: '#ef4444',
+    wickUpColor: '#22c55e', wickDownColor: '#ef4444',
   });
   window.addEventListener('resize', () => chart.applyOptions({ width: el.clientWidth }));
 }
@@ -54,9 +54,9 @@ async function loadCandles() {
     // Remove old series and create fresh one to avoid stale data conflicts
     chart.removeSeries(candleSeries);
     candleSeries = chart.addCandlestickSeries({
-      upColor: '#10b981', downColor: '#ef4444',
-      borderUpColor: '#10b981', borderDownColor: '#ef4444',
-      wickUpColor: '#10b981', wickDownColor: '#ef4444',
+      upColor: '#22c55e', downColor: '#ef4444',
+      borderUpColor: '#22c55e', borderDownColor: '#ef4444',
+      wickUpColor: '#22c55e', wickDownColor: '#ef4444',
       priceFormat: { type: 'price', precision: pf.precision, minMove: pf.minMove },
     });
     candleSeries.setData(candles);
@@ -64,6 +64,7 @@ async function loadCandles() {
 }
 
 let lastCandle = null;
+let lastCandlePair = null;
 let prevPrice = null;
 let priceLine = null;
 let pollPaused = false;
@@ -93,7 +94,9 @@ async function pollPrice() {
         const sign = diff > 0 ? '+' : '';
         const pf = pricePrecision(price);
         deltaEl.textContent = `${sign}${diff.toFixed(pf.precision)}`;
-        deltaEl.className = `text-xs font-medium ${diff > 0 ? 'pnl-pos' : 'pnl-neg'}`;
+        deltaEl.className = diff > 0 ? 'pnl-pos' : 'pnl-neg';
+        deltaEl.style.fontSize = '12px';
+        deltaEl.style.fontWeight = '500';
       }
     }
     prevPrice = price;
@@ -103,6 +106,11 @@ async function pollPrice() {
     const intervalSecs = { '1m': 60, '5m': 300, '15m': 900, '1h': 3600, '4h': 14400, '1d': 86400 };
     const bucket = intervalSecs[currentInterval] || 300;
     const candleTime = Math.floor(now / bucket) * bucket;
+
+    if (lastCandlePair !== currentPair) {
+      lastCandle = null;
+      lastCandlePair = currentPair;
+    }
 
     if (lastCandle && lastCandle.time === candleTime) {
       lastCandle.close = price;
@@ -142,8 +150,8 @@ function renderOrderbook(bids, asks) {
     const pct = (vol / maxBidVol) * 100;
     return `<div class="ob-row ob-bid">
       <div class="ob-bg" style="width:${pct}%"></div>
-      <span class="text-green-400 relative">${fmt(price)}</span>
-      <span class="text-gray-400 relative">${vol.toFixed(4)}</span>
+      <span class="ob-price" style="color:var(--green)">${fmt(price)}</span>
+      <span class="ob-vol" style="color:var(--text-faint)">${vol.toFixed(4)}</span>
     </div>`;
   }).join('');
 
@@ -153,12 +161,12 @@ function renderOrderbook(bids, asks) {
     const pct = (vol / maxAskVol) * 100;
     return `<div class="ob-row ob-ask">
       <div class="ob-bg" style="width:${pct}%"></div>
-      <span class="text-red-400 relative">${fmt(price)}</span>
-      <span class="text-gray-400 relative">${vol.toFixed(4)}</span>
+      <span class="ob-price" style="color:var(--red)">${fmt(price)}</span>
+      <span class="ob-vol" style="color:var(--text-faint)">${vol.toFixed(4)}</span>
     </div>`;
   }).join('');
 
-  el.innerHTML = `<div>${bidHtml}</div><div>${askHtml}</div>`;
+  el.innerHTML = `<div class="ob-col">${bidHtml}</div><div class="ob-col">${askHtml}</div>`;
 
   // Spread
   if (bids.length && asks.length) {
@@ -176,7 +184,7 @@ function initEquityChart() {
   const ctx = document.getElementById('equity-chart').getContext('2d');
   equityChart = new Chart(ctx, {
     type: 'line',
-    data: { datasets: [{ label: 'Equity', data: [], borderColor: '#3b82f6', fill: true, backgroundColor: 'rgba(59,130,246,0.08)', tension: 0.3, pointRadius: 0 }] },
+    data: { datasets: [{ label: 'Equity', data: [], borderColor: '#3b82f6', borderWidth: 2, fill: true, backgroundColor: 'rgba(59,130,246,0.06)', tension: 0.3, pointRadius: 0 }] },
     options: {
       responsive: true, maintainAspectRatio: false,
       plugins: { legend: { display: false } },
@@ -184,10 +192,10 @@ function initEquityChart() {
         x: {
           type: 'time',
           time: { unit: 'hour', displayFormats: { hour: 'MMM d HH:mm', day: 'MMM d' }, tooltipFormat: 'MMM d HH:mm' },
-          grid: { color: '#1e2235' },
-          ticks: { color: '#64748b', font: { size: 10 }, maxTicksLimit: 6 },
+          grid: { color: '#18181b' },
+          ticks: { color: '#3f3f46', font: { size: 10 }, maxTicksLimit: 5 },
         },
-        y: { grid: { color: '#1e2235' }, ticks: { color: '#64748b', font: { size: 11 } } },
+        y: { grid: { color: '#18181b' }, ticks: { color: '#3f3f46', font: { size: 10 } } },
       },
     },
   });
@@ -221,7 +229,7 @@ async function refreshPortfolio() {
     setText('hdr-equity', `€${fmt(eq)}`);
     const dd = d.drawdown_pct || 0;
     document.getElementById('drawdown').innerHTML =
-      `<span class="${dd > 3 ? 'pnl-neg' : 'text-green-400'}">${dd.toFixed(2)}%</span>`;
+      `<span class="${dd > 3 ? 'pnl-neg' : 'pnl-pos'}">${dd.toFixed(2)}%</span>`;
     setText('pos-count', (d.open_positions || []).length);
     renderPositions(d.open_positions || []);
   } catch (e) {}
@@ -272,18 +280,26 @@ function renderSentimentList(query) {
     rows = rows.filter(r => r.base.toLowerCase().includes(query) || r.symbol.toLowerCase().includes(query));
   }
   if (!rows.length) {
-    el.innerHTML = '<div class="text-xs text-gray-600 italic">No results</div>';
+    el.innerHTML = '<div style="font-size:12px;color:var(--text-faint);font-style:italic;">No results</div>';
     return;
   }
   el.innerHTML = rows.map(r => {
     const pct = Math.round(((r.score + 1) / 2) * 100);
-    const color = r.score > 0.1 ? '#10b981' : r.score < -0.1 ? '#ef4444' : '#f59e0b';
+    const color = r.score > 0.1 ? 'var(--green)' : r.score < -0.1 ? 'var(--red)' : 'var(--amber)';
     const label = r.score > 0.1 ? 'Bullish' : r.score < -0.1 ? 'Bearish' : 'Neutral';
     const isActive = r.symbol === currentPair;
-    const highlight = isActive ? ' text-white font-medium' : ' text-gray-400';
-    return `<div class="cursor-pointer hover:bg-gray-800 rounded px-1 py-0.5" onclick="switchPair('${r.symbol}')">
-      <div class="flex justify-between text-xs mb-0.5"><span class="${highlight}">${r.base}</span><span style="color:${color}">${r.score.toFixed(3)} ${label}</span></div>
-      <div class="w-full bg-gray-800 rounded" style="height:3px"><div class="rounded" style="width:${pct}%;height:3px;background:${color}"></div></div>
+    const nameColor = isActive ? 'var(--text-primary)' : 'var(--text-secondary)';
+    const nameWeight = isActive ? '500' : '400';
+    return `<div style="cursor:pointer;padding:4px 2px;border-radius:4px;" onmouseover="this.style.background='var(--bg-hover)'" onmouseout="this.style.background=''" onclick="switchPair('${r.symbol}')">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;">
+        <span style="font-size:12px;color:${nameColor};font-weight:${nameWeight};">${r.base}</span>
+        <div style="display:flex;align-items:center;gap:6px;">
+          <div style="width:48px;height:4px;background:var(--bg-surface);border-radius:2px;overflow:hidden;">
+            <div class="sentiment-bar" style="width:${pct}%;background:${color};"></div>
+          </div>
+          <span style="font-size:11px;color:${color};width:36px;text-align:right;">${r.score.toFixed(2)}</span>
+        </div>
+      </div>
     </div>`;
   }).join('');
 }
@@ -320,9 +336,9 @@ async function refreshStatus() {
     const d = await res.json();
     const modeBadge = document.getElementById('mode-badge');
     if (d.paper_trading) {
-      modeBadge.textContent = 'PAPER'; modeBadge.className = 'text-xs px-2 py-1 rounded font-medium badge-paper';
+      modeBadge.textContent = 'PAPER'; modeBadge.className = 'badge badge-paper';
     } else {
-      modeBadge.textContent = 'LIVE'; modeBadge.className = 'text-xs px-2 py-1 rounded font-medium badge-live';
+      modeBadge.textContent = 'LIVE'; modeBadge.className = 'badge badge-live';
     }
     updateToggleButton(d.running);
     updatePaperResetVisibility(d.paper_trading);
@@ -331,10 +347,12 @@ async function refreshStatus() {
     const candleEl = document.getElementById('candle-status');
     const candleText = document.getElementById('candle-status-text');
     if (d.candles_ready) {
-      candleEl.style.background = '#10b98122';
-      candleEl.style.color = '#10b981';
+      candleEl.className = 'badge';
+      candleEl.style.background = 'rgba(34,197,94,0.12)';
+      candleEl.style.color = '#22c55e';
+      candleEl.style.border = '1px solid rgba(34,197,94,0.25)';
       candleText.textContent = 'Candles ready';
-      setTimeout(() => candleEl.style.opacity = '0.6', 3000);
+      setTimeout(() => candleEl.style.opacity = '0.5', 3000);
     } else if (d.candles_progress) {
       const p = d.candles_progress;
       const pct = p.total > 0 ? Math.round(p.loaded / p.total * 100) : 0;
@@ -349,14 +367,17 @@ async function refreshStatus() {
       if (rlText && rlBadge) {
         rlText.textContent = `${rl.remaining}/${rl.limit}`;
         if (rl.remaining < 100) {
-          rlBadge.style.background = '#ef444422';
+          rlBadge.style.background = 'rgba(239,68,68,0.12)';
           rlBadge.style.color = '#ef4444';
+          rlBadge.style.border = '1px solid rgba(239,68,68,0.25)';
         } else if (rl.remaining < 300) {
-          rlBadge.style.background = '#f59e0b22';
+          rlBadge.style.background = 'rgba(245,158,11,0.12)';
           rlBadge.style.color = '#f59e0b';
+          rlBadge.style.border = '1px solid rgba(245,158,11,0.25)';
         } else {
-          rlBadge.style.background = '#10b98122';
-          rlBadge.style.color = '#10b981';
+          rlBadge.style.background = 'rgba(34,197,94,0.12)';
+          rlBadge.style.color = '#22c55e';
+          rlBadge.style.border = '1px solid rgba(34,197,94,0.25)';
         }
       }
     }
@@ -374,23 +395,22 @@ function renderPositions(positions) {
 
 function _drawPositions() {
   const el = document.getElementById('positions-list');
-  if (!openPositions.length) { el.innerHTML = '<div class="text-xs text-gray-600 italic">No positions</div>'; return; }
+  if (!openPositions.length) { el.innerHTML = '<div style="font-size:12px;color:var(--text-faint);font-style:italic;">No positions</div>'; return; }
   el.innerHTML = openPositions.map(p => {
     const pnl = p.unrealized_pnl || 0;
     const price = p.current_price || 0;
     const value = price * (p.quantity || 0);
     const entry = p.entry_price || 0;
     const roiPct = entry > 0 ? ((price - entry) / entry * 100) : 0;
-    return `<div class="flex justify-between items-center py-1 border-b border-gray-800">
+    return `<div class="pos-item">
       <div>
-        <div class="text-white font-medium">${p.symbol}</div>
-        <div class="text-xs text-gray-500">${p.strategy_name}</div>
-        <div class="text-xs text-gray-600">Entry €${fmt(entry)}</div>
+        <div style="color:var(--text-primary);font-size:13px;font-weight:500;">${p.symbol}</div>
+        <div style="color:var(--text-faint);font-size:11px;">${p.strategy_name}</div>
+        <div style="color:var(--text-faint);font-size:11px;">Entry €${fmt(entry)}</div>
       </div>
-      <div class="text-right">
-        <div class="${pnl>=0?'pnl-pos':'pnl-neg'} font-medium">€${fmt(pnl)} <span class="text-xs">(${roiPct>=0?'+':''}${roiPct.toFixed(2)}%)</span></div>
-        <div class="text-xs text-gray-400">€${fmt(value)}</div>
-        <div class="text-xs text-gray-500">${p.quantity?.toFixed(4)||'—'} @ €${fmt(price)}</div>
+      <div style="text-align:right;">
+        <div class="${pnl>=0?'pnl-pos':'pnl-neg'}" style="font-weight:500;font-size:13px;">€${fmt(pnl)} <span style="font-size:11px;">(${roiPct>=0?'+':''}${roiPct.toFixed(2)}%)</span></div>
+        <div style="color:var(--text-faint);font-size:11px;">${p.quantity?.toFixed(4)||'—'} @ €${fmt(price)}</div>
       </div>
     </div>`;
   }).join('');
@@ -413,22 +433,21 @@ function updatePositionPrices(symbol, price) {
 
 function renderTrades(trades) {
   const tbody = document.getElementById('trades-body');
-  if (!trades.length) { tbody.innerHTML = '<tr><td colspan="10" class="text-gray-600 text-center py-6">No trades yet</td></tr>'; return; }
+  if (!trades.length) { tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:var(--text-faint);padding:24px;">No trades yet</td></tr>'; return; }
   tbody.innerHTML = trades.map(t => {
     const pnlClass = t.net_pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
     const hold = fmtDuration(t.hold_seconds);
-    const dt = t.created_at ? t.created_at.slice(0, 16).replace('T', ' ') : '';
     return `<tr>
-      <td class="font-medium text-white">${t.symbol}</td>
-      <td class="text-gray-400">${t.strategy_name}</td>
-      <td>€${fmt(t.entry_price)}</td>
-      <td>€${fmt(t.exit_price)}</td>
-      <td>${t.quantity?.toFixed(4)||'—'}</td>
-      <td class="${pnlClass} font-medium">€${fmt(t.net_pnl)}</td>
-      <td class="${pnlClass}">${t.roi_pct?.toFixed(2)||'—'}%</td>
-      <td class="text-gray-400">${hold}</td>
-      <td><span class="text-xs px-2 py-0.5 rounded bg-gray-800 text-gray-300">${t.exit_reason}</span></td>
-      <td><span class="text-xs ${t.paper_trade?'text-yellow-500':'text-green-500'}">${t.paper_trade?'paper':'live'}</span></td>
+      <td style="color:var(--text-primary);font-weight:500;">${t.symbol}</td>
+      <td style="color:var(--text-muted);">${t.strategy_name}</td>
+      <td class="text-right">€${fmt(t.entry_price)}</td>
+      <td class="text-right">€${fmt(t.exit_price)}</td>
+      <td class="text-right">${t.quantity?.toFixed(4)||'—'}</td>
+      <td class="${pnlClass} text-right" style="font-weight:500;">€${fmt(t.net_pnl)}</td>
+      <td class="${pnlClass} text-right">${t.roi_pct?.toFixed(2)||'—'}%</td>
+      <td style="color:var(--text-muted);">${hold}</td>
+      <td><span class="reason-badge">${t.exit_reason}</span></td>
+      <td><span style="font-size:11px;color:${t.paper_trade?'var(--amber)':'var(--green)'}">${t.paper_trade?'paper':'live'}</span></td>
     </tr>`;
   }).join('');
 }
@@ -436,11 +455,11 @@ function renderTrades(trades) {
 function addSignalFeedItem(data) {
   const el = document.getElementById('signal-feed');
   const dir = data.direction || data.type || 'NEUTRAL';
-  const cls = dir === 'LONG' ? 'signal-long' : dir === 'SHORT' ? 'signal-short' : 'signal-neutral';
-  const now = new Date().toLocaleTimeString();
+  const badgeCls = dir === 'LONG' ? 'signal-badge-long' : dir === 'SHORT' ? 'signal-badge-short' : '';
+  const now = new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
   const item = document.createElement('div');
-  item.className = 'flex gap-2 items-center';
-  item.innerHTML = `<span class="text-gray-600">${now}</span><span class="${cls} font-medium">${dir}</span><span class="text-gray-400">${data.symbol||data.type||''}</span><span class="text-gray-500">${data.strategy_name||''}</span><span class="text-gray-600">${data.strength ? (data.strength*100).toFixed(0)+'%' : ''}</span>`;
+  item.className = 'signal-item';
+  item.innerHTML = `<span style="color:var(--text-faint)">${now}</span><span class="signal-badge ${badgeCls}">${dir}</span><span style="color:var(--text-secondary)">${data.symbol||data.type||''}</span><span style="color:var(--text-faint);margin-left:auto;">${data.strength ? 'strength '+(data.strength*100).toFixed(0)+'%' : ''}</span>`;
   el.prepend(item);
   while (el.children.length > 30) el.removeChild(el.lastChild);
 }
@@ -498,10 +517,10 @@ function updateToggleButton(running) {
   const btn = document.getElementById('btn-toggle');
   if (running) {
     btn.textContent = 'Stop';
-    btn.className = 'px-4 py-2 bg-red-600 hover:bg-red-500 text-white rounded-lg text-sm font-medium transition';
+    btn.className = 'btn btn-stop';
   } else {
     btn.textContent = 'Start';
-    btn.className = 'px-4 py-2 bg-green-600 hover:bg-green-500 text-white rounded-lg text-sm font-medium transition';
+    btn.className = 'btn btn-start';
   }
 }
 
@@ -522,7 +541,7 @@ async function switchInterval(iv) {
   prevPrice = null;
   if (priceLine) { try { candleSeries.removePriceLine(priceLine); } catch(e) {} priceLine = null; }
   document.querySelectorAll('.tf-btn').forEach(b => {
-    b.className = 'tf-btn px-3 py-1 text-xs rounded ' + (b.textContent.trim() === iv ? 'bg-blue-700 text-white' : 'bg-gray-800 text-gray-400 hover:text-white');
+    b.className = 'tf-btn' + (b.textContent.trim() === iv ? ' active' : '');
   });
   await loadCandles();
   pollPaused = false;
@@ -549,7 +568,8 @@ function setValueColored(id, num, text) {
   const el = document.getElementById(id);
   if (!el) return;
   el.textContent = text;
-  el.className = num >= 0 ? 'pnl-pos font-bold' : 'pnl-neg font-bold';
+  el.className = num >= 0 ? 'pnl-pos' : 'pnl-neg';
+  el.style.fontWeight = '500';
 }
 
 // ── Strategy Performance ──────────────────────────────────────────────────
@@ -560,17 +580,17 @@ async function refreshStrategies() {
     const strategies = await res.json();
     const tbody = document.getElementById('strategy-body');
     if (!strategies.length) {
-      tbody.innerHTML = '<tr><td colspan="4" class="text-gray-600 text-center py-4">No data</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--text-faint);padding:16px;">No data</td></tr>';
       return;
     }
     tbody.innerHTML = strategies.map(s => {
       const pnlClass = s.total_pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
       const wr = (s.win_rate * 100).toFixed(1);
       return `<tr>
-        <td class="text-white">${s.name}</td>
+        <td style="color:var(--text-primary);">${s.name}</td>
         <td>${s.total_trades}</td>
         <td>${wr}%</td>
-        <td class="${pnlClass} font-medium">${fmt(s.total_pnl)}</td>
+        <td class="${pnlClass} text-right" style="font-weight:500;">€${fmt(s.total_pnl)}</td>
       </tr>`;
     }).join('');
   } catch (e) { console.error('refreshStrategies', e); }
@@ -585,30 +605,24 @@ async function refreshRiskGate() {
     const el = document.getElementById('risk-gate-log');
     if (!el) return;
     if (!decisions.length) {
-      el.innerHTML = '<div class="text-gray-600 italic">No decisions yet</div>';
+      el.innerHTML = '<div style="font-size:12px;color:var(--text-faint);font-style:italic;">No decisions yet</div>';
       return;
     }
     el.innerHTML = decisions.map(d => {
-      const badge = d.approved
-        ? '<span class="px-1.5 py-0.5 rounded text-xs font-medium" style="background:#10b98122;color:#10b981">APPROVED</span>'
-        : '<span class="px-1.5 py-0.5 rounded text-xs font-medium" style="background:#ef444422;color:#ef4444">REJECTED</span>';
-      const ts = d.timestamp ? d.timestamp.slice(11, 19) : '';
+      const dotColor = d.approved ? 'var(--green)' : 'var(--red)';
+      const label = d.approved ? 'approved' : 'rejected';
+      const ts = d.timestamp ? d.timestamp.slice(11, 16) : '';
       const failedGates = d.gate_details
         ? Object.entries(d.gate_details).filter(([, g]) => !g.passed).map(([name]) => name.replace('_', ' ')).join(', ')
         : '';
       const gateInfo = !d.approved && failedGates
-        ? `<div class="text-gray-500 mt-0.5">Failed: <span class="text-red-400">${failedGates}</span></div>`
+        ? `<div style="font-size:10px;color:var(--text-faint);margin-top:2px;margin-left:14px;">Failed: <span style="color:var(--red)">${failedGates}</span></div>`
         : '';
-      return `<div class="py-1.5 border-b border-gray-800">
-        <div class="flex items-center justify-between">
-          <div class="flex items-center gap-2">
-            <span class="text-gray-500">${ts}</span>
-            <span class="text-white font-medium">${d.symbol || '?'}</span>
-            <span class="text-gray-400">${d.side || ''}</span>
-          </div>
-          ${badge}
-        </div>
-        ${gateInfo}
+      return `<div class="risk-item" style="flex-wrap:wrap;">
+        <div style="width:6px;height:6px;border-radius:50%;background:${dotColor};flex-shrink:0;"></div>
+        <span style="color:var(--text-secondary);font-size:12px;">${d.symbol || '?'} ${label}</span>
+        <span style="color:var(--text-faint);font-size:11px;margin-left:auto;">${ts}</span>
+        ${gateInfo ? `<div style="width:100%;">${gateInfo}</div>` : ''}
       </div>`;
     }).join('');
   } catch (e) { console.error('refreshRiskGate', e); }
