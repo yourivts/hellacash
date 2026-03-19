@@ -505,6 +505,37 @@ def _fetch_coinalyze_long_short_ratio(symbol: str = "BTCUSDT_PERP.A") -> pd.Data
         return pd.DataFrame()
 
 
+def _fetch_bgeometrics_sopr() -> pd.DataFrame:
+    """Fetch historical SOPR from BGeometrics free API (daily, back to 2015)."""
+    import requests
+    try:
+        all_rows = []
+        page = 0
+        while True:
+            resp = requests.get(
+                "https://bitcoin-data.com/v1/sopr",
+                params={"startday": "2015-01-01", "size": 1000, "page": page},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if not data:
+                break
+            for item in data:
+                ts = datetime.fromtimestamp(int(item["unixTs"]), tz=timezone.utc)
+                all_rows.append({"date": ts, "value": float(item["sopr"])})
+            if len(data) < 1000:
+                break
+            page += 1
+            time.sleep(0.5)
+        if not all_rows:
+            return pd.DataFrame()
+        return pd.DataFrame(all_rows).set_index("date").sort_index()
+    except Exception as e:
+        logger.warning("BGeometrics SOPR fetch failed: %s", e)
+        return pd.DataFrame()
+
+
 def _coingecko_headers() -> dict:
     """Build CoinGecko request headers with Demo API key if available."""
     import os
@@ -705,6 +736,7 @@ _SOURCE_STALENESS = {
     "coinmetrics_eth_addr": "onchain",
     "blockchain_com_puell": "onchain",
     "blockchain_com_txvol": "onchain",
+    "bgeometrics_sopr": "onchain",
     "defillama_stablecoins": "defi",
     "defillama_tvl": "defi",
 }
@@ -821,8 +853,13 @@ class ExternalDataProvider:
         else:
             result["mvrv"] = np.zeros(len(idx_5m))
 
-        # On-chain: SOPR — no free source available, zero-fill
-        result["sopr"] = np.zeros(len(idx_5m))
+        # On-chain: SOPR (BGeometrics free API — daily, back to 2015)
+        sopr_df = self._cached_fetch("bgeometrics_sopr", _fetch_bgeometrics_sopr)
+        if not sopr_df.empty:
+            # SOPR oscillates around 1.0; normalize to [-1, 1] range
+            result["sopr"] = np.clip(align_to_5m(sopr_df["value"] - 1.0, idx_5m) * 10, -1, 1)
+        else:
+            result["sopr"] = np.zeros(len(idx_5m))
 
         # On-chain: Puell Multiple (self-calculated from Blockchain.com miners-revenue)
         puell_df = self._cached_fetch("blockchain_com_puell", _fetch_blockchain_com_puell)
