@@ -26,6 +26,8 @@ import xgboost as xgb
 from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
 
 from bot.exchange.bitvavo_client import BitvavoClient
+from bot.config import get_settings
+from bot.data.candle_store import CandleStore
 from bot.data.external_features import ExternalDataProvider
 from bot.learning.transformer_embedder import TransformerEmbedder, train_transformer
 from bot.learning.ml_features import (
@@ -296,30 +298,62 @@ def main():
     model_dir = Path(MODEL_DIR)
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step 1: Fetch candles
-    all_dfs = {}
-    client = BitvavoClient(api_key="", api_secret="", paper_trading=True)
+    # Step 1: Load candles from PostgreSQL (1m -> resample to 5m)
+    #   First top-up DB with the last few days from Bitvavo API
+    settings = get_settings()
+    candle_store = CandleStore(db_url=settings.database_url)
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=YEARS * 365)
 
+    import asyncio
+    from bot.exchange.bitvavo_client import _api_get, _API_BASE
+
+    async def _topup():
+        """Fetch candles from the last stored timestamp to now for each pair."""
+        print("\n  Topping up DB with recent candles from Bitvavo API...")
+        loop = asyncio.get_running_loop()
+        now_ms = int(time.time() * 1000)
+        for pair in PAIRS:
+            last_ts = candle_store._get_last_timestamp(pair)
+            if last_ts is None:
+                print(f"    {pair}: no data in DB, skipping top-up (needs bulk_download)")
+                continue
+            cursor_ms = int(last_ts.timestamp() * 1000) + 60_000  # 1min after last
+            stored = 0
+            while cursor_ms < now_ms:
+                page_end = min(cursor_ms + 1440 * 60_000, now_ms)
+                url = (f"{_API_BASE}/{pair}/candles?interval=1m"
+                       f"&start={cursor_ms}&end={page_end}&limit=1440")
+                try:
+                    candles = await loop.run_in_executor(None, _api_get, url)
+                except Exception:
+                    break
+                if not candles:
+                    break
+                candle_store._store_candles(pair, candles)
+                stored += len(candles)
+                newest = max(c[0] for c in candles)
+                cursor_ms = newest + 60_000
+                await asyncio.sleep(0.2)
+            if stored > 0:
+                print(f"    {pair}: +{stored:,} new candles")
+        candle_store.clear_cache()
+
+    asyncio.run(_topup())
+    print("  Top-up complete.")
+
+    all_dfs = {}
     for pair in PAIRS:
-        print(f"\n  Fetching {pair}...", end="", flush=True)
-        candles = client.get_candles_range(pair, interval="5m", start=start, end=end)
-        if not candles or len(candles) < 10000:
-            print(f" skipped (insufficient data: {len(candles) if candles else 0})")
+        print(f"\n  Loading {pair} from DB...", end="", flush=True)
+        df = candle_store.get_candles(pair, start, end, resample="5m")
+        if df.empty or len(df) < 10000:
+            print(f" skipped (insufficient data: {len(df)})")
             continue
-        df = pd.DataFrame([{
-            "open": c.open, "high": c.high, "low": c.low,
-            "close": c.close, "volume": c.volume,
-        } for c in candles], index=[c.timestamp for c in candles])
-        df.index = pd.to_datetime(df.index)
-        df = df.sort_index()
         print(f" {len(df):,} candles")
         all_dfs[pair] = df
-        time.sleep(1)
 
     if not all_dfs:
-        print("  ERROR: No data fetched. Exiting.")
+        print("  ERROR: No data loaded from DB. Exiting.")
         sys.exit(1)
 
     # Step 2: Fetch external data
