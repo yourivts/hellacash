@@ -677,6 +677,27 @@ def _fetch_coingecko_btc_dominance() -> pd.DataFrame:
         return pd.DataFrame()
 
 
+    # Map source names to their staleness group for auto-refresh
+_SOURCE_STALENESS = {
+    "fear_greed": "fear_greed",
+    "funding_rates": "funding_rate",
+    "bybit_oi": "oi_liquidations",
+    "coinalyze_liquidations": "oi_liquidations",
+    "binance_futures_klines": "oi_liquidations",
+    "deribit_dvol": "dvol",
+    "coingecko_btc_dom_hist": "onchain",
+    "coinmetrics_nvt_proxy": "onchain",
+    "coinmetrics_mvrv": "onchain",
+    "coinmetrics_hashrate": "onchain",
+    "coinmetrics_btc_addr": "onchain",
+    "coinmetrics_eth_addr": "onchain",
+    "blockchain_com_puell": "onchain",
+    "blockchain_com_txvol": "onchain",
+    "defillama_stablecoins": "defi",
+    "defillama_tvl": "defi",
+}
+
+
 class ExternalDataProvider:
     """Fetch, cache, and serve external market data for ML features.
 
@@ -684,8 +705,10 @@ class ExternalDataProvider:
     Live mode: call refresh() periodically, then build_live_features().
     """
 
-    def __init__(self, cache_dir: str | None = "data/external_cache") -> None:
+    def __init__(self, cache_dir: str | None = "data/external_cache",
+                 db_url: str | None = None) -> None:
         self._cache_dir = Path(cache_dir) if cache_dir else None
+        self._db_url = db_url
         self._live_cache: dict[str, float] = {}  # source -> latest value
         self._last_fetched: dict[str, datetime] = {
             source: datetime.now(timezone.utc)
@@ -1223,21 +1246,108 @@ class ExternalDataProvider:
             pass
 
     def _cached_fetch(self, name: str, fetch_fn) -> pd.DataFrame:
-        """Fetch data with parquet cache."""
+        """Fetch data with DB cache (auto-refresh when stale) + parquet fallback."""
+        import io
+
+        # Determine staleness threshold for this source
+        group = _SOURCE_STALENESS.get(name, "onchain")
+        threshold = STALENESS_THRESHOLDS.get(group, timedelta(hours=48))
+        now = datetime.now(timezone.utc)
+
+        # Try DB cache first
+        if self._db_url:
+            try:
+                cached_df, fetched_at = self._db_load(name)
+                if cached_df is not None:
+                    age = now - fetched_at.replace(tzinfo=timezone.utc) if fetched_at.tzinfo is None else now - fetched_at
+                    if age <= threshold:
+                        logger.info("DB cache hit for %s (%d rows, %.1fh old)",
+                                    name, len(cached_df), age.total_seconds() / 3600)
+                        return cached_df
+                    else:
+                        logger.info("DB cache stale for %s (%.1fh old, threshold %.1fh) — refreshing",
+                                    name, age.total_seconds() / 3600, threshold.total_seconds() / 3600)
+            except Exception as e:
+                logger.warning("DB cache read failed for %s: %s", name, e)
+
+        # Parquet fallback (for migration / no DB)
         if self._cache_dir:
             cache_path = str(self._cache_dir / f"{name}.parquet")
             cached = load_cache(cache_path)
             if cached is not None:
-                logger.info("Using cached data for %s (%d rows)", name, len(cached))
+                logger.info("Using parquet cache for %s (%d rows)", name, len(cached))
+                # Migrate to DB if available
+                if self._db_url:
+                    try:
+                        self._db_save(name, cached)
+                        logger.info("Migrated %s to DB cache", name)
+                    except Exception as e:
+                        logger.warning("DB migration failed for %s: %s", name, e)
                 return cached
 
+        # Fetch from API
         logger.info("Fetching %s from API...", name)
         try:
             df = fetch_fn()
-            if self._cache_dir and not df.empty:
-                save_cache(df, str(self._cache_dir / f"{name}.parquet"))
-                logger.info("Cached %s (%d rows)", name, len(df))
+            if not df.empty:
+                # Save to DB
+                if self._db_url:
+                    try:
+                        self._db_save(name, df)
+                    except Exception as e:
+                        logger.warning("DB save failed for %s: %s", name, e)
+                # Also save parquet as backup
+                if self._cache_dir:
+                    save_cache(df, str(self._cache_dir / f"{name}.parquet"))
+                logger.info("Fetched and cached %s (%d rows)", name, len(df))
             return df
         except Exception as e:
             logger.warning("Failed to fetch %s: %s", name, e)
             return pd.DataFrame()
+
+    def _db_load(self, name: str) -> tuple[Optional[pd.DataFrame], Optional[datetime]]:
+        """Load cached DataFrame from DB."""
+        import io
+        import psycopg2
+        from bot.data.candle_store import _connect_with_retry
+        sync_url = self._db_url.replace("+asyncpg", "").replace("postgresql+psycopg2", "postgresql")
+        conn = _connect_with_retry(sync_url)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT data, fetched_at FROM external_data_cache WHERE source = %s",
+                    (name,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return None, None
+                buf = io.BytesIO(bytes(row[0]))
+                df = pd.read_parquet(buf)
+                return df, row[1]
+        finally:
+            conn.close()
+
+    def _db_save(self, name: str, df: pd.DataFrame) -> None:
+        """Save DataFrame to DB as parquet bytes."""
+        import io
+        import psycopg2
+        import psycopg2.extras
+        from bot.data.candle_store import _connect_with_retry
+        sync_url = self._db_url.replace("+asyncpg", "").replace("postgresql+psycopg2", "postgresql")
+        buf = io.BytesIO()
+        df.to_parquet(buf)
+        data = buf.getvalue()
+        conn = _connect_with_retry(sync_url)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO external_data_cache (source, data, fetched_at, row_count)
+                       VALUES (%s, %s, %s, %s)
+                       ON CONFLICT (source) DO UPDATE
+                       SET data = EXCLUDED.data, fetched_at = EXCLUDED.fetched_at,
+                           row_count = EXCLUDED.row_count""",
+                    (name, psycopg2.Binary(data), datetime.now(timezone.utc), len(df)),
+                )
+            conn.commit()
+        finally:
+            conn.close()

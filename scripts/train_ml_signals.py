@@ -358,7 +358,7 @@ def main():
 
     # Step 2: Fetch external data
     print("\n  Fetching external data from 12+ APIs...")
-    ext_provider = ExternalDataProvider(cache_dir="data/external_cache")
+    ext_provider = ExternalDataProvider(cache_dir="data/external_cache", db_url=settings.database_url)
     btc_df = all_dfs.get("BTC-EUR")
     if btc_df is not None:
         idx_5m = btc_df.index
