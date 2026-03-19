@@ -505,17 +505,28 @@ def _fetch_coinalyze_long_short_ratio(symbol: str = "BTCUSDT_PERP.A") -> pd.Data
         return pd.DataFrame()
 
 
+def _coingecko_headers() -> dict:
+    """Build CoinGecko request headers with Demo API key if available."""
+    import os
+    key = os.environ.get("COINGECKO_API_KEY", "")
+    if key:
+        return {"x_cg_demo_api_key": key}
+    return {}
+
+
 def _fetch_coingecko_btc_dominance_history() -> pd.DataFrame:
     """Fetch historical BTC dominance from CoinGecko market_chart endpoint.
 
     Computes dominance as BTC market cap / total crypto market cap.
     """
     import requests
+    headers = _coingecko_headers()
     try:
         # BTC market cap history (max range)
         btc_resp = requests.get(
             "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
             params={"vs_currency": "usd", "days": "max", "interval": "daily"},
+            headers=headers,
             timeout=30,
         )
         btc_resp.raise_for_status()
@@ -523,12 +534,13 @@ def _fetch_coingecko_btc_dominance_history() -> pd.DataFrame:
         if not btc_data:
             return pd.DataFrame()
 
-        time.sleep(1.5)  # respect CoinGecko rate limit
+        time.sleep(2)  # respect CoinGecko ~30 req/min rate limit
 
         # Total crypto market cap history
         total_resp = requests.get(
             "https://api.coingecko.com/api/v3/global/market_cap_chart",
             params={"days": "max"},
+            headers=headers,
             timeout=30,
         )
 
@@ -666,7 +678,7 @@ def _fetch_coingecko_btc_dominance() -> pd.DataFrame:
     import requests
     try:
         url = "https://api.coingecko.com/api/v3/global"
-        resp = requests.get(url, timeout=30)
+        resp = requests.get(url, headers=_coingecko_headers(), timeout=30)
         resp.raise_for_status()
         data = resp.json().get("data", {})
         btc_dom = data.get("market_cap_percentage", {}).get("btc", 0)
