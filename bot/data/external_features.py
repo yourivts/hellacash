@@ -544,10 +544,10 @@ def _fetch_coingecko_btc_dominance_history() -> pd.DataFrame:
     import requests
     headers = _coingecko_headers()
     try:
-        # BTC market cap history (max range)
+        # BTC market cap history (Demo API limited to 365 days)
         btc_resp = requests.get(
             "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
-            params={"vs_currency": "usd", "days": "max", "interval": "daily"},
+            params={"vs_currency": "usd", "days": "365", "interval": "daily"},
             headers=headers,
             timeout=30,
         )
@@ -561,7 +561,7 @@ def _fetch_coingecko_btc_dominance_history() -> pd.DataFrame:
         # Total crypto market cap history
         total_resp = requests.get(
             "https://api.coingecko.com/api/v3/global/market_cap_chart",
-            params={"days": "max"},
+            params={"days": "365"},
             headers=headers,
             timeout=30,
         )
