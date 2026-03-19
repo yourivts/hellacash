@@ -527,6 +527,29 @@ def _fetch_bgeometrics_sopr() -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _fetch_bgeometrics_btc_dominance() -> pd.DataFrame:
+    """Fetch historical BTC dominance from BGeometrics free API (daily)."""
+    import requests
+    try:
+        resp = requests.get(
+            "https://bitcoin-data.com/v1/bitcoin-dominance",
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not data or not isinstance(data, list):
+            return pd.DataFrame()
+        rows = []
+        for item in data:
+            ts = datetime.fromtimestamp(int(item["unixTs"]), tz=timezone.utc)
+            # Dominance as ratio 0-1
+            rows.append({"date": ts, "value": float(item.get("bitcoinDominance", item.get("value", 0))) / 100.0})
+        return pd.DataFrame(rows).set_index("date").sort_index()
+    except Exception as e:
+        logger.warning("BGeometrics BTC dominance fetch failed: %s", e)
+        return pd.DataFrame()
+
+
 def _coingecko_headers() -> dict:
     """Build CoinGecko request headers with Demo API key if available."""
     import os
@@ -728,6 +751,7 @@ _SOURCE_STALENESS = {
     "blockchain_com_puell": "onchain",
     "blockchain_com_txvol": "onchain",
     "bgeometrics_sopr": "onchain",
+    "bgeometrics_btc_dom": "onchain",
     "defillama_stablecoins": "defi",
     "defillama_tvl": "defi",
 }
@@ -975,8 +999,10 @@ class ExternalDataProvider:
         else:
             result["dvol"] = np.zeros(len(idx_5m))
 
-        # BTC dominance change (CoinGecko — full history)
-        btc_dom = self._cached_fetch("coingecko_btc_dom_hist", _fetch_coingecko_btc_dominance_history)
+        # BTC dominance change (BGeometrics — full history, CoinGecko fallback)
+        btc_dom = self._cached_fetch("bgeometrics_btc_dom", _fetch_bgeometrics_btc_dominance)
+        if btc_dom.empty:
+            btc_dom = self._cached_fetch("coingecko_btc_dom_hist", _fetch_coingecko_btc_dominance_history)
         if not btc_dom.empty:
             # If we got actual dominance ratios (0-1), compute 7d change
             if btc_dom["value"].max() <= 1.0:
