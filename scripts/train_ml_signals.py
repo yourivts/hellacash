@@ -111,8 +111,12 @@ def build_lstm_targets(df_5m: pd.DataFrame) -> np.ndarray:
     for step in range(LSTM_PREDICT_BARS):
         future = ohlcv[step + 1:step + 1 + n_targets]
         for ch in range(4):
-            targets[:, step * 5 + ch] = (future[:, ch] - ref_close) / (ref_close + 1e-12)
-        targets[:, step * 5 + 4] = future[:, 4] / (ref_vol + 1e-12)
+            targets[:, step * 5 + ch] = np.clip(
+                (future[:, ch] - ref_close) / (ref_close + 1e-12), -0.20, 0.20
+            )
+        targets[:, step * 5 + 4] = np.clip(
+            future[:, 4] / (ref_vol + 1e-12), 0.0, 5.0
+        )
 
     return targets
 
